@@ -11,6 +11,7 @@
     <nav aria-label="Main navigation"><button class="tab active" id="live-tab" aria-current="page">Live view</button><button class="tab" id="library-tab">Library <span id="library-count">0</span></button></nav>
     <button id="global-stop" class="danger" hidden>■ Stop <span id="global-timer">00:00</span></button>
     <span class="connection" id="connection">Connecting…</span>
+    <span class="athens-clock" id="athens-clock"></span>
   </header>
   <main>
     <div class="notice" id="notice" role="alert" hidden></div>
@@ -46,6 +47,7 @@
           <details><summary>Focus</summary><div id="focus-controls" class="control-group"></div></details>
           <details><summary>Every camera control</summary><div class="advanced"><p>Direct libcamera controls, discovered from this sensor. Advanced values may interrupt the stream. Manual exposure/gain may require their Mode control set to Manual; colour gains require AWB off.</p><label>Control<select id="advanced-select"></select></label><p id="advanced-help"></p><label>Value (JSON)<textarea id="advanced-value" rows="3" spellcheck="false"></textarea></label><button id="apply-advanced" class="wide">Apply control</button></div></details>
           <details><summary>Sensor information</summary><pre id="sensor-info"></pre></details>
+          <details><summary>System time</summary><div class="time-panel"><p>Athens: <strong id="athens-time">—</strong></p><p>Pi server: <strong id="server-time">—</strong></p><p id="time-drift" class="help" hidden></p><label>Set Pi time (Athens)<input type="datetime-local" id="set-time-value"></label><button id="set-time" class="wide">Apply time</button></div></details>
         </aside>
       </div>
       <footer>Do not operate while driving.</footer>

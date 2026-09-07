@@ -8,10 +8,13 @@ import os
 import re
 import secrets
 import signal
+import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, abort, jsonify, request, send_file, session
 from camera import CameraDeck
@@ -115,6 +118,34 @@ def create_app(deck, password=""):
     @app.get("/api/status")
     def status():
         return jsonify(deck.status())
+
+    ATHENS = ZoneInfo("Europe/Athens")
+
+    @app.get("/api/time")
+    def get_time():
+        now = datetime.now(timezone.utc)
+        return jsonify(
+            utc=now.isoformat(),
+            athens=now.astimezone(ATHENS).isoformat(),
+            epoch=int(now.timestamp()),
+        )
+
+    @app.post("/api/time")
+    def set_time():
+        t = request.get_json().get("time", "")
+        if not re.match(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?$", t):
+            raise ValueError("Time must be ISO format, e.g. 2026-09-07T18:30:00")
+        result = subprocess.run(
+            ["sudo", "timedatectl", "set-time", t.replace("T", " ")],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise ValueError(
+                f"Could not set time: {result.stderr.strip() or 'timedatectl failed'}"
+            )
+        return jsonify(ok=True)
 
     @app.post("/api/configure")
     def configure():

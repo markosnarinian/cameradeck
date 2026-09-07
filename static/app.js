@@ -19,6 +19,15 @@ const date = n => new Date(n).toLocaleString(undefined, {
     minute: '2-digit'
 });
 
+function tickAthensClock() {
+    $('athens-clock').textContent = new Date().toLocaleString('en-GB', {
+        timeZone: 'Europe/Athens',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    }) + ' Athens';
+}
+setInterval(tickAthensClock, 1000);
+tickAthensClock();
+
 function toast(message, error = false) {
     if (error && $('viewer').open) $('viewer-info').textContent = message;
     $('toast').textContent = message;
@@ -90,6 +99,7 @@ async function poll() {
     try {
         state = await api('/api/status');
         connected = true;
+        checkServerTime();
         $('connection').textContent = state.ready ? '● Connected to Pi' : 'Camera unavailable';
         $('connection').classList.toggle('offline', !state.ready);
         $('camera-name').textContent = (state.properties.Model || 'Camera').toUpperCase();
@@ -520,6 +530,38 @@ $('feed').onerror = () => {
 };
 setInterval(poll, 1200);
 setInterval(videoFocus, 500);
+
+async function checkServerTime() {
+    try {
+        const t = await api('/api/time');
+        const drift = Math.abs(Date.now() / 1000 - t.epoch);
+        $('athens-time').textContent = new Date(t.athens).toLocaleString('en-GB', {
+            timeZone: 'Europe/Athens', year: 'numeric', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        });
+        $('server-time').textContent = new Date(t.utc).toLocaleString('en-GB', {
+            year: 'numeric', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        });
+        if (drift > 30) {
+            $('time-drift').hidden = false;
+            $('time-drift').textContent = `Warning: your browser and the Pi disagree by ${Math.round(drift)} seconds. Use "Apply time" below to correct.`;
+        } else {
+            $('time-drift').hidden = true;
+        }
+        const athensDate = new Date(t.athens);
+        $('set-time-value').value = athensDate.toISOString().slice(0, 16);
+    } catch (e) {}
+}
+
+$('set-time').onclick = () => action(async () => {
+    const raw = $('set-time-value').value;
+    if (!raw) { toast('Select a date and time first.', true); return; }
+    await api('/api/time', { time: raw });
+    toast('Pi time updated');
+    await checkServerTime();
+});
+
 (async () => {
     await poll();
     if (connected) await recent();

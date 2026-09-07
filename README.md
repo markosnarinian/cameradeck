@@ -18,14 +18,15 @@ Use a current **64-bit Raspberry Pi OS** with a working native libcamera/Picamer
 
 ```bash
 sudo apt install python3-picamera2 python3-venv python3-av ffmpeg
+curl -LsSf astral.sh/uv/install.sh | sh
 git clone https://github.com/markosnarinian/cameradeck.git
 cd cameradeck
-python3 -m venv --system-site-packages .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python app.py
+uv venv --system-site-packages
+uv sync --frozen
+uv run python app.py
 ```
 
-Open **http://127.0.0.1:8080** on the Pi. The system-site-packages flag is important: use Raspberry Pi OS's Picamera2, libcamera, NumPy, and PyAV rather than unrelated pip camera packages. No Node, frontend build, CDN, internet connection, or cloud account is needed to run the app.
+Open **http://127.0.0.1:8080** on the Pi. The system-site-packages flag is important: use Raspberry Pi OS's Picamera2, libcamera, NumPy, and PyAV rather than unrelated pip camera packages (`uv venv --system-site-packages` followed by `uv sync --frozen` preserves this). No Node, frontend build, CDN, internet connection, or cloud account is needed to run the app.
 
 ### Access from your phone
 
@@ -34,7 +35,7 @@ Join the Pi and phone to the same trusted Wi-Fi network or hotspot. Stop the loc
 ```bash
 read -rs -p 'Choose a CameraDeck password (8+ characters): ' CAMERADECK_PASSWORD; echo
 export CAMERADECK_PASSWORD
-.venv/bin/python app.py --host 0.0.0.0
+uv run python app.py --host 0.0.0.0
 ```
 
 Open `http://<pi-ip>:8080` on the phone (`hostname -I` on the Pi shows its IP addresses). All clients share the same camera and recording state. Up to four simultaneous live viewers are allowed, leaving server capacity for capture and stop commands. Browsing the library or hiding the tab disconnects that browser's preview, **not its recording**.
@@ -87,15 +88,15 @@ Stop any manually running CameraDeck/rpicam application first. To release the ca
 ## Development and verification
 
 ```bash
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q
+uv sync --frozen
+uv run python -m pytest -q
 # With CameraDeck already running and Chromium installed:
-.venv/bin/python tests/browser_smoke.py
+uv run python tests/browser_smoke.py
 ```
 
 Unit/API tests do not open a real camera. The explicit browser smoke test **does** change camera settings, take real stills, record video, exercise playback/seek/focus/download/delete, and check desktop/mobile layouts. It restores the initial video settings and deletes only its own captures. Override `CAMERADECK_TEST_URL`, `CAMERADECK_PASSWORD`, or `CHROMIUM` as needed. Screenshots/downloads remain in ignored `test-results/`; inspect them locally and do not publish private camera scenes.
 
-Code formatting: `.venv/bin/black app.py camera.py tests`, `.venv/bin/js-beautify -r static/app.js`, `.venv/bin/css-beautify -r static/style.css`.
+Code formatting: `uv run black app.py camera.py tests`, `uv run js-beautify -r static/app.js`, `uv run css-beautify -r static/style.css`.
 
 ### Verified on the connected Pi 4 / B0569 (7 September 2026)
 

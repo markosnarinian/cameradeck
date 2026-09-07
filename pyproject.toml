@@ -1,0 +1,28 @@
+[project]
+name = "cameradeck"
+version = "0.1.0"
+description = "Local-first Raspberry Pi camera console built on Picamera2 and libcamera"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "Flask>=3.1,<4",
+    "waitress>=3,<4",
+    "Pillow>=9",
+    "numpy>=1.24",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "playwright>=1.50,<2",
+    "black>=24",
+    "jsbeautifier>=1.15",
+    "cssbeautifier>=1.15",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/test_app.py"]

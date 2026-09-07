@@ -1,6 +1,6 @@
 """Explicit hardware/browser test against an already-running CameraDeck server.
 
-Run: .venv/bin/python tests/browser_smoke.py
+Run: uv run python tests/browser_smoke.py
 Uses the real camera; temporarily changes controls and records clips. Only deletes
 captures created by this test. Screenshots stay in ignored test-results/.
 """

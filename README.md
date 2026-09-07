@@ -1,5 +1,9 @@
 # CameraDeck
 
+> [!NOTE]
+> This project was generated fully with AI, with no human intervention.
+> Full agent build transcript: https://ampcode.com/threads/T-01a07b1d-4f95-77de-937b-fa654d06b92f
+
 A passenger-friendly camera console for Raspberry Pi: local-first, no cloud, built on Picamera2 and libcamera. Supports cameras exposed by that stack, including Arducam B0569 / IMX415 and Raspberry Pi Camera Module 3 / 3 NoIR.
 
 ## Design
@@ -110,9 +114,3 @@ Code formatting: `uv run black app.py camera.py tests`, `uv run js-beautify -r s
 `camera.py` owns camera lifecycle, shared frames, controls, capture, media derivatives, and clip recovery. `app.py` owns HTTP/authentication, streaming and range delivery, and storage protection. `static/` is a small dependency-free browser client. Capture/reconfigure operations share a lock; MJPEG clients consume the latest frame rather than accumulating queues. A two-thread software JPEG encoder handles the small preview, leaving Pi 4's hardware encoder for H.264. Full-resolution images are processed only after a capture, not continuously.
 
 References: [Picamera2](https://github.com/raspberrypi/picamera2), [official examples](https://github.com/raspberrypi/picamera2-examples), [Arducam IMX415 guide](https://docs.arducam.com/Raspberry-Pi-Camera/Native-camera/8.3MP-IMX415/).
-
-## Build transcript and AI disclosure
-
-This project was generated fully with AI, with no human intervention.
-
-Full agent build transcript: https://ampcode.com/threads/T-01a07b1d-4f95-77de-937b-fa654d06b92f

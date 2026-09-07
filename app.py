@@ -29,13 +29,27 @@ def create_app(deck, password=""):
     )
     attempts = {}
     attempts_lock = threading.Lock()
+    viewers = threading.BoundedSemaphore(4)
 
     @app.before_request
     def protect():
+        if not password and urlsplit(request.host_url).hostname not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            abort(403)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("Origin")
-            if origin and urlsplit(origin).netloc != request.host:
+            if origin and (
+                urlsplit(origin).netloc != request.host
+                or urlsplit(origin).scheme != request.scheme
+            ):
                 abort(403)
+            if request.method != "DELETE" and (
+                not request.is_json or not isinstance(request.get_json(), dict)
+            ):
+                raise ValueError("Supply a JSON object.")
         if (
             password
             and not session.get("authenticated")
@@ -73,6 +87,10 @@ def create_app(deck, password=""):
     def index():
         return app.send_static_file("index.html")
 
+    @app.get("/favicon.ico")
+    def favicon():
+        return Response(status=204)
+
     @app.post("/api/login")
     def login():
         address = request.remote_addr
@@ -105,6 +123,7 @@ def create_app(deck, password=""):
             int(data.get("index", deck.index)),
             data.get("profile", deck.profile),
             float(data.get("fps", deck.fps)),
+            int(data.get("rotation", deck.rotation)),
         )
         return jsonify(deck.status())
 
@@ -115,7 +134,10 @@ def create_app(deck, password=""):
 
     @app.post("/api/focus")
     def focus():
-        deck.focus_enabled = bool(request.get_json().get("enabled"))
+        enabled = request.get_json().get("enabled")
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be true or false.")
+        deck.focus_enabled = enabled
         return jsonify(ok=True)
 
     @app.post("/api/capture")
@@ -132,22 +154,33 @@ def create_app(deck, password=""):
 
     @app.get("/stream.mjpg")
     def stream():
+        if not viewers.acquire(blocking=False):
+            return (
+                jsonify(
+                    error="Four live viewers are already connected. Close another live view."
+                ),
+                503,
+            )
+
         def frames():
-            sequence = -1
-            while not deck.shutdown.is_set():
-                with deck.frames.condition:
-                    ready = deck.frames.condition.wait_for(
-                        lambda: sequence != deck.frames.sequence
-                        or deck.shutdown.is_set(),
-                        timeout=10,
-                    )
-                    if not ready:
-                        continue
-                    sequence, frame = deck.frames.sequence, deck.frames.frame
-                if frame:
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(
-                        len(frame)
-                    ).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            try:
+                sequence = -1
+                while not deck.shutdown.is_set():
+                    with deck.frames.condition:
+                        ready = deck.frames.condition.wait_for(
+                            lambda: sequence != deck.frames.sequence
+                            or deck.shutdown.is_set(),
+                            timeout=10,
+                        )
+                        if not ready:
+                            continue
+                        sequence, frame = deck.frames.sequence, deck.frames.frame
+                    if frame:
+                        yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(
+                            len(frame)
+                        ).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            finally:
+                viewers.release()
 
         return Response(
             frames(),
@@ -169,6 +202,8 @@ def create_app(deck, password=""):
         kind = request.args.get("kind", "all")
         items = []
         for path in sorted(deck.root.glob("*.json"), reverse=True):
+            if not ID.fullmatch(path.stem):
+                continue
             try:
                 entry = json.loads(path.read_text())
                 if kind == "all" or entry["kind"] == kind:
@@ -192,13 +227,16 @@ def create_app(deck, password=""):
             name = ident + ".json"
         else:
             abort(404)
-        return send_file(
+        response = send_file(
             deck.root / name,
             conditional=True,
             as_attachment="download" in request.args,
             download_name=name,
             max_age=86400,
         )
+        response.cache_control.public = False
+        response.cache_control.private = True
+        return response
 
     @app.delete("/api/media/<ident>")
     def delete(ident):
@@ -243,10 +281,15 @@ def main():
     # Monitor independently of clients: stop before exhausting storage, even if a phone disconnects.
     def watchdog():
         while not deck.shutdown.wait(2):
-            if deck.recording and deck.status()["free_bytes"] < 256 * 1024 * 1024:
+            low_space = deck.status()["free_bytes"] < 256 * 1024 * 1024
+            if deck.recording and (low_space or deck.output_error):
                 try:
                     deck.stop_recording()
-                    deck.error = "Recording stopped: storage is nearly full."
+                    deck.error = "Recording stopped: " + (
+                        "storage is nearly full."
+                        if low_space
+                        else str(deck.output_error)
+                    )
                 except Exception:
                     logging.exception("Could not finalize recording")
 

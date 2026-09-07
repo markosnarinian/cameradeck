@@ -376,7 +376,7 @@ main {
     border: 1px solid #ffffff40;
     border-radius: 4px;
     padding: 6px 9px;
-    font-size: 9px;
+    font-size: 10px;
     letter-spacing: 1px
 }
 
@@ -657,7 +657,7 @@ summary span {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 11px;
+    font-size: 12px;
     gap: 10px
 }
 
@@ -834,9 +834,9 @@ footer span:first-child {
 
 .toast {
     position: fixed;
-    bottom: 24px;
-    left: 50%;
-    transform: translateX(-50%);
+    top: 100px;
+    right: 4%;
+    pointer-events: none;
     max-width: 90vw;
     padding: 15px 24px;
     border-radius: 10px;
@@ -1006,9 +1006,19 @@ dialog::backdrop {
 }
 
 @media(max-width:760px) {
+    .toast {
+        top: auto;
+        bottom: calc(92px + env(safe-area-inset-bottom));
+        left: 5%;
+        right: 5%;
+        padding: 12px 16px;
+        text-align: center
+    }
+
     .topbar {
-        height: 70px;
-        padding: 0 5%;
+        min-height: 70px;
+        height: auto;
+        padding: 10px 5%;
         gap: 10px;
         flex-wrap: wrap
     }
@@ -1025,7 +1035,8 @@ dialog::backdrop {
     }
 
     .topbar nav {
-        gap: 13px
+        gap: 13px;
+        min-height: 44px
     }
 
     .tab {
@@ -1066,7 +1077,7 @@ dialog::backdrop {
     }
 
     .storage small {
-        font-size: 8px
+        font-size: 10px
     }
 
     .workspace {
@@ -1083,15 +1094,16 @@ dialog::backdrop {
     }
 
     .view-caption {
-        font-size: 7px;
+        font-size: 9px;
         bottom: 9px;
         left: 10px
     }
 
     .view-badge {
-        top: 10px;
-        left: 10px;
-        font-size: 8px
+        top: 5px;
+        left: 5px;
+        padding: 3px 5px;
+        font-size: 9px
     }
 
     .telemetry {
@@ -1103,7 +1115,7 @@ dialog::backdrop {
     }
 
     .telemetry small {
-        font-size: 7px;
+        font-size: 9px;
         letter-spacing: .5px
     }
 
@@ -1112,7 +1124,15 @@ dialog::backdrop {
     }
 
     .capture-bar {
-        padding: 17px 0
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        z-index: 5;
+        background: var(--bg);
+        border-top: 1px solid var(--line);
+        box-shadow: 0 -4px 20px #17201b0a;
+        padding: 10px 5% calc(10px + env(safe-area-inset-bottom))
     }
 
     .capture-hint {
@@ -1168,7 +1188,8 @@ dialog::backdrop {
     footer {
         flex-direction: column;
         gap: 10px;
-        padding-top: 24px
+        padding-top: 24px;
+        padding-bottom: 100px
     }
 
     dialog {

@@ -43,11 +43,13 @@ class Frames(io.BufferedIOBase):
         self.condition = threading.Condition()
         self.frame = None
         self.sequence = 0
+        self.updated = 0
 
     def write(self, data):
         with self.condition:
             self.frame = bytes(data)
             self.sequence += 1
+            self.updated = time.monotonic()
             self.condition.notify_all()
         return len(data)
 
@@ -71,9 +73,11 @@ class CameraDeck:
         self.index = 0
         self.profile = "720p"
         self.fps = 15
+        self.rotation = 0
         self.schema = {}
         self.modes = []
         self.properties = {}
+        self.output_error = None
 
     def start(self):
         try:
@@ -84,14 +88,15 @@ class CameraDeck:
                 raise RuntimeError(
                     "No camera detected. Check the ribbon cable and libcamera configuration, then retry."
                 )
-            self.open(0, self.profile, self.fps)
+            self.open(self.cameras[0]["Num"], self.profile, self.fps)
         except Exception as exc:
             self.error = str(exc)
+        self.recover_recordings()
         self.worker = threading.Thread(target=self._analyze, daemon=True)
         self.worker.start()
 
-    def open(self, index, profile, fps):
-        from libcamera import controls
+    def open(self, index, profile, fps, rotation=0):
+        from libcamera import Transform, controls
         from picamera2 import Picamera2
         from picamera2.encoders import JpegEncoder
         from picamera2.outputs import FileOutput
@@ -103,6 +108,8 @@ class CameraDeck:
                 )
             if profile not in {"720p", "1080p"} or not 1 <= fps <= 30:
                 raise ValueError("Choose 720p or 1080p and 1–30 fps.")
+            if rotation not in {0, 180}:
+                raise ValueError("Supported mounting rotations are 0° and 180°.")
             self.cameras = plain(Picamera2.global_camera_info())
             if not any(c["Num"] == index for c in self.cameras):
                 raise ValueError("Camera is not available.")
@@ -128,6 +135,7 @@ class CameraDeck:
                     main={"size": (width, height), "format": "YUV420"},
                     lores={"size": (640, 360), "format": "YUV420"},
                     controls={"FrameRate": fps},
+                    transform=Transform(hflip=rotation == 180, vflip=rotation == 180),
                     buffer_count=6,
                 )
                 p.configure(config)
@@ -159,6 +167,7 @@ class CameraDeck:
                 p.start()
                 p.start_encoder(self.preview, name="lores")
                 self.index, self.profile, self.fps = index, profile, fps
+                self.rotation = rotation
                 self.error = None
             except Exception as exc:
                 self.error = str(exc)
@@ -210,11 +219,13 @@ class CameraDeck:
             settings=dict(self.applied),
             profile=self.profile,
             fps=self.fps,
+            rotation=self.rotation,
         )
 
     def _finish(self, item, image):
         item["focus"] = focus_grid(image)
-        item["width"], item["height"] = image.size
+        if item["kind"] == "still":
+            item["width"], item["height"] = image.size
         for suffix, size in [("thumb", (480, 320)), ("preview", (1600, 1200))]:
             copy = image.copy()
             copy.thumbnail(size)
@@ -245,9 +256,12 @@ class CameraDeck:
                         main={"size": self.camera.sensor_resolution},
                         buffer_count=2,
                         controls=self.applied,
+                        transform=previous["transform"],
                     )
                     item["metadata"] = plain(
-                        self.camera.switch_mode_and_capture_file(config, str(path))
+                        self.camera.switch_mode_and_capture_file(
+                            config, str(path), delay=2
+                        )
                     )
                     item["capture_mode"] = "full sensor"
                 finally:
@@ -262,7 +276,7 @@ class CameraDeck:
 
     def start_recording(self):
         from picamera2.encoders import H264Encoder
-        from picamera2.outputs import FfmpegOutput
+        from picamera2.outputs import PyavOutput
 
         with self.lock:
             self.require_camera()
@@ -270,8 +284,20 @@ class CameraDeck:
                 raise ValueError("A recording is already running.")
             item = self._new("video")
             item["file"] = item["id"] + ".mp4"
-            encoder = H264Encoder(bitrate=10_000_000, repeat=True)
-            output = FfmpegOutput(str(self.root / item["file"]))
+            item["width"], item["height"] = self.camera.stream_configuration("main")[
+                "size"
+            ]
+            encoder = H264Encoder(
+                bitrate=10_000_000, repeat=True, iperiod=max(1, round(self.fps))
+            )
+            output = PyavOutput(
+                str(self.root / item["file"]),
+                format="mp4",
+                options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
+            )
+            self.output_error = None
+            output.error_callback = self._output_failed
+            (self.root / (item["id"] + ".pending.json")).write_text(json.dumps(item))
             self.camera.start_encoder(encoder, output, name="main")
             self.recording = dict(
                 item=item,
@@ -291,14 +317,36 @@ class CameraDeck:
             item = rec["item"]
             item["duration"] = round(time.monotonic() - rec["started"], 2)
             item["metadata"] = self.metadata
+            import av
+
+            with av.open(str(self.root / item["file"])) as container:
+                if container.duration:
+                    item["duration"] = round(container.duration / av.time_base, 2)
             with Image.open(io.BytesIO(rec["poster"] or self.frames.frame)) as image:
                 item = self._finish(item, image)
-            # Poster dimensions describe the preview, not the video stream.
-            item["width"], item["height"] = self.camera.stream_configuration("main")[
-                "size"
-            ]
-            (self.root / (item["id"] + ".json")).write_text(json.dumps(item))
+            (self.root / (item["id"] + ".pending.json")).unlink(missing_ok=True)
             return item
+
+    def _output_failed(self, exc):
+        self.output_error = str(exc)
+
+    def recover_recordings(self):
+        """Publish surviving fragments from interrupted recordings; never discard originals."""
+        import av
+
+        for path in self.root.glob("*.pending.json"):
+            try:
+                item = json.loads(path.read_text())
+                with av.open(str(self.root / item["file"])) as container:
+                    image = next(container.decode(video=0)).to_image()
+                    item["duration"] = round(
+                        (container.duration or 0) / av.time_base, 2
+                    )
+                item["recovered"] = True
+                self._finish(item, image)
+                path.unlink()
+            except Exception as exc:
+                self.error = f"An interrupted clip could not be recovered: {path.name}. Original preserved. {exc}"
 
     def status(self):
         rec = self.recording
@@ -309,6 +357,12 @@ class CameraDeck:
             index=self.index,
             profile=self.profile,
             fps=self.fps,
+            rotation=self.rotation,
+            frame_age=(
+                round(time.monotonic() - self.frames.updated, 1)
+                if self.frames.updated
+                else None
+            ),
             properties=self.properties,
             modes=self.modes,
             controls=self.schema,
@@ -359,7 +413,7 @@ def validate_controls(values, schema):
             result[name] = [tuple(r) for r in rectangles] if size else tuple(value)
             continue
         vals = value if size else [value]
-        if size and (not isinstance(vals, list) or len(vals) != size):
+        if size and (not isinstance(vals, list) or (size > 0 and len(vals) != size)):
             raise ValueError(f"{name}: expected an array of {size} values.")
         for i, v in enumerate(vals):
             if kind == "Bool":

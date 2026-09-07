@@ -7,7 +7,9 @@ let state = null,
     kind = 'all',
     offset = 0,
     viewed = null,
-    toastTimer, connected = false;
+    toastTimer, connected = false,
+    polling = false,
+    libraryRequest = 0;
 const bytes = n => n >= 1e9 ? `${(n/1e9).toFixed(1)} GB` : `${(n/1e6).toFixed(1)} MB`;
 const duration = n => `${Math.floor(n/60).toString().padStart(2,'0')}:${Math.floor(n%60).toString().padStart(2,'0')}`;
 const date = n => new Date(n).toLocaleString(undefined, {
@@ -18,6 +20,7 @@ const date = n => new Date(n).toLocaleString(undefined, {
 });
 
 function toast(message, error = false) {
+    if (error && $('viewer').open) $('viewer-info').textContent = message;
     $('toast').textContent = message;
     $('toast').classList.toggle('error', error);
     $('toast').hidden = false;
@@ -47,6 +50,7 @@ async function action(task) {
     try {
         await task();
     } catch (e) {
+        schemaKey = '';
         toast(e.message, true);
     } finally {
         busy = false;
@@ -58,6 +62,7 @@ async function action(task) {
 function updateButtons() {
     $('capture').disabled = busy || !connected || !state?.ready;
     $('record').disabled = busy || !connected || !state?.ready;
+    $('global-stop').disabled = busy || !connected;
     $('apply-config').disabled = busy || !!state?.recording;
     $('capture-title').textContent = busy ? 'Working on your capture…' : state?.recording ? 'Recording in progress' : 'Ready when you are';
 }
@@ -80,7 +85,8 @@ function preview() {
     else if (page !== 'live' || document.hidden || !connected || !state?.ready) $('feed').removeAttribute('src');
 }
 async function poll() {
-    if (document.hidden || $('login').open) return;
+    if (document.hidden || $('login').open || polling) return;
+    polling = true;
     try {
         state = await api('/api/status');
         connected = true;
@@ -91,14 +97,18 @@ async function poll() {
         $('free-space').textContent = bytes(state.free_bytes) + ' free';
         $('camera-offline').hidden = state.ready;
         $('camera-error').textContent = state.error || 'Check your camera connection.';
-        $('notice').hidden = !state.error;
-        $('notice').textContent = state.error || '';
+        const stale = state.ready && state.frame_age > 5;
+        $('notice').hidden = !state.error && !stale;
+        $('notice').textContent = state.error || (stale ? 'Preview has not updated for more than 5 seconds. Check long-exposure settings or reconnect the camera.' : '');
+        $('live-badge').textContent = stale ? '○ WAITING FOR FRAME' : '● LIVE';
         $('shutter').textContent = state.metadata.ExposureTime ? `${(state.metadata.ExposureTime/1000).toFixed(1)} ms` : '—';
         $('gain').textContent = state.metadata.AnalogueGain ? `${state.metadata.AnalogueGain.toFixed(1)}×` : '—';
         $('temperature').textContent = state.metadata.ColourTemperature ? `${state.metadata.ColourTemperature} K` : '—';
         $('actual-fps').textContent = state.metadata.FrameDuration ? `${(1e6/state.metadata.FrameDuration).toFixed(1)} fps` : '—';
         $('record-badge').hidden = !state.recording;
         $('timer').textContent = duration(state.elapsed);
+        $('global-stop').hidden = !state.recording;
+        $('global-timer').textContent = duration(state.elapsed);
         $('record').classList.toggle('recording', !!state.recording);
         $('record-label').textContent = state.recording ? 'Stop recording' : 'Record video';
         $('capture-detail').textContent = state.recording ? `${state.profile} snapshot · no interruption` : 'Full-resolution JPEG · saved locally';
@@ -106,7 +116,7 @@ async function poll() {
         $('focus-note').hidden = !state.focus_enabled;
         $('focus-toggle').checked = state.focus_enabled;
         if (state.focus_enabled) grid($('live-grid'), state.focus);
-        const key = JSON.stringify([state.index, state.profile, state.fps, state.controls]);
+        const key = JSON.stringify([state.index, state.profile, state.fps, state.rotation, state.controls, state.applied]);
         if (schemaKey !== key) {
             schemaKey = key;
             buildControls();
@@ -121,11 +131,15 @@ async function poll() {
         $('notice').textContent = 'Connection lost. Recording on the Pi may still be running. Reconnecting…';
         preview();
         updateButtons();
+    } finally {
+        polling = false;
     }
 }
 const groups = {
     exposure: [
         ['AeEnable', 'Auto exposure'],
+        ['ExposureTimeMode', 'Shutter mode'],
+        ['AnalogueGainMode', 'Gain mode'],
         ['ExposureValue', 'Exposure compensation'],
         ['ExposureTime', 'Shutter · µs'],
         ['AnalogueGain', 'Analogue gain']
@@ -147,6 +161,7 @@ const groups = {
 };
 
 function current(name, spec) {
+    if (spec.type === 'Bool') return state.applied[name] ?? spec.default ?? true;
     return state.applied[name] ?? state.metadata[name] ?? spec.default ?? spec.min;
 }
 
@@ -156,12 +171,14 @@ function buildControls() {
     $('camera-select').value = state.index;
     $('profile').value = state.profile;
     $('fps').value = state.fps;
+    $('rotation').value = state.rotation;
     for (const [group, names] of Object.entries(groups)) {
         const container = $(group + '-controls');
         container.replaceChildren();
         for (const [name, title] of names) {
             const spec = state.controls[name];
             if (!spec) continue;
+            if (name === 'AeEnable' && state.controls.ExposureTimeMode && state.controls.AnalogueGainMode) continue;
             const row = document.createElement('div');
             row.className = 'control-row';
             const label = document.createElement('label');
@@ -192,9 +209,21 @@ function buildControls() {
             }
             input.onchange = () => action(async () => {
                 const v = input.type === 'checkbox' ? input.checked : Number(input.value);
-                await api('/api/controls', {
+                const values = {
                     [name]: v
-                });
+                };
+                if (name === 'AeEnable') {
+                    for (const mode of ['ExposureTimeMode', 'AnalogueGainMode'])
+                        if (state.controls[mode]) values[mode] = v ? 0 : 1;
+                }
+                if (name === 'ExposureTime' || name === 'AnalogueGain') {
+                    const mode = name + 'Mode';
+                    if (state.controls[mode]) values[mode] = 1;
+                    else values.AeEnable = false;
+                }
+                if (name === 'LensPosition') values.AfMode = 0;
+                if (name === 'AwbMode') values.AwbEnable = true;
+                await api('/api/controls', values);
                 toast(`${title} updated`);
             });
             if (spec.type === 'Bool') {
@@ -223,8 +252,10 @@ function buildControls() {
         });
         $('focus-controls').append(button);
     }
+    const advancedName = $('advanced-select').value;
     $('advanced-select').replaceChildren();
     Object.keys(state.controls).sort().forEach(name => $('advanced-select').add(new Option(name, name)));
+    if (state.controls[advancedName]) $('advanced-select').value = advancedName;
     advanced();
     $('sensor-info').textContent = JSON.stringify({
         properties: state.properties,
@@ -281,19 +312,24 @@ async function recent() {
         if (result.items.length) {
             $('recent').replaceChildren(...result.items.slice(0, 4).map(card));
         } else {
-            $('recent').textContent = 'Your next shot starts here. Captures will appear as you go.';
+            const empty = document.createElement('p');
+            empty.className = 'empty-inline';
+            empty.textContent = 'Your next shot starts here. Captures will appear as you go.';
+            $('recent').replaceChildren(empty);
         }
     } catch (e) {
         toast(e.message, true);
     }
 }
 async function loadLibrary(more = false) {
+    const version = ++libraryRequest;
     try {
         if (!more) {
             offset = 0;
             $('library-grid').replaceChildren();
         }
         const result = await api(`/api/media?kind=${kind}&offset=${offset}`);
+        if (version !== libraryRequest) return;
         $('library-grid').append(...result.items.map(card));
         offset += result.items.length;
         $('results-count').textContent = `${result.total} capture${result.total===1?'':'s'}`;
@@ -326,7 +362,7 @@ async function openViewer(item) {
         $('viewer-image').src = `/media/${item.id}/thumb`;
         const preload = new Image();
         preload.onload = () => {
-            if (viewed?.id === item.id) $('viewer-image').src = preload.src;
+            if (viewed?.id === item.id && !$('load-original').disabled) $('viewer-image').src = preload.src;
         };
         preload.src = `/media/${item.id}/preview`;
     }
@@ -377,6 +413,12 @@ $('record').onclick = () => action(async () => {
     toast(stopping ? 'Video saved to your library' : 'Recording on the Pi. Keep this page handy to stop.');
     await recent();
 });
+$('global-stop').onclick = () => action(async () => {
+    await api('/api/record/stop', {});
+    toast('Video saved to your library');
+    await recent();
+    if (page === 'library') await loadLibrary();
+});
 $('focus-toggle').onchange = () => action(async () => {
     await api('/api/focus', {
         enabled: $('focus-toggle').checked
@@ -388,7 +430,8 @@ $('configure-form').onsubmit = e => {
         await api('/api/configure', {
             index: Number($('camera-select').value),
             profile: $('profile').value,
-            fps: Number($('fps').value)
+            fps: Number($('fps').value),
+            rotation: Number($('rotation').value)
         });
         schemaKey = '';
         toast('Video settings applied');
@@ -431,8 +474,15 @@ $('viewer-focus').onchange = () => {
 };
 $('viewer-video').addEventListener('seeked', videoFocus);
 $('load-original').onclick = () => {
+    $('viewer-image').onload = () => {
+        if ($('viewer-image').src.endsWith('/original')) $('load-original').textContent = 'Full resolution loaded';
+    };
+    $('viewer-image').onerror = () => {
+        toast('Could not load the original. Try downloading it.', true);
+        $('load-original').disabled = false;
+    };
     $('viewer-image').src = `/media/${viewed.id}/original`;
-    $('load-original').textContent = 'Full resolution loaded';
+    $('load-original').textContent = 'Loading original…';
     $('load-original').disabled = true;
 };
 $('delete-media').onclick = () => {
@@ -464,6 +514,10 @@ document.addEventListener('visibilitychange', () => {
     preview();
     if (!document.hidden) poll();
 });
+$('feed').onerror = () => {
+    $('feed').removeAttribute('src');
+    $('live-badge').textContent = '○ RECONNECTING';
+};
 setInterval(poll, 1200);
 setInterval(videoFocus, 500);
 (async () => {

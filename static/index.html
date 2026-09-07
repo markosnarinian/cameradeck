@@ -9,6 +9,7 @@
   <header class="topbar">
     <a class="brand" href="/" aria-label="CameraDeck home"><span class="brand-icon">◉</span> CameraDeck<span class="beta">FIELD CONSOLE</span></a>
     <nav aria-label="Main navigation"><button class="tab active" id="live-tab" aria-current="page">Live view</button><button class="tab" id="library-tab">Library <span id="library-count">0</span></button></nav>
+    <button id="global-stop" class="danger" hidden>■ Stop <span id="global-timer">00:00</span></button>
     <span class="connection" id="connection">Connecting…</span>
   </header>
   <main>
@@ -38,6 +39,7 @@
           <form id="configure-form" class="config-form">
             <label>Connected camera<select id="camera-select" aria-label="Connected camera"></select></label>
             <div class="two-col"><label>Video resolution<select id="profile"><option value="720p">1280 × 720</option><option value="1080p">1920 × 1080</option></select></label><label>Target fps<input id="fps" type="number" min="1" max="30" step="0.01" value="15"></label></div>
+            <label>Mounting orientation<select id="rotation"><option value="0">Normal · 0°</option><option value="180">Upside-down mount · 180°</option></select></label>
             <button class="wide" id="apply-config">Apply video settings</button><small class="help">Sensor limits apply. Changing settings resets camera controls and briefly pauses preview.</small>
           </form>
           <details open><summary>Exposure <span>01</span></summary><div id="exposure-controls" class="control-group"></div></details>

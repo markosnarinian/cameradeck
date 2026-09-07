@@ -1,4 +1,5 @@
 import json
+import subprocess
 from unittest.mock import Mock
 
 import numpy as np
@@ -85,8 +86,99 @@ def test_library_derivatives_ranges_and_delete(deck, client):
 
 
 def test_corrupt_sidecar_does_not_break_library(deck, client):
-    (deck.root / "broken.json").write_text("{")
+    (deck.root / "20260907_100000_12345678.json").write_text("{")
     assert client.get("/api/media").json["items"] == []
+
+
+def test_pending_recording_is_not_published(deck, client):
+    pending = deck._new("video")
+    (deck.root / (pending["id"] + ".pending.json")).write_text(json.dumps(pending))
+    assert client.get("/api/media").json["items"] == []
+
+
+def test_unrecoverable_recording_preserved(deck):
+    pending = deck._new("video")
+    pending["file"] = pending["id"] + ".mp4"
+    path = deck.root / (pending["id"] + ".pending.json")
+    path.write_text(json.dumps(pending))
+    (deck.root / pending["file"]).write_bytes(b"interrupted")
+    deck.recover_recordings()
+    assert "could not be recovered" in deck.error
+    assert path.exists() and (deck.root / pending["file"]).exists()
+
+
+def test_interrupted_clip_recovery(deck, client):
+    pending = deck._new("video")
+    pending.update(file=pending["id"] + ".mp4", width=320, height=240)
+    path = deck.root / (pending["id"] + ".pending.json")
+    path.write_text(json.dumps(pending))
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=320x240:r=15",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-threads",
+            "1",
+            "-g",
+            "15",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            str(deck.root / pending["file"]),
+        ],
+        check=True,
+    )
+    # Simulate losing the last fragment and final index, not a graceful close.
+    video = deck.root / pending["file"]
+    data = video.read_bytes()
+    last_fragment = data.rfind(b"moof") - 4
+    assert last_fragment > data.find(b"moof")
+    video.write_bytes(data[:last_fragment])
+    deck.recover_recordings()
+    assert not path.exists()
+    item = client.get("/api/media").json["items"][0]
+    assert item["recovered"] and 0.9 <= item["duration"] < 2
+    assert (item["width"], item["height"]) == (320, 240)
+
+
+def test_still_failure_restores_preview(deck):
+    deck.camera = Mock()
+    deck.camera.camera_configuration.return_value = {"transform": "normal"}
+    deck.camera.switch_mode_and_capture_file.side_effect = OSError("disk write failed")
+    deck.preview = Mock()
+    with pytest.raises(OSError, match="disk write failed"):
+        deck.capture()
+    deck.camera.start.assert_called_once()
+    deck.camera.start_encoder.assert_called_once_with(deck.preview, name="lores")
+
+
+def test_request_validation_and_host(client):
+    assert (
+        client.get("/api/status", headers={"Host": "evil.example"}).status_code == 403
+    )
+    assert client.post("/api/focus", json={"enabled": "false"}).status_code == 400
+    assert client.post("/api/configure", json=[]).status_code == 400
+    assert client.post("/api/controls", data="Brightness=1").status_code == 400
+
+
+def test_stream_limit_releases_slots(deck, client):
+    deck.frames.write(b"test-jpeg")
+    streams = [client.get("/stream.mjpg", buffered=False) for _ in range(4)]
+    assert all(r.status_code == 200 for r in streams)
+    assert client.get("/stream.mjpg").status_code == 503
+    streams.pop().close()
+    replacement = client.get("/stream.mjpg", buffered=False)
+    assert replacement.status_code == 200
+    replacement.close()
+    for r in streams:
+        r.close()
 
 
 def spec(kind="Float", low=0, high=10, size=0, options=None):

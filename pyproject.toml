@@ -12,6 +12,10 @@ dependencies = [
     "av>=18.1.0",
 ]
 
+# picamera2 and libcamera are apt-installed system packages (not on PyPI):
+#   sudo apt install python3-picamera2 python3-libcamera
+# The uv venv is created with --system-site-packages so it sees them.
+
 [dependency-groups]
 dev = [
     "pytest>=8,<10",

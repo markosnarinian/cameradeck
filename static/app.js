@@ -64,7 +64,7 @@ function updateButtons() {
     $('record').disabled = busy || !connected || !state?.ready;
     $('global-stop').disabled = busy || !connected;
     $('apply-config').disabled = busy || !!state?.recording;
-    $('capture-title').textContent = busy ? 'Working on your capture…' : state?.recording ? 'Recording in progress' : 'Ready when you are';
+    $('capture-title').textContent = busy ? 'Working…' : state?.recording ? 'Recording' : 'Ready';
 }
 
 function grid(target, scores) {
@@ -297,7 +297,7 @@ function card(item) {
     const info = document.createElement('div');
     info.className = 'card-info';
     const title = document.createElement('strong');
-    title.textContent = item.kind === 'video' ? `▶ ${duration(item.duration)}` : '↗ Photo';
+    title.textContent = item.kind === 'video' ? `Video · ${duration(item.duration)}` : 'Photo';
     const time = document.createElement('span');
     time.textContent = date(item.created);
     info.append(title, time);
@@ -314,7 +314,7 @@ async function recent() {
         } else {
             const empty = document.createElement('p');
             empty.className = 'empty-inline';
-            empty.textContent = 'Your next shot starts here. Captures will appear as you go.';
+            empty.textContent = 'No captures yet.';
             $('recent').replaceChildren(empty);
         }
     } catch (e) {

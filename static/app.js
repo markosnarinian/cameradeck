@@ -534,7 +534,8 @@ setInterval(videoFocus, 500);
 async function checkServerTime() {
     try {
         const t = await api('/api/time');
-        const drift = Math.abs(Date.now() / 1000 - t.epoch);
+        const effective = t.epoch + (t.offset || 0);
+        const drift = Math.abs(Date.now() / 1000 - effective);
         $('athens-time').textContent = new Date(t.athens).toLocaleString('en-GB', {
             timeZone: 'Europe/Athens', year: 'numeric', month: 'short', day: 'numeric',
             hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
@@ -545,7 +546,7 @@ async function checkServerTime() {
         });
         if (drift > 30) {
             $('time-drift').hidden = false;
-            $('time-drift').textContent = `Warning: your browser and the Pi disagree by ${Math.round(drift)} seconds. Use "Apply time" below to correct.`;
+            $('time-drift').textContent = `Your browser and the applied Pi time differ by ${Math.round(drift)} seconds. Use "Apply time" below to correct.`;
         } else {
             $('time-drift').hidden = true;
         }
@@ -558,7 +559,7 @@ $('set-time').onclick = () => action(async () => {
     const raw = $('set-time-value').value;
     if (!raw) { toast('Select a date and time first.', true); return; }
     await api('/api/time', { time: raw });
-    toast('Pi time updated');
+    toast('Time offset applied to Camera Deck');
     await checkServerTime();
 });
 

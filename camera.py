@@ -6,7 +6,7 @@ import math
 import shutil
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -78,6 +78,18 @@ class CameraDeck:
         self.modes = []
         self.properties = {}
         self.output_error = None
+        self._offset_path = self.root / ".time_offset"
+        self.time_offset = self._load_offset()
+
+    def _load_offset(self):
+        try:
+            return float(self._offset_path.read_text().strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def save_offset(self, seconds):
+        self.time_offset = float(seconds)
+        self._offset_path.write_text(str(self.time_offset))
 
     def start(self):
         try:
@@ -209,7 +221,7 @@ class CameraDeck:
 
     def _new(self, kind):
         self._space()
-        stamp = datetime.now(timezone.utc)
+        stamp = datetime.now(timezone.utc) + timedelta(seconds=self.time_offset)
         ident = stamp.strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
         return dict(
             id=ident,

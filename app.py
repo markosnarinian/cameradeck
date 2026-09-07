@@ -263,10 +263,8 @@ def main():
     parser.add_argument("--media", default=str(Path(__file__).parent / "media"))
     args = parser.parse_args()
     password = os.environ.get("CAMERADECK_PASSWORD", "")
-    if args.host not in {"127.0.0.1", "::1", "localhost"} and len(password) < 8:
-        parser.error(
-            "Network access requires CAMERADECK_PASSWORD with at least 8 characters."
-        )
+    if args.host not in {"127.0.0.1", "::1", "localhost"} and not password:
+        parser.error("Network access requires CAMERADECK_PASSWORD to be set.")
     logging.basicConfig(level=logging.INFO)
     deck = CameraDeck(args.media)
     deck.start()

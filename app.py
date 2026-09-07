@@ -262,7 +262,7 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--media", default=str(Path(__file__).parent / "media"))
     args = parser.parse_args()
-    password = os.environ.get("CAMERADECK_PASSWORD", "")
+    password = os.environ.get("CAMERADECK_PASSWORD", "passwd")
     if args.host not in {"127.0.0.1", "::1", "localhost"} and not password:
         parser.error("Network access requires CAMERADECK_PASSWORD to be set.")
     logging.basicConfig(level=logging.INFO)

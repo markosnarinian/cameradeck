@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f5f5f0"><title>CameraDeck · Field camera console</title>
+  <link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="CameraDeck home"><span class="brand-icon">◉</span> CameraDeck<span class="beta">FIELD CONSOLE</span></a>
+    <nav aria-label="Main navigation"><button class="tab active" id="live-tab" aria-current="page">Live view</button><button class="tab" id="library-tab">Library <span id="library-count">0</span></button></nav>
+    <span class="connection" id="connection">Connecting…</span>
+  </header>
+  <main>
+    <div class="notice" id="notice" role="alert" hidden></div>
+    <section id="live-page">
+      <div class="page-heading"><div><div class="eyebrow">YOUR NEXT PERSPECTIVE</div><h1>Out there. In focus.</h1><p>A little less setup. A little more seeing.</p></div><div class="storage"><span class="storage-icon">▤</span><div><strong id="free-space">—</strong><small>available on this Pi</small></div></div></div>
+      <div class="workspace">
+        <div class="view-column">
+          <section class="view-card" aria-label="Live camera preview">
+            <div class="view-toolbar"><span><i class="dot"></i> <strong id="camera-name">Camera</strong><span class="muted" id="sensor-label"></span></span><span class="pill" id="preview-label">LIGHTWEIGHT PREVIEW</span></div>
+            <div class="viewfinder" id="viewfinder">
+              <img id="feed" alt="Live camera preview">
+              <div class="view-badge" id="live-badge">● LIVE</div><div class="record-badge" id="record-badge" hidden>● REC <span id="timer">00:00</span></div>
+              <div class="grid-overlay" id="live-grid" hidden></div>
+              <span class="view-caption">640 × 360 preview · full quality saved on Pi</span>
+              <div class="camera-offline" id="camera-offline" hidden><strong>Camera unavailable</strong><p id="camera-error"></p><button id="retry">Reconnect camera</button></div>
+            </div>
+            <div class="telemetry"><span><small>SHUTTER</small><strong id="shutter">—</strong></span><span><small>GAIN</small><strong id="gain">—</strong></span><span><small>WHITE BALANCE</small><strong id="temperature">—</strong></span><span><small>SENSOR RATE</small><strong id="actual-fps">—</strong></span></div>
+            <div class="assist-bar"><label class="switch"><input type="checkbox" id="focus-toggle"> Sharpness grid <span class="tag">ASSIST</span></label><button id="fullscreen" class="quiet">⛶ <span>Expand</span></button></div>
+            <p class="focus-note" id="focus-note" hidden>Local detail scores, not focus distance. Compare the same scene and exposure. Higher is sharper; noise and motion affect results.</p>
+          </section>
+          <section class="capture-bar"><div class="capture-hint"><strong id="capture-title">Ready when you are</strong><small id="capture-detail">Full-resolution JPEG · saved locally</small></div><button id="record" class="record-button"><span class="record-dot"></span><span id="record-label">Record video</span></button><button id="capture" class="primary"><span>◎</span> Take photo</button></section>
+          <section class="recent-section"><div class="section-heading"><h2>Just captured</h2><button class="text-button" id="see-library">View library ↗</button></div><div class="recent" id="recent"><p class="empty-inline">Your next shot starts here. Captures will appear as you go.</p></div></section>
+        </div>
+        <aside class="controls-panel">
+          <div class="panel-title"><h2>Camera controls</h2><span class="tag">LIVE</span></div>
+          <form id="configure-form" class="config-form">
+            <label>Connected camera<select id="camera-select" aria-label="Connected camera"></select></label>
+            <div class="two-col"><label>Video resolution<select id="profile"><option value="720p">1280 × 720</option><option value="1080p">1920 × 1080</option></select></label><label>Target fps<input id="fps" type="number" min="1" max="30" step="0.01" value="15"></label></div>
+            <button class="wide" id="apply-config">Apply video settings</button><small class="help">Sensor limits apply. Changing settings resets camera controls and briefly pauses preview.</small>
+          </form>
+          <details open><summary>Exposure <span>01</span></summary><div id="exposure-controls" class="control-group"></div></details>
+          <details open><summary>Colour & detail <span>02</span></summary><div id="colour-controls" class="control-group"></div></details>
+          <details open><summary>Focus <span>03</span></summary><div id="focus-controls" class="control-group"></div></details>
+          <details><summary>Every camera control <span>↗</span></summary><div class="advanced"><p>Direct libcamera controls, discovered from this sensor. Advanced values may interrupt the stream. Manual exposure/gain may require their Mode control set to Manual; colour gains require AWB off.</p><label>Control<select id="advanced-select"></select></label><p id="advanced-help"></p><label>Value (JSON)<textarea id="advanced-value" rows="3" spellcheck="false"></textarea></label><button id="apply-advanced" class="wide">Apply control</button></div></details>
+          <details><summary>Sensor information <span>ⓘ</span></summary><pre id="sensor-info"></pre></details>
+        </aside>
+      </div>
+      <footer><span><i class="dot"></i> LOCAL FIRST. ADVENTURE READY.</span><span>Made for the passenger seat. Never operate while driving.</span></footer>
+    </section>
+    <section id="library-page" hidden>
+      <div class="page-heading"><div><div class="eyebrow">SAVED ALONG THE WAY</div><h1>Your field notes.</h1><p>Full-quality originals. Right here on your Pi.</p></div><button id="refresh-library">↻ Refresh</button></div>
+      <div class="library-toolbar"><div class="filter-group" role="group" aria-label="Filter media"><button class="selected" data-kind="all">All captures</button><button data-kind="still">Photos</button><button data-kind="video">Videos</button></div><span class="muted" id="results-count"></span></div>
+      <div class="library-grid" id="library-grid"></div><div class="empty-state" id="library-empty" hidden><span>◎</span><h2>A fresh roll.</h2><p>Photos and videos you capture will live here.<br>No uploads, no cloud, just your perspective.</p><button class="primary" id="empty-live">Go to live view</button></div><button id="load-more" hidden>Load more captures</button>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="viewer"><div class="viewer-header"><div><span class="eyebrow" id="viewer-kind"></span><h2 id="viewer-title"></h2></div><button id="close-viewer" aria-label="Close viewer">✕</button></div><div class="viewer-stage" id="viewer-stage"><img id="viewer-image" alt="Captured photograph"><video id="viewer-video" controls playsinline preload="metadata" hidden></video><div class="grid-overlay" id="viewer-grid" hidden></div></div><div class="viewer-actions"><label class="switch"><input type="checkbox" id="viewer-focus"> Sharpness grid</label><button id="load-original">Load full resolution</button><a class="button primary" id="download">↓ Download original</a><a class="button" id="download-metadata">Metadata</a><button id="delete-media" class="danger">Delete</button></div><p id="viewer-info" class="muted"></p><p class="help">Sharpness is a relative detail metric, not calibrated focus accuracy. Video scores are computed on the currently displayed frame in your browser.</p></dialog>
+  <dialog id="login"><form id="login-form"><span class="brand-icon">◉</span><h1>Your camera, privately.</h1><p>Enter the CameraDeck password set on this Pi.</p><label>Password<input id="password" type="password" autocomplete="current-password" required></label><p id="login-error" role="alert"></p><button class="primary wide">Unlock CameraDeck</button></form></dialog>
+</body>
+</html>

@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8,<10
+playwright>=1.50,<2
+black>=24
+jsbeautifier>=1.15
+cssbeautifier>=1.15

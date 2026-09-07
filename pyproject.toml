@@ -9,6 +9,7 @@ dependencies = [
     "waitress>=3,<4",
     "Pillow>=9",
     "numpy>=1.24",
+    "av>=18.1.0",
 ]
 
 [dependency-groups]

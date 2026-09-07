@@ -1,0 +1,18 @@
+[Unit]
+Description=CameraDeck Raspberry Pi camera console
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/cameradeck
+EnvironmentFile=/home/pi/cameradeck/.env
+ExecStart=/home/pi/cameradeck/.venv/bin/python /home/pi/cameradeck/app.py --host 0.0.0.0
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

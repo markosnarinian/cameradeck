@@ -14,6 +14,7 @@ import threading
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -44,12 +45,13 @@ def normalize_endpoint(value):
         raise ValueError(
             "Enter the server endpoint only; use Bucket and Prefix separately."
         )
-    if parsed.scheme == "http" and parsed.hostname not in {
-        "localhost",
-        "127.0.0.1",
-        "::1",
-    }:
-        raise ValueError("S3 endpoints must use HTTPS (except localhost development).")
+    insecure_allowed = parsed.hostname == "localhost"
+    try:
+        insecure_allowed = insecure_allowed or ip_address(parsed.hostname).is_private
+    except ValueError:
+        pass
+    if parsed.scheme == "http" and not insecure_allowed:
+        raise ValueError("S3 endpoints must use HTTPS outside private networks.")
     return value.rstrip("/")
 
 
@@ -59,7 +61,7 @@ def create_app(
     *,
     uploader=None,
     power_manager=None,
-    s3_endpoint="example.org",
+    s3_endpoint="http://192.168.1.10:3900",
 ):
     app = Flask(__name__, static_folder="static", static_url_path="/static")
     app.secret_key = secrets.token_hex(32)
@@ -531,7 +533,9 @@ def main():
             create_app(
                 deck,
                 password,
-                s3_endpoint=os.environ.get("CAMERADECK_S3_ENDPOINT", "example.org"),
+                s3_endpoint=os.environ.get(
+                    "CAMERADECK_S3_ENDPOINT", "http://192.168.1.10:3900"
+                ),
             ),
             host=args.host,
             port=args.port,

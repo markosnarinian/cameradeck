@@ -303,9 +303,11 @@ def test_upload_route_settings_and_validation(deck):
         "error": None,
     }
     client = create_app(
-        deck, uploader=uploader, s3_endpoint="example.org"
+        deck, uploader=uploader, s3_endpoint="http://192.168.1.10:3900"
     ).test_client()
-    assert client.get("/api/settings").json == {"s3_endpoint": "https://example.org"}
+    assert client.get("/api/settings").json == {
+        "s3_endpoint": "http://192.168.1.10:3900"
+    }
     response = client.post(
         "/api/media/upload",
         json={

@@ -64,10 +64,10 @@ Optional arguments: `--port 8080`, `--media /path/to/storage`. Use one process o
 Set the server shown initially in the upload dialog; the requested example default is:
 
 ```bash
-CAMERADECK_S3_ENDPOINT=example.org
+CAMERADECK_S3_ENDPOINT=http://192.168.1.10:3900
 ```
 
-Select library items, choose **Upload to S3**, and enter the bucket plus an optional prefix. Credentials remain server-side and use boto3's standard AWS credential chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, profiles, or an instance role). The endpoint must use HTTPS except for localhost development. Local media is never removed after upload.
+Select library items, choose **Upload to S3**, and enter the bucket plus an optional prefix. Credentials remain server-side and use boto3's standard AWS credential chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, profiles, or an instance role). The endpoint must use HTTPS outside private networks. Local media is never removed after upload.
 
 CameraDeck hashes every original with SHA-256 and uses a content-addressed object key. A durable SQLite ledger, conditional object creation, and remote metadata checks deduplicate copies, renames, concurrent requests, and process restarts for each endpoint/bucket/prefix destination. If a network failure makes the result ambiguous, CameraDeck marks it **uncertain** and will only reconcile with `HEAD`; it will not send the bytes again. This strict at-most-once behavior requires an S3-compatible server that supports conditional `PutObject` and read-after-write-consistent `HeadObject`. Resolve an uncertain object at the server rather than deleting CameraDeck's `.uploads.sqlite3` ledger.
 

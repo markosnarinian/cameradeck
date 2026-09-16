@@ -1,13 +1,17 @@
 import json
+import io
 import subprocess
+import zipfile
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from botocore.exceptions import ClientError
 from PIL import Image, ImageFilter
 
 from app import create_app
 from camera import CameraDeck, focus_grid, validate_controls
+from storage import S3Uploader
 
 
 @pytest.fixture
@@ -18,6 +22,18 @@ def deck(tmp_path):
 @pytest.fixture
 def client(deck):
     return create_app(deck).test_client()
+
+
+def make_media(deck, content=b"photo", ident=None):
+    item = deck._new("still")
+    if ident:
+        item["id"] = ident
+    item.update(file=item["id"] + ".jpg", bytes=len(content), width=1, height=1)
+    (deck.root / item["file"]).write_bytes(content)
+    (deck.root / (item["id"] + ".thumb.jpg")).write_bytes(b"thumb")
+    (deck.root / (item["id"] + ".preview.jpg")).write_bytes(b"preview")
+    (deck.root / (item["id"] + ".json")).write_text(json.dumps(item))
+    return item
 
 
 def test_no_camera_status_and_capture(client):
@@ -66,7 +82,7 @@ def test_library_derivatives_ranges_and_delete(deck, client):
     deck._finish(item, image)
     assert client.get("/api/media").json["total"] == 1
     assert client.get("/api/media?kind=video").json["total"] == 0
-    assert client.get("/api/media?offset=40").json["items"] == []
+    assert client.get("/api/media?page=2").json["page"] == 1
     ident = item["id"]
     assert Image.open(deck.root / (ident + ".thumb.jpg")).width == 480
     assert Image.open(deck.root / (ident + ".preview.jpg")).width == 1600
@@ -244,3 +260,184 @@ def test_storage_guard(deck, monkeypatch):
 
 def test_stop_without_recording(client):
     assert client.post("/api/record/stop", json={}).status_code == 400
+
+
+def test_page_pagination_validation_and_clamping(deck, client):
+    for index in range(41):
+        make_media(deck, ident=f"20260916_1200{index // 10}{index % 10}_{index:08x}")
+    first = client.get("/api/media?page=1&per_page=40").json
+    second = client.get("/api/media?page=2&per_page=40").json
+    assert (first["total"], first["pages"], len(first["items"])) == (41, 2, 40)
+    assert (second["page"], len(second["items"])) == (2, 1)
+    assert client.get("/api/media?page=99").json["page"] == 2
+    assert client.get("/api/media?page=0").status_code == 400
+    assert client.get("/api/media?kind=unknown").status_code == 400
+
+
+def test_bulk_download_and_delete(deck, client):
+    first = make_media(deck, b"first")
+    second = make_media(deck, b"second")
+    response = client.post(
+        "/api/media/download", json={"ids": [first["id"], second["id"]]}
+    )
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+        assert archive.read(f'{first["id"]}/{first["file"]}') == b"first"
+        assert archive.read(f'{second["id"]}/{second["id"]}.json')
+    deleted = client.post(
+        "/api/media/delete", json={"ids": [first["id"], second["id"], first["id"]]}
+    ).json
+    assert deleted["deleted"] == [first["id"], second["id"]]
+    assert not list(deck.root.glob("*.json"))
+    assert (
+        client.post("/api/media/delete", json={"ids": ["../../etc"]}).status_code == 400
+    )
+
+
+def test_upload_route_settings_and_validation(deck):
+    media = make_media(deck)
+    uploader = Mock()
+    uploader.upload.return_value = {
+        "status": "uploaded",
+        "key": "sha256/ab/hash.jpg",
+        "error": None,
+    }
+    client = create_app(
+        deck, uploader=uploader, s3_endpoint="example.org"
+    ).test_client()
+    assert client.get("/api/settings").json == {"s3_endpoint": "https://example.org"}
+    response = client.post(
+        "/api/media/upload",
+        json={
+            "ids": [media["id"]],
+            "endpoint": "https://objects.example.org",
+            "bucket": "camera-archive",
+            "prefix": "trip/one",
+        },
+    )
+    assert response.json["results"][0]["status"] == "uploaded"
+    uploader.upload.assert_called_once()
+    assert (
+        client.post(
+            "/api/media/upload",
+            json={
+                "ids": [media["id"]],
+                "endpoint": "http://example.org",
+                "bucket": "ok-bucket",
+            },
+        ).status_code
+        == 400
+    )
+
+
+def test_power_actions_are_fixed_confirmed_and_block_recording(deck):
+    manager = Mock()
+    client = create_app(deck, power_manager=manager).test_client()
+    assert (
+        client.post(
+            "/api/system/power", json={"action": "shutdown", "confirm": "wrong"}
+        ).status_code
+        == 400
+    )
+    response = client.post(
+        "/api/system/power", json={"action": "reboot", "confirm": "ReBoOt"}
+    )
+    assert response.status_code == 202
+    manager.schedule.assert_called_once_with("reboot")
+    deck.recording = {"item": {"id": "ongoing"}}
+    assert (
+        client.post(
+            "/api/system/power", json={"action": "shutdown", "confirm": "shutdown"}
+        ).status_code
+        == 409
+    )
+
+
+class FakeS3:
+    def __init__(self, fail_put=False):
+        self.objects = {}
+        self.puts = 0
+        self.fail_put = fail_put
+
+    def head_object(self, Bucket, Key):
+        if (Bucket, Key) not in self.objects:
+            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        body, metadata = self.objects[(Bucket, Key)]
+        return {"ContentLength": len(body), "Metadata": metadata, "ETag": "etag"}
+
+    def put_object(self, Bucket, Key, Body, ContentLength, Metadata, IfNoneMatch):
+        self.puts += 1
+        if self.fail_put:
+            raise TimeoutError("response lost")
+        assert IfNoneMatch == "*"
+        self.objects[(Bucket, Key)] = (Body.read(), Metadata)
+
+
+def test_s3_uploader_deduplicates_copies_and_persists(deck):
+    first = make_media(deck, b"identical")
+    second = make_media(deck, b"identical")
+    s3 = FakeS3()
+    uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
+    first_result = uploader.upload(
+        deck.root / first["file"],
+        first["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    second_result = uploader.upload(
+        deck.root / second["file"],
+        second["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    restarted = S3Uploader(deck.root, client_factory=lambda _: s3).upload(
+        deck.root / second["file"],
+        second["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    assert first_result.status == "uploaded"
+    assert second_result.status == restarted.status == "deduplicated"
+    assert s3.puts == 1
+
+
+def test_s3_ambiguous_attempt_is_never_sent_twice(deck):
+    media = make_media(deck, b"ambiguous")
+    s3 = FakeS3(fail_put=True)
+    uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
+    first = uploader.upload(
+        deck.root / media["file"],
+        media["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    second = S3Uploader(deck.root, client_factory=lambda _: s3).upload(
+        deck.root / media["file"],
+        media["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    assert first.status == second.status == "uncertain"
+    assert s3.puts == 1
+
+
+def test_s3_overwritten_file_gets_a_new_content_key(deck):
+    media = make_media(deck, b"first version")
+    s3 = FakeS3()
+    uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
+    first = uploader.upload(
+        deck.root / media["file"],
+        media["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    (deck.root / media["file"]).write_bytes(b"second version")
+    second = uploader.upload(
+        deck.root / media["file"],
+        media["id"],
+        endpoint_url="https://example.org",
+        bucket="archive",
+    )
+    assert first.status == second.status == "uploaded"
+    assert first.key != second.key
+    assert s3.puts == 2

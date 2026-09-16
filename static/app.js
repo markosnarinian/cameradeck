@@ -5,11 +5,17 @@ let state = null,
     busy = false,
     page = 'live',
     kind = 'all',
-    offset = 0,
+    libraryPage = 1,
+    libraryPages = 0,
+    pageItems = [],
     viewed = null,
     toastTimer, connected = false,
     polling = false,
-    libraryRequest = 0;
+    libraryRequest = 0,
+    s3Endpoint = 'https://example.org',
+    powerAction = null,
+    shuttingDown = false;
+const selectedIds = new Set();
 const bytes = n => n >= 1e9 ? `${(n/1e9).toFixed(1)} GB` : `${(n/1e6).toFixed(1)} MB`;
 const duration = n => `${Math.floor(n/60).toString().padStart(2,'0')}:${Math.floor(n%60).toString().padStart(2,'0')}`;
 const date = n => new Date(n).toLocaleString(undefined, {
@@ -22,7 +28,10 @@ const date = n => new Date(n).toLocaleString(undefined, {
 function tickAthensClock() {
     $('athens-clock').textContent = new Date().toLocaleString('en-GB', {
         timeZone: 'Europe/Athens',
-        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
     }) + ' Athens';
 }
 setInterval(tickAthensClock, 1000);
@@ -73,7 +82,10 @@ function updateButtons() {
     $('record').disabled = busy || !connected || !state?.ready;
     $('global-stop').disabled = busy || !connected;
     $('apply-config').disabled = busy || !!state?.recording;
+    $('shutdown-pi').disabled = busy || !!state?.recording;
+    $('reboot-pi').disabled = busy || !!state?.recording;
     $('capture-title').textContent = busy ? 'Working…' : state?.recording ? 'Recording' : 'Ready';
+    updateSelection();
 }
 
 function grid(target, scores) {
@@ -94,7 +106,7 @@ function preview() {
     else if (page !== 'live' || document.hidden || !connected || !state?.ready) $('feed').removeAttribute('src');
 }
 async function poll() {
-    if (document.hidden || $('login').open || polling) return;
+    if (document.hidden || $('login').open || polling || shuttingDown) return;
     polling = true;
     try {
         state = await api('/api/status');
@@ -296,9 +308,10 @@ function showPage(next) {
     if (next === 'library') loadLibrary();
 }
 
-function card(item) {
+function card(item, selectable = false) {
     const button = document.createElement('button');
     button.className = 'media-card';
+    button.type = 'button';
     button.setAttribute('aria-label', `View ${item.kind} ${date(item.created)}`);
     const image = document.createElement('img');
     image.src = `/media/${item.id}/thumb`;
@@ -313,7 +326,25 @@ function card(item) {
     info.append(title, time);
     button.append(image, info);
     button.onclick = () => openViewer(item);
-    return button;
+    if (!selectable) return button;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'media-card-wrap';
+    wrapper.classList.toggle('selected', selectedIds.has(item.id));
+    const label = document.createElement('label');
+    label.className = 'card-select';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selectedIds.has(item.id);
+    checkbox.setAttribute('aria-label', `Select ${item.kind} ${date(item.created)}`);
+    checkbox.onchange = () => {
+        if (checkbox.checked) selectedIds.add(item.id);
+        else selectedIds.delete(item.id);
+        wrapper.classList.toggle('selected', checkbox.checked);
+        updateSelection();
+    };
+    label.append(checkbox);
+    wrapper.append(button, label);
+    return wrapper;
 }
 async function recent() {
     try {
@@ -331,23 +362,34 @@ async function recent() {
         toast(e.message, true);
     }
 }
-async function loadLibrary(more = false) {
+async function loadLibrary(targetPage = libraryPage) {
     const version = ++libraryRequest;
     try {
-        if (!more) {
-            offset = 0;
-            $('library-grid').replaceChildren();
-        }
-        const result = await api(`/api/media?kind=${kind}&offset=${offset}`);
+        const result = await api(`/api/media?kind=${kind}&page=${targetPage}&per_page=40`);
         if (version !== libraryRequest) return;
-        $('library-grid').append(...result.items.map(card));
-        offset += result.items.length;
-        $('results-count').textContent = `${result.total} capture${result.total===1?'':'s'}`;
+        libraryPage = result.page;
+        libraryPages = result.pages;
+        pageItems = result.items;
+        $('library-grid').replaceChildren(...result.items.map(item => card(item, true)));
+        const first = result.total ? (result.page - 1) * result.per_page + 1 : 0;
+        const last = first ? first + result.items.length - 1 : 0;
+        $('results-count').textContent = result.total ? `${first}–${last} of ${result.total} captures` : '0 captures';
         $('library-empty').hidden = result.total !== 0;
-        $('load-more').hidden = offset >= result.total;
+        $('pagination').hidden = result.pages <= 1;
+        $('page-status').textContent = `Page ${result.page} of ${Math.max(1, result.pages)}`;
+        $('previous-page').disabled = result.page <= 1;
+        $('next-page').disabled = result.page >= result.pages;
+        updateSelection();
     } catch (e) {
         toast(e.message, true);
     }
+}
+
+function updateSelection() {
+    const count = selectedIds.size;
+    $('selection-count').textContent = `${count} selected`;
+    for (const id of ['clear-selection', 'download-selected', 'upload-selected', 'delete-selected']) $(id).disabled = !count || busy;
+    $('select-page').disabled = !pageItems.length || busy || pageItems.every(item => selectedIds.has(item.id));
 }
 async function openViewer(item) {
     viewed = item;
@@ -409,6 +451,53 @@ function videoFocus() {
         }
     grid($('viewer-grid'), sums.map((sum, i) => Math.max(0, squares[i] / counts[i] - (sum / counts[i]) ** 2)));
 }
+
+async function downloadSelection() {
+    if (!selectedIds.size || busy) return;
+    busy = true;
+    updateSelection();
+    try {
+        const response = await fetch('/api/media/download', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ids: [...selectedIds]
+            })
+        });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Download failed.');
+        }
+        const url = URL.createObjectURL(await response.blob());
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'cameradeck-media.zip';
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        toast(`${selectedIds.size} originals downloaded`);
+    } catch (e) {
+        toast(e.message, true);
+    } finally {
+        busy = false;
+        updateSelection();
+    }
+}
+
+function openPower(actionName) {
+    powerAction = actionName;
+    const confirmation = actionName.toUpperCase();
+    $('power-title').textContent = actionName === 'shutdown' ? 'Shut down Pi?' : 'Reboot Pi?';
+    $('power-warning').textContent = actionName === 'shutdown' ?
+        'CameraDeck will disconnect. Physical access is required to turn the Pi back on.' :
+        'CameraDeck will disconnect while the Pi restarts.';
+    $('power-confirm-label').textContent = confirmation;
+    $('power-confirm').value = '';
+    $('confirm-power').disabled = true;
+    $('power-dialog').showModal();
+}
+
 $('live-tab').onclick = () => showPage('live');
 $('library-tab').onclick = $('see-library').onclick = () => showPage('library');
 $('empty-live').onclick = () => showPage('live');
@@ -464,12 +553,91 @@ $('fullscreen').onclick = () => {
     promise?.catch(e => toast(e.message, true));
 };
 $('refresh-library').onclick = () => loadLibrary();
-$('load-more').onclick = () => loadLibrary(true);
+$('previous-page').onclick = () => loadLibrary(Math.max(1, libraryPage - 1));
+$('next-page').onclick = () => loadLibrary(Math.min(libraryPages, libraryPage + 1));
+$('select-page').onclick = () => {
+    pageItems.forEach(item => selectedIds.add(item.id));
+    loadLibrary();
+};
+$('clear-selection').onclick = () => {
+    selectedIds.clear();
+    loadLibrary();
+};
+$('download-selected').onclick = downloadSelection;
+$('delete-selected').onclick = () => {
+    if (!selectedIds.size || !confirm(`Permanently delete ${selectedIds.size} selected capture${selectedIds.size===1?'':'s'} from the Pi?`)) return;
+    action(async () => {
+        const result = await api('/api/media/delete', {
+            ids: [...selectedIds]
+        });
+        result.deleted.forEach(id => selectedIds.delete(id));
+        await recent();
+        await loadLibrary();
+        toast(`${result.deleted.length} capture${result.deleted.length===1?'':'s'} deleted`);
+    });
+};
+$('upload-selected').onclick = () => {
+    $('s3-endpoint').value = s3Endpoint;
+    $('upload-summary').textContent = `${selectedIds.size} selected original${selectedIds.size===1?'':'s'}`;
+    $('upload-result').textContent = '';
+    $('upload-dialog').showModal();
+};
+$('close-upload').onclick = $('cancel-upload').onclick = () => $('upload-dialog').close();
+$('upload-form').onsubmit = async event => {
+    event.preventDefault();
+    if (busy) return;
+    busy = true;
+    $('confirm-upload').disabled = true;
+    $('upload-result').textContent = 'Uploading…';
+    try {
+        const result = await api('/api/media/upload', {
+            ids: [...selectedIds],
+            endpoint: $('s3-endpoint').value,
+            bucket: $('s3-bucket').value,
+            prefix: $('s3-prefix').value
+        });
+        const complete = result.results.filter(item => ['uploaded', 'deduplicated', 'reconciled'].includes(item.status));
+        const unresolved = result.results.length - complete.length;
+        complete.forEach(item => selectedIds.delete(item.id));
+        const failures = result.results.filter(item => !complete.includes(item)).map(item => `${item.id}: ${item.error || item.status}`);
+        $('upload-result').textContent = `${complete.length} complete${unresolved ? `; ${unresolved} need attention and remain selected. ${failures.join(' ')}` : '.'}`;
+        updateSelection();
+        if (!unresolved) setTimeout(() => $('upload-dialog').close(), 900);
+    } catch (e) {
+        $('upload-result').textContent = e.message;
+    } finally {
+        busy = false;
+        $('confirm-upload').disabled = false;
+        updateSelection();
+    }
+};
 document.querySelectorAll('[data-kind]').forEach(button => button.onclick = () => {
     kind = button.dataset.kind;
+    libraryPage = 1;
     document.querySelectorAll('[data-kind]').forEach(b => b.classList.toggle('selected', b === button));
-    loadLibrary();
+    loadLibrary(1);
 });
+$('shutdown-pi').onclick = () => openPower('shutdown');
+$('reboot-pi').onclick = () => openPower('reboot');
+$('close-power').onclick = $('cancel-power').onclick = () => $('power-dialog').close();
+$('power-confirm').oninput = () => $('confirm-power').disabled = $('power-confirm').value.toLowerCase() !== powerAction;
+$('power-form').onsubmit = async event => {
+    event.preventDefault();
+    try {
+        await api('/api/system/power', {
+            action: powerAction,
+            confirm: $('power-confirm').value
+        });
+        shuttingDown = true;
+        $('power-dialog').close();
+        $('feed').removeAttribute('src');
+        $('connection').textContent = powerAction === 'shutdown' ? 'Pi is shutting down…' : 'Pi is rebooting…';
+        $('notice').hidden = false;
+        $('notice').textContent = powerAction === 'shutdown' ? 'The Pi is shutting down. Physical access is required to turn it back on.' : 'The Pi is rebooting. Reload this page after it starts.';
+    } catch (e) {
+        toast(e.message, true);
+    }
+};
 $('close-viewer').onclick = () => $('viewer').close();
 $('viewer').onclose = () => {
     $('viewer-video').pause();
@@ -499,6 +667,7 @@ $('delete-media').onclick = () => {
     if (!viewed || !confirm('Permanently delete this capture and its metadata from the Pi? Download it first if you want to keep it.')) return;
     action(async () => {
         await api(`/api/media/${viewed.id}`, {}, 'DELETE');
+        selectedIds.delete(viewed.id);
         $('viewer').close();
         await recent();
         await loadLibrary();
@@ -516,6 +685,7 @@ $('login-form').onsubmit = async e => {
         $('login').close();
         await poll();
         await recent();
+        s3Endpoint = (await api('/api/settings')).s3_endpoint;
     } catch (e) {
         $('login-error').textContent = e.message;
     }
@@ -537,12 +707,23 @@ async function checkServerTime() {
         const effective = t.epoch + (t.offset || 0);
         const drift = Math.abs(Date.now() / 1000 - effective);
         $('athens-time').textContent = new Date(t.athens).toLocaleString('en-GB', {
-            timeZone: 'Europe/Athens', year: 'numeric', month: 'short', day: 'numeric',
-            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+            timeZone: 'Europe/Athens',
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
         });
         $('server-time').textContent = new Date(t.utc).toLocaleString('en-GB', {
-            year: 'numeric', month: 'short', day: 'numeric',
-            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
         });
         if (drift > 30) {
             $('time-drift').hidden = false;
@@ -557,13 +738,23 @@ async function checkServerTime() {
 
 $('set-time').onclick = () => action(async () => {
     const raw = $('set-time-value').value;
-    if (!raw) { toast('Select a date and time first.', true); return; }
-    await api('/api/time', { time: raw });
+    if (!raw) {
+        toast('Select a date and time first.', true);
+        return;
+    }
+    await api('/api/time', {
+        time: raw
+    });
     toast('Time offset applied to Camera Deck');
     await checkServerTime();
 });
 
 (async () => {
     await poll();
-    if (connected) await recent();
+    if (connected) {
+        await recent();
+        try {
+            s3Endpoint = (await api('/api/settings')).s3_endpoint;
+        } catch (e) {}
+    }
 })();

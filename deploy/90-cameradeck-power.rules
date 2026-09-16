@@ -1,0 +1,13 @@
+// Permit only the CameraDeck service user to ask logind to power off or reboot.
+// Review the username before installing this root-owned file.
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.login1.power-off",
+        "org.freedesktop.login1.power-off-multiple-sessions",
+        "org.freedesktop.login1.reboot",
+        "org.freedesktop.login1.reboot-multiple-sessions"
+    ];
+    if (subject.user == "pi" && allowed.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+});

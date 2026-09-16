@@ -108,16 +108,16 @@ class CameraDeck:
         self.worker.start()
 
     def open(self, index, profile, fps, rotation=0):
-        from libcamera import Transform, controls
-        from picamera2 import Picamera2
-        from picamera2.encoders import JpegEncoder
-        from picamera2.outputs import FileOutput
-
         with self.lock:
             if self.recording:
                 raise ValueError(
                     "Stop recording before changing camera or video settings."
                 )
+            from libcamera import Transform, controls
+            from picamera2 import Picamera2
+            from picamera2.encoders import JpegEncoder
+            from picamera2.outputs import FileOutput
+
             if profile not in {"720p", "1080p"} or not 1 <= fps <= 30:
                 raise ValueError("Choose 720p or 1080p and 1–30 fps.")
             if rotation not in {0, 180}:

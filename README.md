@@ -4,7 +4,7 @@
 > This project was generated fully with AI, with no human intervention.
 > Full agent build transcript: https://ampcode.com/threads/T-01a07b1d-4f95-77de-937b-fa654d06b92f
 
-A passenger-friendly camera console for Raspberry Pi: local-first, no cloud, built on Picamera2 and libcamera. Supports cameras exposed by that stack, including Arducam B0569 / IMX415 and Raspberry Pi Camera Module 3 / 3 NoIR.
+A passenger-friendly, local-first camera console for Raspberry Pi, built on Picamera2 and libcamera, with optional explicit S3-compatible backup. Supports cameras exposed by that stack, including Arducam B0569 / IMX415 and Raspberry Pi Camera Module 3 / 3 NoIR.
 
 ## Design
 
@@ -56,7 +56,20 @@ Optional arguments: `--port 8080`, `--media /path/to/storage`. Use one process o
 - **Controls:** the main panel provides common controls; “Every camera control” exposes **all controls advertised by the configured camera**, including names, types, bounds, array lengths, and available enumerations. Values are JSON: `true`, `1.5`, `[1.8,1.4]`, or `[x,y,width,height]` for a crop. AF windows are arrays of rectangles. Unsupported names and invalid numeric values are rejected.
 - **Manual operation:** changing shutter/gain selects the corresponding manual mode on current libcamera (or disables AE on older versions). Set Shutter mode and Gain mode to Auto to restore automatic operation; older stacks show an Auto exposure toggle instead. Changing lens position selects manual focus; the one-shot button triggers autofocus. White-balance presets turn AWB on. For custom `ColourGains`, turn AWB off first. Advanced changes may require related controls; advertised controls do not guarantee every value is effective on every sensor.
 - **Sharpness grid:** optional live 3×3 Laplacian-variance scores, sampled twice per second from a small shared preview. The brightest score label marks the highest-detail region in that frame, not a guaranteed in-focus region. Still scores are stored in the JSON sidecar. Video-review scores are calculated from the displayed/paused/seeked frame on the client, not by decoding full videos on the Pi. Compare the same scene and settings; live, still, and video scores are not calibrated against each other.
-- **Library:** newest first, photo/video filters, 40-item pages, 480px thumbnails, then up-to-1600px still previews. Load full resolution explicitly or download the original. Video supports seeking/range requests. Download JSON metadata for exposure and camera settings. Deletion requires confirmation and removes the original and its derived files permanently.
+- **Library:** newest first, photo/video filters, 40-item Previous/Next pages, selectable cards, ZIP download, bulk deletion, and optional S3 upload. Load full resolution explicitly or download one original from the viewer. Video supports seeking/range requests. Download JSON metadata for exposure and camera settings. Deletion requires confirmation and removes the original and its derived files permanently.
+- **Power:** the controls panel can reboot or shut down the Pi after typed confirmation. Power actions are refused while recording. A shutdown requires physical access or separate hardware to restore power.
+
+### Optional S3-compatible upload
+
+Set the server shown initially in the upload dialog; the requested example default is:
+
+```bash
+CAMERADECK_S3_ENDPOINT=example.org
+```
+
+Select library items, choose **Upload to S3**, and enter the bucket plus an optional prefix. Credentials remain server-side and use boto3's standard AWS credential chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, profiles, or an instance role). The endpoint must use HTTPS except for localhost development. Local media is never removed after upload.
+
+CameraDeck hashes every original with SHA-256 and uses a content-addressed object key. A durable SQLite ledger, conditional object creation, and remote metadata checks deduplicate copies, renames, concurrent requests, and process restarts for each endpoint/bucket/prefix destination. If a network failure makes the result ambiguous, CameraDeck marks it **uncertain** and will only reconcile with `HEAD`; it will not send the bytes again. This strict at-most-once behavior requires an S3-compatible server that supports conditional `PutObject` and read-after-write-consistent `HeadObject`. Resolve an uncertain object at the server rather than deleting CameraDeck's `.uploads.sqlite3` ledger.
 
 ## Camera compatibility
 
@@ -70,7 +83,7 @@ The Pi 4 normally has one CSI connector; this is not a simultaneous three-camera
 
 ## Storage and interrupted sessions
 
-Captures stay under `media/` (gitignored). Originals are never uploaded. Each completed capture has a `.json` metadata sidecar, `.thumb.jpg`, and `.preview.jpg`. The library only publishes completed sidecars; recording files are not offered as downloads until finalized.
+Captures stay under `media/` (gitignored). Originals are uploaded only after explicit selection and confirmation. Each completed capture has a `.json` metadata sidecar, `.thumb.jpg`, and `.preview.jpg`. The library only publishes completed sidecars; recording files are not offered as downloads until finalized.
 
 Capture is refused below 256 MiB free; a server-side watchdog checks every two seconds and stops recording at that threshold, even without a connected browser. Other processes can still exhaust the disk between checks. Use reliable power and adequate storage; abrupt removal of power can damage the filesystem.
 
@@ -78,16 +91,21 @@ Video uses fragmented MP4 with approximately one-second keyframe intervals. Grac
 
 ## Optional boot service
 
-An example unit is provided in `deploy/cameradeck.service`. Review its user, paths, and network binding before installing it. Put a strong `CAMERADECK_PASSWORD=...` in `/home/pi/cameradeck/.env` with permissions `chmod 600 .env`. This service is **not installed or enabled automatically**.
+An example unit is provided in `deploy/cameradeck.service`. Review its user, paths, and network binding before installing it. Put a strong `CAMERADECK_PASSWORD=...` and any S3 credentials/endpoint override in `/home/pi/cameradeck/.env` with permissions `chmod 600 .env`. This service is **not installed or enabled automatically**.
 
 ```bash
 sudo cp deploy/cameradeck.service /etc/systemd/system/
+sudo cp deploy/90-cameradeck-power.rules /etc/polkit-1/rules.d/
+sudo chown root:root /etc/polkit-1/rules.d/90-cameradeck-power.rules
+sudo chmod 644 /etc/polkit-1/rules.d/90-cameradeck-power.rules
 sudo systemctl daemon-reload
 sudo systemctl enable --now cameradeck
 journalctl -u cameradeck -f
 ```
 
 Stop any manually running CameraDeck/rpicam application first. To release the camera for another tool, stop the service with `sudo systemctl stop cameradeck`.
+
+The polkit rule grants only the `pi` service user the logind power-off/reboot actions and keeps the service's `NoNewPrivileges=true` hardening. Review and change the username in both deployment files if CameraDeck runs as another user. Without this root-owned rule, power requests fail safely and are logged; never run CameraDeck as root or grant it unrestricted sudo.
 
 ## Development and verification
 
@@ -100,7 +118,7 @@ uv run python tests/browser_smoke.py
 
 Unit/API tests do not open a real camera. The explicit browser smoke test **does** change camera settings, take real stills, record video, exercise playback/seek/focus/download/delete, and check desktop/mobile layouts. It restores the initial video settings and deletes only its own captures. Override `CAMERADECK_TEST_URL`, `CAMERADECK_PASSWORD`, or `CHROMIUM` as needed. Screenshots/downloads remain in ignored `test-results/`; inspect them locally and do not publish private camera scenes.
 
-Code formatting: `uv run black app.py camera.py tests`, `uv run js-beautify -r static/app.js`, `uv run css-beautify -r static/style.css`.
+Code formatting: `uv run black app.py camera.py power.py storage.py tests`, `uv run js-beautify -r static/app.js`, `uv run css-beautify -r static/style.css`.
 
 ### Verified on the connected Pi 4 / B0569 (7 September 2026)
 
@@ -111,6 +129,6 @@ Code formatting: `uv run black app.py camera.py tests`, `uv run js-beautify -r s
 
 ## Architecture
 
-`camera.py` owns camera lifecycle, shared frames, controls, capture, media derivatives, and clip recovery. `app.py` owns HTTP/authentication, streaming and range delivery, and storage protection. `static/` is a small dependency-free browser client. Capture/reconfigure operations share a lock; MJPEG clients consume the latest frame rather than accumulating queues. A two-thread software JPEG encoder handles the small preview, leaving Pi 4's hardware encoder for H.264. Full-resolution images are processed only after a capture, not continuously.
+`camera.py` owns camera lifecycle, shared frames, controls, capture, media derivatives, and clip recovery. `app.py` owns HTTP/authentication, streaming, range/ZIP delivery, pagination, and storage protection. `storage.py` owns S3 delivery and its deduplication ledger; `power.py` owns the fixed host power commands. `static/` is a small dependency-free browser client. Capture/reconfigure operations share a lock; MJPEG clients consume the latest frame rather than accumulating queues. A two-thread software JPEG encoder handles the small preview, leaving Pi 4's hardware encoder for H.264. Full-resolution images are processed only after a capture, not continuously.
 
 References: [Picamera2](https://github.com/raspberrypi/picamera2), [official examples](https://github.com/raspberrypi/picamera2-examples), [Arducam IMX415 guide](https://docs.arducam.com/Raspberry-Pi-Camera/Native-camera/8.3MP-IMX415/).

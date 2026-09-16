@@ -393,6 +393,7 @@ main {
 
 .media-card {
     display: block;
+    width: 100%;
     padding: 0;
     border: 0;
     border-radius: 0;
@@ -422,6 +423,34 @@ main {
 .card-info strong {
     color: #111;
     font-weight: 500;
+}
+
+.media-card-wrap {
+    position: relative;
+    min-width: 0;
+    border: 2px solid transparent;
+    padding: 2px;
+}
+
+.media-card-wrap.selected {
+    border-color: #111;
+}
+
+.card-select {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    background: #fffd;
+    border: 1px solid #111;
+    cursor: pointer;
+}
+
+.card-select input {
+    margin: 0;
 }
 
 .controls-panel {
@@ -584,6 +613,24 @@ footer {
     margin-bottom: 24px;
 }
 
+.selection-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px 0;
+    margin-bottom: 20px;
+    border-block: 1px solid var(--line);
+}
+
+.selection-toolbar strong {
+    min-width: 80px;
+}
+
+.selection-spacer {
+    flex: 1;
+}
+
 .filter-group {
     display: flex;
     gap: 6px;
@@ -613,9 +660,18 @@ footer {
     color: var(--muted);
 }
 
-#load-more {
+.pagination {
     display: flex;
-    margin: 24px auto;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    margin: 28px auto;
+}
+
+.pagination span {
+    min-width: 90px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
 }
 
 .notice {
@@ -660,8 +716,48 @@ dialog::backdrop {
     background: #0009;
 }
 
-.viewer-header {
+.viewer-header,
+.dialog-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
     margin-bottom: 16px;
+}
+
+#upload-dialog,
+#power-dialog {
+    max-width: 520px;
+}
+
+#upload-dialog label,
+#power-dialog label {
+    margin: 18px 0;
+}
+
+.dialog-actions,
+.power-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.power-panel {
+    padding-bottom: 18px;
+}
+
+.power-panel .power-actions {
+    justify-content: stretch;
+}
+
+.power-panel button {
+    flex: 1;
+}
+
+#upload-result {
+    min-height: 24px;
+    font-weight: 600;
 }
 
 .eyebrow {
@@ -851,6 +947,20 @@ dialog::backdrop {
 
     .library-toolbar {
         flex-wrap: wrap;
+    }
+
+    .selection-toolbar {
+        align-items: stretch;
+    }
+
+    .selection-toolbar strong,
+    .selection-spacer {
+        width: 100%;
+        flex-basis: 100%;
+    }
+
+    .selection-toolbar button {
+        flex: 1 1 120px;
     }
 
     .filter-group button {

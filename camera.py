@@ -78,6 +78,18 @@ class CameraDeck:
         self.modes = []
         self.properties = {}
         self.output_error = None
+        self.sequence = None
+        self.sequence_stop = threading.Event()
+        self.sequence_worker = None
+        self.sequence_settings = {
+            "stills": {"interval": 5, "count": 0, "controls": {}},
+            "test": {
+                "shutters": [500, 1000, 2000, 4000],
+                "gains": [1, 2, 4, 8],
+                "settle": 2,
+                "samples": 1,
+            },
+        }
         self._offset_path = self.root / ".time_offset"
         self.time_offset = self._load_offset()
 
@@ -109,6 +121,7 @@ class CameraDeck:
 
     def open(self, index, profile, fps, rotation=0):
         with self.lock:
+            self._sequence_guard()
             if self.recording:
                 raise ValueError(
                     "Stop recording before changing camera or video settings."
@@ -208,10 +221,177 @@ class CameraDeck:
 
     def set_controls(self, values):
         with self.lock:
+            self._sequence_guard()
             self.require_camera()
             checked = validate_controls(values, self.schema)
             self.camera.set_controls(checked)
             self.applied.update(plain(checked))
+
+    def _sequence_guard(self):
+        if (
+            self.sequence
+            and self.sequence["active"]
+            and threading.current_thread() is not self.sequence_worker
+        ):
+            raise ValueError("Stop the capture sequence before changing the camera.")
+
+    def _manual_exposure(self, shutter, gain):
+        values = {"ExposureTime": shutter, "AnalogueGain": gain}
+        for name in ("ExposureTimeMode", "AnalogueGainMode"):
+            if name in self.schema:
+                values[name] = self.schema[name]["options"].get("Manual", 1)
+            elif "AeEnable" in self.schema:
+                values["AeEnable"] = False
+            else:
+                raise ValueError(
+                    "This camera does not advertise manual exposure control."
+                )
+        return validate_controls(values, self.schema)
+
+    def start_sequence(self, mode, settings):
+        with self.lock:
+            self._sequence_guard()
+            self.require_camera()
+            if self.recording:
+                raise ValueError("Stop recording before starting a capture sequence.")
+            if (
+                not isinstance(mode, str)
+                or mode not in self.sequence_settings
+                or not isinstance(settings, dict)
+            ):
+                raise ValueError("Choose stills or test with a settings object.")
+            if set(settings) - set(self.sequence_settings[mode]):
+                raise ValueError("Unknown sequence setting.")
+            settings = {**self.sequence_settings[mode], **settings}
+
+            def number(name, low, high, integer=False):
+                value = settings[name]
+                if (
+                    type(value) not in (int, float)
+                    or not math.isfinite(value)
+                    or not low <= value <= high
+                    or (integer and type(value) is not int)
+                ):
+                    raise ValueError(
+                        f"{name} must be {'an integer' if integer else 'a number'} between {low} and {high}."
+                    )
+
+            if mode == "stills":
+                number("interval", 1, 86400)
+                number("count", 0, 10000, True)
+                values = settings["controls"]
+                if not isinstance(values, dict):
+                    raise ValueError("Still controls must be a JSON object.")
+                plan = [validate_controls(values, self.schema) if values else {}]
+                total = settings["count"]
+            else:
+                number("settle", 0.5, 30)
+                number("samples", 1, 5, True)
+                for name in ("shutters", "gains"):
+                    values = settings[name]
+                    if (
+                        not isinstance(values, list)
+                        or not 1 <= len(values) <= 8
+                        or any(
+                            type(v) not in (int, float)
+                            or not math.isfinite(v)
+                            or v <= 0
+                            for v in values
+                        )
+                    ):
+                        raise ValueError(f"{name}: supply 1–8 positive numbers.")
+                plan = [
+                    self._manual_exposure(s, g)
+                    for s in settings["shutters"]
+                    for g in settings["gains"]
+                ]
+                total = len(plan) * settings["samples"]
+            self._space()
+            self.sequence_settings[mode] = plain(settings)
+            self.sequence_stop.clear()
+            self.sequence = dict(
+                id=uuid4().hex,
+                mode=mode,
+                active=True,
+                completed=0,
+                total=total,
+                current={},
+                results=[],
+                error=None,
+                settings=plain(settings),
+            )
+            saved = (
+                self.index,
+                self.profile,
+                self.fps,
+                self.rotation,
+                dict(self.applied),
+            )
+            self.sequence_worker = threading.Thread(
+                target=self._run_sequence, args=(plan, saved), daemon=True
+            )
+            self.sequence_worker.start()
+            return dict(self.sequence)
+
+    def stop_sequence(self):
+        # Do not wait for the camera lock: a full-resolution capture may be in progress.
+        self.sequence_stop.set()
+        return {"ok": True}
+
+    def _run_sequence(self, plan, saved):
+        run = self.sequence
+        settings = run["settings"]
+        try:
+            while not self.sequence_stop.is_set() and not self.shutdown.is_set():
+                started = time.monotonic()
+                index = run["completed"]
+                values = (
+                    plan[index // settings["samples"]]
+                    if run["mode"] == "test"
+                    else plan[0]
+                )
+                with self.lock:
+                    run["current"] = plain(values)
+                    if values:
+                        self.set_controls(values)
+                if run["mode"] == "test" and self.sequence_stop.wait(
+                    settings["settle"]
+                ):
+                    break
+                if self.sequence_stop.is_set() or self.shutdown.is_set():
+                    break
+                item = self.capture()
+                with self.lock:
+                    run["completed"] += 1
+                    result = {
+                        k: item[k] for k in ("id", "metadata", "focus", "settings")
+                    }
+                    run["results"] = (
+                        (run["results"] + [result])
+                        if run["mode"] == "test"
+                        else [result]
+                    )
+                if run["total"] and run["completed"] >= run["total"]:
+                    break
+                if run["mode"] == "stills":
+                    if self.sequence_stop.wait(
+                        max(0, settings["interval"] - (time.monotonic() - started))
+                    ):
+                        break
+        except Exception as exc:
+            run["error"] = str(exc)
+        finally:
+            with self.lock:
+                try:
+                    # Reconfigure to restore automatic defaults as well as explicitly set controls.
+                    self.open(*saved[:4])
+                    if saved[4]:
+                        self.set_controls(saved[4])
+                except Exception as exc:
+                    run["error"] = (
+                        run["error"] or ""
+                    ) + f" Could not restore camera: {exc}"
+                run["active"] = False
 
     def _space(self):
         if shutil.disk_usage(self.root).free < 256 * 1024 * 1024:
@@ -253,8 +433,16 @@ class CameraDeck:
 
     def capture(self):
         with self.lock:
+            self._sequence_guard()
             self.require_camera()
             item = self._new("still")
+            if self.sequence and self.sequence["active"]:
+                item["sequence"] = {
+                    "id": self.sequence["id"],
+                    "mode": self.sequence["mode"],
+                    "number": self.sequence["completed"] + 1,
+                    "settings": self.sequence["settings"],
+                }
             item["file"] = item["id"] + ".jpg"
             path = self.root / item["file"]
             if self.recording:
@@ -287,13 +475,14 @@ class CameraDeck:
                 return self._finish(item, image)
 
     def start_recording(self):
-        from picamera2.encoders import H264Encoder
-        from picamera2.outputs import PyavOutput
-
         with self.lock:
+            self._sequence_guard()
             self.require_camera()
             if self.recording:
                 raise ValueError("A recording is already running.")
+            from picamera2.encoders import H264Encoder
+            from picamera2.outputs import PyavOutput
+
             item = self._new("video")
             item["file"] = item["id"] + ".mp4"
             item["width"], item["height"] = self.camera.stream_configuration("main")[
@@ -383,12 +572,17 @@ class CameraDeck:
             focus=self.focus if self.focus_enabled else [],
             focus_enabled=self.focus_enabled,
             recording=rec["item"]["id"] if rec else None,
+            sequence=self.sequence,
+            sequence_settings=self.sequence_settings,
             elapsed=round(time.monotonic() - rec["started"], 1) if rec else 0,
             free_bytes=shutil.disk_usage(self.root).free,
         )
 
     def close(self):
         self.shutdown.set()
+        self.sequence_stop.set()
+        if self.sequence_worker:
+            self.sequence_worker.join()
         with self.lock:
             if self.recording:
                 self.stop_recording()

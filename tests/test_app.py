@@ -443,3 +443,204 @@ def test_s3_overwritten_file_gets_a_new_content_key(deck):
     assert first.status == second.status == "uploaded"
     assert first.key != second.key
     assert s3.puts == 2
+
+
+@pytest.fixture
+def sequence_deck(deck):
+    deck.schema = {
+        "ExposureTime": spec("Integer32", 100, 10000),
+        "AnalogueGain": spec("Float", 1, 8),
+        "AeEnable": spec("Bool"),
+    }
+    deck.camera = Mock()
+    deck.camera.camera_configuration.return_value = {"transform": None}
+    deck.camera.sensor_resolution = (80, 60)
+
+    def photo(config, path, delay):
+        Image.new("RGB", (80, 60), "gray").save(path)
+        return {
+            "ExposureTime": deck.applied.get("ExposureTime", 6000),
+            "AnalogueGain": deck.applied.get("AnalogueGain", 1),
+        }
+
+    deck.camera.switch_mode_and_capture_file.side_effect = photo
+    deck.open = Mock(side_effect=lambda *args: deck.applied.clear())
+    yield deck
+    deck.stop_sequence()
+    if deck.sequence_worker:
+        deck.sequence_worker.join(5)
+        assert not deck.sequence_worker.is_alive()
+
+
+def test_periodic_stills_publish_limit_and_restore(sequence_deck):
+    deck = sequence_deck
+    deck.applied = {"ExposureTime": 7000, "AeEnable": False}
+    deck.start_sequence(
+        "stills", {"interval": 1, "count": 2, "controls": {"ExposureTime": 1300}}
+    )
+    deck.sequence_worker.join(4)
+    assert not deck.sequence["active"]
+    assert deck.sequence["completed"] == 2
+    assert deck.sequence["error"] is None
+    items = [json.loads(p.read_text()) for p in deck.root.glob("*.json")]
+    assert len(items) == 2
+    assert {i["sequence"]["number"] for i in items} == {1, 2}
+    assert all(i["metadata"]["ExposureTime"] == 1300 for i in items)
+    assert all(i["capture_mode"] == "full sensor" for i in items)
+    assert deck.applied == {"ExposureTime": 7000, "AeEnable": False}
+    deck.open.assert_called_once_with(0, "720p", 15, 0)
+    assert deck.sequence_settings["test"]["samples"] == 1
+
+
+@pytest.mark.parametrize("modern", [False, True])
+def test_test_sweep_all_pairs_metadata_and_restore(sequence_deck, modern):
+    deck = sequence_deck
+    if modern:
+        del deck.schema["AeEnable"]
+        for name in ("ExposureTimeMode", "AnalogueGainMode"):
+            deck.schema[name] = spec(
+                "Integer32", 0, 1, options={"Auto": 0, "Manual": 1}
+            )
+    deck.start_sequence(
+        "test",
+        {"shutters": [700, 2300], "gains": [1.5, 3], "settle": 0.5, "samples": 2},
+    )
+    deck.sequence_worker.join(7)
+    assert deck.sequence["error"] is None
+    assert not deck.sequence["active"]
+    results = deck.sequence["results"]
+    assert [
+        (r["metadata"]["ExposureTime"], r["metadata"]["AnalogueGain"]) for r in results
+    ] == [
+        (700, 1.5),
+        (700, 1.5),
+        (700, 3),
+        (700, 3),
+        (2300, 1.5),
+        (2300, 1.5),
+        (2300, 3),
+        (2300, 3),
+    ]
+    if modern:
+        assert all(
+            r["settings"]["ExposureTimeMode"] == r["settings"]["AnalogueGainMode"] == 1
+            for r in results
+        )
+    else:
+        assert all(r["settings"]["AeEnable"] is False for r in results)
+    assert deck.applied == {}
+
+
+def test_sequence_stop_interrupts_settle_and_blocks_conflicts(sequence_deck):
+    deck = sequence_deck
+    client = create_app(deck, power_manager=Mock()).test_client()
+    assert (
+        client.post(
+            "/api/sequence/start", json={"mode": "test", "settings": {"settle": 30}}
+        ).status_code
+        == 200
+    )
+    for path, data in [
+        ("/api/sequence/start", {"mode": "stills"}),
+        ("/api/capture", {}),
+        ("/api/record/start", {}),
+        ("/api/controls", {"ExposureTime": 1500}),
+    ]:
+        assert client.post(path, json=data).status_code == 400
+    # Use the real guard; open itself is mocked only to avoid importing Pi hardware.
+    with pytest.raises(ValueError, match="Stop the capture sequence"):
+        CameraDeck.open(deck, 0, "720p", 15)
+    assert (
+        client.post(
+            "/api/system/power", json={"action": "reboot", "confirm": "reboot"}
+        ).status_code
+        == 409
+    )
+    assert client.post("/api/sequence/stop", json={}).status_code == 200
+    deck.sequence_worker.join(2)
+    assert not deck.sequence["active"]
+    assert deck.sequence["completed"] == 0
+    assert deck.sequence["error"] is None
+
+
+@pytest.mark.parametrize(
+    "mode,settings",
+    [
+        ([], {}),
+        ("invalid", {}),
+        ("stills", {"interval": 0}),
+        ("stills", {"count": True}),
+        ("stills", {"count": 1.5}),
+        ("stills", {"interval": float("nan")}),
+        ("stills", {"controls": []}),
+        ("stills", {"controls": {"Unknown": 1}}),
+        ("test", {"shutters": [99]}),
+        ("test", {"gains": [9]}),
+        ("test", {"shutters": [500.5]}),
+        ("test", {"gains": []}),
+        ("test", {"samples": 6}),
+        ("test", {"settle": 0}),
+        ("test", {"gains": [True]}),
+    ],
+)
+def test_sequence_rejects_invalid_before_camera_changes(sequence_deck, mode, settings):
+    deck = sequence_deck
+    response = (
+        create_app(deck)
+        .test_client()
+        .post("/api/sequence/start", json={"mode": mode, "settings": settings})
+    )
+    assert response.status_code == 400
+    assert deck.sequence is None
+    deck.camera.set_controls.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["capture", "storage"])
+def test_sequence_failure_stops_and_restores(sequence_deck, failure):
+    deck = sequence_deck
+    deck.applied = {"AeEnable": True}
+    if failure == "capture":
+        deck.camera.switch_mode_and_capture_file.side_effect = OSError("write failed")
+    else:
+        deck._space = Mock(side_effect=[None, ValueError("256 MB")])
+    deck.start_sequence("stills", {"count": 3})
+    deck.sequence_worker.join(2)
+    assert not deck.sequence["active"]
+    assert deck.sequence["completed"] == 0
+    assert ("write failed" if failure == "capture" else "256 MB") in deck.sequence[
+        "error"
+    ]
+    assert deck.applied == {"AeEnable": True}
+    assert not list(deck.root.glob("*.json"))
+
+
+@pytest.mark.parametrize("capture_time,delay", [(0.25, 1.75), (3.5, 0)])
+def test_periodic_cadence_and_stop_during_interval(
+    sequence_deck, monkeypatch, capture_time, delay
+):
+    deck = sequence_deck
+    monkeypatch.setattr(
+        "camera.time.monotonic", Mock(side_effect=[10, 10 + capture_time])
+    )
+    # End an unlimited run at its first interval, without sleeping in the test.
+    deck.sequence_stop.wait = Mock(return_value=True)
+    deck.start_sequence("stills", {"interval": 2, "count": 0})
+    deck.sequence_worker.join(2)
+    assert deck.sequence["error"] is None
+    assert deck.sequence["completed"] == 1
+    deck.sequence_stop.wait.assert_called_once_with(delay)
+    assert not deck.sequence["active"]
+
+
+def test_recording_blocks_sequence_and_close_stops_worker(sequence_deck):
+    deck = sequence_deck
+    deck.recording = {"item": {"id": "ongoing"}}
+    with pytest.raises(ValueError, match="Stop recording"):
+        deck.start_sequence("stills", {})
+    deck.recording = None
+    deck.start_sequence("test", {"settle": 30})
+    deck.close()
+    assert not deck.sequence_worker.is_alive()
+    assert not deck.sequence["active"]
+    assert deck.sequence["completed"] == 0
+    assert deck.camera is None

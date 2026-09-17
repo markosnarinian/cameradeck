@@ -222,6 +222,15 @@ def create_app(
     def record_stop():
         return jsonify(deck.stop_recording())
 
+    @app.post("/api/sequence/start")
+    def sequence_start():
+        data = request.get_json()
+        return jsonify(deck.start_sequence(data.get("mode"), data.get("settings", {})))
+
+    @app.post("/api/sequence/stop")
+    def sequence_stop():
+        return jsonify(deck.stop_sequence())
+
     @app.get("/stream.mjpg")
     def stream():
         if not viewers.acquire(blocking=False):
@@ -477,8 +486,13 @@ def create_app(
         confirmation = data.get("confirm")
         if not isinstance(confirmation, str) or confirmation.casefold() != action:
             raise ValueError(f"Type {action.upper()} to confirm.")
-        if deck.recording:
-            return jsonify(error="Stop recording before changing Pi power."), 409
+        if deck.recording or (deck.sequence and deck.sequence["active"]):
+            return (
+                jsonify(
+                    error="Stop recording or the capture sequence before changing Pi power."
+                ),
+                409,
+            )
         try:
             power_manager.schedule(action)
         except RuntimeError as exc:

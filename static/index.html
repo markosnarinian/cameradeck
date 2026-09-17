@@ -41,24 +41,24 @@
           <label>Capture mode<select id="capture-mode"><option value="video">Video</option><option value="stills">Periodic stills</option><option value="test">Camera test</option></select></label>
           <div id="stills-settings" class="config-form" hidden>
             <h2>Periodic still settings</h2>
-            <label>Interval · seconds<input id="still-interval" type="number" min="1" max="86400" value="5"></label>
+            <label>Interval · seconds<input id="still-interval" type="number" min="1" max="86400" value="1"></label>
             <label>Photo limit · 0 until stopped<input id="still-count" type="number" min="0" max="10000" value="0"></label>
             <label>Still-only control overrides · JSON<textarea id="still-controls" rows="3" spellcheck="false">{}</textarea></label>
-            <p class="help">Full-sensor JPEGs. First photo immediately; slower captures extend the interval without queuing. Controls override the current camera settings only for this run. Use advertised control names below. Runs on the Pi until stopped, full, or the limit is reached.</p>
+            <p class="help">Truck default: one full-sensor JPEG per second (about 8.3 m apart at 30 km/h). Slower captures increase that gap; use video for continuous coverage. First photo immediately. Overrides apply only to this run; otherwise current camera controls apply. Runs until stopped, storage is low, or the limit is reached.</p>
           </div>
           <div id="test-settings" class="config-form" hidden>
             <h2>Low-light motion test</h2>
-            <label>Shutter times · µs, comma-separated<input id="test-shutters" value="500, 1000, 2000, 4000"></label>
-            <label>Analogue gains · comma-separated<input id="test-gains" value="1, 2, 4, 8"></label>
+            <label>Shutter times · µs, comma-separated<input id="test-shutters" value="1000, 2000, 4000, 8000"></label>
+            <label>Analogue gains · comma-separated<input id="test-gains" value="2, 4, 8"></label>
             <label>Settle time · seconds<input id="test-settle" type="number" min="0.5" max="30" step="0.5" value="2"></label>
-            <label>Photos per combination<input id="test-samples" type="number" min="1" max="5" value="1"></label>
-            <p class="help">Tries every shutter/gain pair supported by your camera; unsupported values must be corrected before starting. 500 µs = 1/2000 s. Short exposures reduce blur but need more light or gain. Repeat the same scene/motion safely; never operate while driving. Previous settings are restored after stop or completion.</p>
+            <label>Photos per combination<input id="test-samples" type="number" min="1" max="5" value="3"></label>
+            <p class="help">Dawn/twilight, 0–30 km/h: 36 photos across 1/1000–1/125 s and 2×–8× gain. Start comparison around 2000 µs (1/500 s); 8000 µs is a brighter, more blur-prone reference. Higher gain adds noise. Unsupported values must be corrected. Repeat the same scene/motion safely; never operate while driving. Previous settings are restored afterward.</p>
           </div>
           <form id="configure-form" class="config-form">
             <label>Connected camera<select id="camera-select" aria-label="Connected camera"></select></label>
-            <div class="two-col"><label>Video resolution<select id="profile"><option value="720p">1280 × 720</option><option value="1080p">1920 × 1080</option></select></label><label>Target fps<input id="fps" type="number" min="1" max="30" step="0.01" value="15"></label></div>
+            <div class="two-col"><label>Video resolution<select id="profile"><option value="720p">1280 × 720</option><option value="1080p" selected>1920 × 1080</option></select></label><label>Target fps<input id="fps" type="number" min="1" max="30" step="0.01" value="30"></label></div>
             <label>Mounting orientation<select id="rotation"><option value="0">Normal · 0°</option><option value="180">Upside-down mount · 180°</option></select></label>
-            <button class="wide" id="apply-config">Apply video settings</button><small class="help">Sensor limits apply. Changing settings resets camera controls and briefly pauses preview.</small>
+            <button class="wide" id="apply-config">Apply video settings</button><small class="help">Truck default: 1080p, up to 30 fps (sensor-limited). Applying settings restores automatic exposure/gain and short-exposure preference where supported; preview pauses briefly. AE Short depends on camera tuning, not a fixed shutter cap. Check actual shutter time for blur.</small>
           </form>
           <details open><summary>Exposure</summary><div id="exposure-controls" class="control-group"></div></details>
           <details><summary>Colour & detail</summary><div id="colour-controls" class="control-group"></div></details>

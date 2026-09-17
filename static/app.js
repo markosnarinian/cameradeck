@@ -199,6 +199,7 @@ async function poll() {
 const groups = {
     exposure: [
         ['AeEnable', 'Auto exposure'],
+        ['AeExposureMode', 'Auto exposure preference'],
         ['ExposureTimeMode', 'Shutter mode'],
         ['AnalogueGainMode', 'Gain mode'],
         ['ExposureValue', 'Exposure compensation'],

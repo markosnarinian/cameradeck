@@ -71,8 +71,8 @@ class CameraDeck:
         self.preview = None
         self.cameras = []
         self.index = 0
-        self.profile = "720p"
-        self.fps = 15
+        self.profile = "1080p"
+        self.fps = 30
         self.rotation = 0
         self.schema = {}
         self.modes = []
@@ -82,12 +82,12 @@ class CameraDeck:
         self.sequence_stop = threading.Event()
         self.sequence_worker = None
         self.sequence_settings = {
-            "stills": {"interval": 5, "count": 0, "controls": {}},
+            "stills": {"interval": 1, "count": 0, "controls": {}},
             "test": {
-                "shutters": [500, 1000, 2000, 4000],
-                "gains": [1, 2, 4, 8],
+                "shutters": [1000, 2000, 4000, 8000],
+                "gains": [2, 4, 8],
                 "settle": 2,
-                "samples": 1,
+                "samples": 3,
             },
         }
         self._offset_path = self.root / ".time_offset"
@@ -185,6 +185,7 @@ class CameraDeck:
                 self.preview.frame_skip_count = max(1, round(fps / 10))
                 self.preview.output = FileOutput(self.frames)
                 self.applied = {}
+                self._apply_motion_defaults()
                 if "AfMode" in self.schema:
                     p.set_controls({"AfMode": controls.AfModeEnum.Continuous})
                     self.applied["AfMode"] = int(controls.AfModeEnum.Continuous)
@@ -200,6 +201,24 @@ class CameraDeck:
                     self.camera.close()
                     self.camera = None
                 raise
+
+    def _apply_motion_defaults(self):
+        """Prefer short AE exposures without fixing brightness as daylight changes."""
+        values = {
+            name: True for name in ("AeEnable", "AwbEnable") if name in self.schema
+        }
+        for name in ("ExposureTimeMode", "AnalogueGainMode"):
+            if name in self.schema:
+                values[name] = 0  # libcamera Auto; do not pin either shutter or gain.
+        spec = self.schema.get("AeExposureMode")
+        if spec:
+            for label in ("Short", "ExposureShort"):
+                short = spec["options"].get(label)
+                if short is not None and spec["min"] <= short <= spec["max"]:
+                    values["AeExposureMode"] = short
+                    break
+        if values:
+            self.set_controls(values)
 
     def _metadata(self, request):
         self.metadata = plain(request.get_metadata())

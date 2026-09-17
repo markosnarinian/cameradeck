@@ -488,8 +488,8 @@ def test_periodic_stills_publish_limit_and_restore(sequence_deck):
     assert all(i["metadata"]["ExposureTime"] == 1300 for i in items)
     assert all(i["capture_mode"] == "full sensor" for i in items)
     assert deck.applied == {"ExposureTime": 7000, "AeEnable": False}
-    deck.open.assert_called_once_with(0, "720p", 15, 0)
-    assert deck.sequence_settings["test"]["samples"] == 1
+    deck.open.assert_called_once_with(0, "1080p", 30, 0)
+    assert deck.sequence_settings["test"]["samples"] == 3
 
 
 @pytest.mark.parametrize("modern", [False, True])
@@ -644,3 +644,86 @@ def test_recording_blocks_sequence_and_close_stops_worker(sequence_deck):
     assert not deck.sequence["active"]
     assert deck.sequence["completed"] == 0
     assert deck.camera is None
+
+
+@pytest.mark.parametrize("ceiling,expected", [(15.75, 15.75), (60, 30)])
+def test_truck_defaults_applied_on_camera_open(deck, monkeypatch, ceiling, expected):
+    import enum
+    import sys
+    from types import SimpleNamespace
+
+    exposure = enum.IntEnum("AeExposureModeEnum", {"Normal": 0, "Short": 1, "Long": 2})
+    camera = Mock()
+    camera.sensor_modes = [{"size": (1920, 1080), "fps": ceiling}]
+    camera.camera_properties = {"Model": "test sensor"}
+    camera.camera_controls = {
+        "AeEnable": (False, True, True),
+        "AwbEnable": (False, True, True),
+        "AeExposureMode": (0, 2, 0),
+    }
+    camera.camera_ctrl_info = {
+        name: (
+            SimpleNamespace(
+                type="Integer32" if name == "AeExposureMode" else "Bool", size=0
+            ),
+        )
+        for name in camera.camera_controls
+    }
+    picamera = Mock(return_value=camera)
+    picamera.global_camera_info.return_value = [{"Num": 0, "Model": "test sensor"}]
+    monkeypatch.setitem(
+        sys.modules,
+        "libcamera",
+        SimpleNamespace(
+            Transform=Mock(), controls=SimpleNamespace(AeExposureModeEnum=exposure)
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "picamera2", SimpleNamespace(Picamera2=picamera))
+    monkeypatch.setitem(
+        sys.modules, "picamera2.encoders", SimpleNamespace(JpegEncoder=Mock())
+    )
+    monkeypatch.setitem(
+        sys.modules, "picamera2.outputs", SimpleNamespace(FileOutput=Mock())
+    )
+
+    deck.open(deck.index, deck.profile, deck.fps)
+    config = camera.create_video_configuration.call_args.kwargs
+    assert config["main"]["size"] == (1920, 1080)
+    assert config["controls"] == {"FrameRate": expected}
+    assert deck.fps == expected
+    camera.set_controls.assert_called_once_with(
+        {"AeEnable": True, "AwbEnable": True, "AeExposureMode": 1}
+    )
+    assert deck.applied == {"AeEnable": True, "AwbEnable": True, "AeExposureMode": 1}
+    assert deck.sequence_settings["stills"] == {
+        "interval": 1,
+        "count": 0,
+        "controls": {},
+    }
+    assert deck.sequence_settings["test"] == {
+        "shutters": [1000, 2000, 4000, 8000],
+        "gains": [2, 4, 8],
+        "settle": 2,
+        "samples": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "short_name,maximum", [("Short", 2), ("ExposureShort", 2), ("Short", 0), (None, 2)]
+)
+def test_motion_defaults_modern_modes_and_unsupported_short(deck, short_name, maximum):
+    deck.camera = Mock()
+    deck.schema = {
+        "ExposureTimeMode": spec("Integer32", 0, 1, options={"Auto": 0, "Manual": 1}),
+        "AnalogueGainMode": spec("Integer32", 0, 1, options={"Auto": 0, "Manual": 1}),
+    }
+    if short_name:
+        deck.schema["AeExposureMode"] = spec(
+            "Integer32", 0, maximum, options={"Normal": 0, short_name: 1}
+        )
+    deck._apply_motion_defaults()
+    expected = {"ExposureTimeMode": 0, "AnalogueGainMode": 0}
+    if short_name and maximum >= 1:
+        expected["AeExposureMode"] = 1
+    deck.camera.set_controls.assert_called_once_with(expected)
+    assert "ExposureTime" not in deck.applied and "AnalogueGain" not in deck.applied

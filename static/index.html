@@ -32,10 +32,28 @@
             <p class="focus-note" id="focus-note" hidden>Local detail scores, not focus distance. Compare the same scene and exposure. Higher is sharper; noise and motion affect results.</p>
           </section>
           <section class="capture-bar"><div class="capture-hint"><strong id="capture-title">Ready</strong><small id="capture-detail">Full-resolution JPEG</small></div><button id="record" class="record-button"><span class="record-dot"></span><span id="record-label">Record video</span></button><button id="capture" class="primary">Take photo</button></section>
+          <p id="sequence-status" role="status" class="help"></p>
+          <details id="test-results" hidden><summary>Camera test comparisons</summary><div id="test-comparisons" class="control-group"></div><p class="help">Compare brightness, noise and motion blur in the originals. Detail scores can rise with noise; no automatic winner is selected. Requested controls and actual metadata are saved with each photo.</p></details>
           <section class="recent-section"><div class="section-heading"><h2>Recent captures</h2><button class="text-button" id="see-library">View library</button></div><div class="recent" id="recent"><p class="empty-inline">No captures yet.</p></div></section>
         </div>
         <aside class="controls-panel">
           <div class="panel-title"><h2>Camera controls</h2></div>
+          <label>Capture mode<select id="capture-mode"><option value="video">Video</option><option value="stills">Periodic stills</option><option value="test">Camera test</option></select></label>
+          <div id="stills-settings" class="config-form" hidden>
+            <h2>Periodic still settings</h2>
+            <label>Interval · seconds<input id="still-interval" type="number" min="1" max="86400" value="5"></label>
+            <label>Photo limit · 0 until stopped<input id="still-count" type="number" min="0" max="10000" value="0"></label>
+            <label>Still-only control overrides · JSON<textarea id="still-controls" rows="3" spellcheck="false">{}</textarea></label>
+            <p class="help">Full-sensor JPEGs. First photo immediately; slower captures extend the interval without queuing. Controls override the current camera settings only for this run. Use advertised control names below. Runs on the Pi until stopped, full, or the limit is reached.</p>
+          </div>
+          <div id="test-settings" class="config-form" hidden>
+            <h2>Low-light motion test</h2>
+            <label>Shutter times · µs, comma-separated<input id="test-shutters" value="500, 1000, 2000, 4000"></label>
+            <label>Analogue gains · comma-separated<input id="test-gains" value="1, 2, 4, 8"></label>
+            <label>Settle time · seconds<input id="test-settle" type="number" min="0.5" max="30" step="0.5" value="2"></label>
+            <label>Photos per combination<input id="test-samples" type="number" min="1" max="5" value="1"></label>
+            <p class="help">Tries every shutter/gain pair supported by your camera; unsupported values must be corrected before starting. 500 µs = 1/2000 s. Short exposures reduce blur but need more light or gain. Repeat the same scene/motion safely; never operate while driving. Previous settings are restored after stop or completion.</p>
+          </div>
           <form id="configure-form" class="config-form">
             <label>Connected camera<select id="camera-select" aria-label="Connected camera"></select></label>
             <div class="two-col"><label>Video resolution<select id="profile"><option value="720p">1280 × 720</option><option value="1080p">1920 × 1080</option></select></label><label>Target fps<input id="fps" type="number" min="1" max="30" step="0.01" value="15"></label></div>

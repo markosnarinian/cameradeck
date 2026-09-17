@@ -89,6 +89,23 @@ input[type=range] {
     border: 0;
 }
 
+input:disabled,
+select:disabled,
+textarea:disabled {
+    background: #eee;
+    color: #666;
+    cursor: not-allowed;
+}
+
+#capture-mode {
+    margin-bottom: 18px;
+}
+
+#stills-settings h2,
+#test-settings h2 {
+    margin-bottom: 14px;
+}
+
 label {
     display: block;
     font-size: 13px;

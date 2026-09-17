@@ -78,13 +78,23 @@ async function action(task) {
 }
 
 function updateButtons() {
-    $('capture').disabled = busy || !connected || !state?.ready;
+    const running = !!state?.sequence?.active;
+    const mode = $('capture-mode').value;
+    $('capture-mode').disabled = busy || running || !!state?.recording;
+    $('stills-settings').hidden = mode !== 'stills';
+    $('test-settings').hidden = mode !== 'test';
+    $('configure-form').hidden = mode !== 'video';
+    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings textarea, #test-settings input, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
+    $('capture').disabled = busy || !connected || !state?.ready || running;
     $('record').disabled = busy || !connected || !state?.ready;
     $('global-stop').disabled = busy || !connected;
-    $('apply-config').disabled = busy || !!state?.recording;
-    $('shutdown-pi').disabled = busy || !!state?.recording;
-    $('reboot-pi').disabled = busy || !!state?.recording;
-    $('capture-title').textContent = busy ? 'Working…' : state?.recording ? 'Recording' : 'Ready';
+    $('apply-config').disabled = busy || !!state?.recording || running;
+    $('shutdown-pi').disabled = busy || !!state?.recording || running;
+    $('reboot-pi').disabled = busy || !!state?.recording || running;
+    $('capture-title').textContent = busy ? 'Working…' : running ? 'Sequence running' : state?.recording ? 'Recording' : 'Ready';
+    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start stills' : mode === 'test' ? 'Start camera test' : 'Record video';
+    $('global-stop').hidden = !state?.recording && !running;
+    if (running) $('global-timer').textContent = `${state.sequence.completed} photos`;
     updateSelection();
 }
 
@@ -109,7 +119,36 @@ async function poll() {
     if (document.hidden || $('login').open || polling || shuttingDown) return;
     polling = true;
     try {
+        const previousSequence = state?.sequence;
         state = await api('/api/status');
+        if (!connected && state.sequence_settings) {
+            const s = state.sequence_settings.stills,
+                t = state.sequence_settings.test;
+            $('still-interval').value = s.interval;
+            $('still-count').value = s.count;
+            $('still-controls').value = JSON.stringify(s.controls);
+            $('test-shutters').value = t.shutters.join(', ');
+            $('test-gains').value = t.gains.join(', ');
+            $('test-settle').value = t.settle;
+            $('test-samples').value = t.samples;
+        }
+        const run = state.sequence;
+        if (run?.active) $('capture-mode').value = run.mode;
+        else if (state.recording) $('capture-mode').value = 'video';
+        $('sequence-status').textContent = run ? `${run.mode === 'test' ? 'Camera test' : 'Periodic stills'} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''} photos${run.error ? ' · ' + run.error : ''}` : '';
+        $('test-results').hidden = run?.mode !== 'test' || !run.results.length;
+        if (run?.id !== previousSequence?.id || run?.completed !== previousSequence?.completed) {
+            await recent();
+            $('test-comparisons').replaceChildren();
+            if (run?.mode === 'test')
+                for (const result of run.results) {
+                    const button = document.createElement('button');
+                    button.className = 'wide';
+                    button.textContent = `${result.settings.ExposureTime} µs / ${result.settings.AnalogueGain}× → actual ${result.metadata.ExposureTime ?? '—'} µs / ${result.metadata.AnalogueGain ?? '—'}×`;
+                    button.onclick = () => action(async () => openViewer(await api('/api/media/' + result.id)));
+                    $('test-comparisons').append(button);
+                }
+        }
         connected = true;
         checkServerTime();
         $('connection').textContent = state.ready ? '● Connected to Pi' : 'Camera unavailable';
@@ -507,17 +546,47 @@ $('capture').onclick = () => action(async () => {
     await recent();
 });
 $('record').onclick = () => action(async () => {
+    if (state.sequence?.active) {
+        await api('/api/sequence/stop', {});
+        toast('Stopping after the current photo; restoring camera settings.');
+        return;
+    }
+    const mode = $('capture-mode').value;
+    if (mode !== 'video') {
+        const settings = mode === 'stills' ? {
+            interval: Number($('still-interval').value),
+            count: Number($('still-count').value),
+            controls: JSON.parse($('still-controls').value)
+        } : {
+            shutters: $('test-shutters').value.split(',').map(Number),
+            gains: $('test-gains').value.split(',').map(Number),
+            settle: Number($('test-settle').value),
+            samples: Number($('test-samples').value)
+        };
+        await api('/api/sequence/start', {
+            mode,
+            settings
+        });
+        toast('Capture sequence started on the Pi.');
+        return;
+    }
     const stopping = !!state.recording;
     await api('/api/record/' + (stopping ? 'stop' : 'start'), {});
     toast(stopping ? 'Video saved to your library' : 'Recording on the Pi. Keep this page handy to stop.');
     await recent();
 });
 $('global-stop').onclick = () => action(async () => {
+    if (state.sequence?.active) {
+        await api('/api/sequence/stop', {});
+        toast('Stopping after the current photo; restoring camera settings.');
+        return;
+    }
     await api('/api/record/stop', {});
     toast('Video saved to your library');
     await recent();
     if (page === 'library') await loadLibrary();
 });
+$('capture-mode').onchange = updateButtons;
 $('focus-toggle').onchange = () => action(async () => {
     await api('/api/focus', {
         enabled: $('focus-toggle').checked

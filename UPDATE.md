@@ -5,12 +5,16 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 
 ## Before you start
 
-- Stop any in-progress recording or capture sequence from the web UI first.
-  Recording is refused for a moment during shutdown/restart, and an abrupt
-  kill can leave a `.pending.json` clip for best-effort recovery on next boot.
+- **Precondition: no running instance of CameraDeck.** Only update while
+  CameraDeck is not running — check whether the `cameradeck` systemd
+  service is active (`systemctl is-active cameradeck`) or a manual
+  `uv run python app.py` process is running, and wait until it isn't
+  before proceeding. Do not stop the service or interrupt a manually-run
+  process to force this condition, and never stop an in-progress
+  recording or capture sequence — let it finish or end on its own first.
 - Note whether CameraDeck runs as the `cameradeck` systemd service or is
-  started manually (`uv run python app.py`). Use the matching stop/start
-  steps below.
+  started manually (`uv run python app.py`). Use the matching start step
+  below once CameraDeck is confirmed not running.
 - Never delete `.uploads.sqlite3` (the S3 upload ledger) or the `media/`
   directory during an update. Both live outside the git checkout's tracked
   files and are left alone by `git pull`.
@@ -19,12 +23,12 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 
 ## Update steps
 
-1. **Stop the running instance.**
+1. **Confirm no running instance.**
    ```bash
-   sudo systemctl stop cameradeck   # if installed as a service
-   # or Ctrl+C the manually-run `uv run python app.py` process
+   systemctl is-active cameradeck   # if installed as a service
+   # or check for a running `uv run python app.py` process
    ```
-   This releases the camera so the update and any post-update checks can use it.
+   Proceed only once this shows CameraDeck is not running.
 
 2. **Fetch and apply the new code.**
    ```bash
@@ -70,15 +74,13 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    or, for a manual run: `uv run python app.py --host 0.0.0.0`.
 
 6. **Verify.** Open the web UI, confirm the camera initializes, take a test
-   still, and check `git log -1` matches what you expect. If a recording was
-   interrupted by the stop in step 1, confirm it was recovered into the
-   library as expected (see README's "Storage and interrupted sessions").
+   still, and check `git log -1` matches what you expect.
 
 ## Rolling back
 
-If the update causes a regression:
+If the update causes a regression, wait until CameraDeck is not running
+(per the precondition above), then:
 ```bash
-sudo systemctl stop cameradeck   # or Ctrl+C
 git log --oneline -10            # find the last known-good commit
 git checkout <previous-commit-or-tag>
 uv sync --frozen

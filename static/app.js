@@ -83,8 +83,9 @@ function updateButtons() {
     $('capture-mode').disabled = busy || running || !!state?.recording;
     $('stills-settings').hidden = mode !== 'stills';
     $('test-settings').hidden = mode !== 'test';
+    $('road-settings').hidden = mode !== 'road';
     $('configure-form').hidden = mode !== 'video';
-    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings textarea, #test-settings input, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
+    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings textarea, #test-settings input, #road-settings input, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
     $('capture').disabled = busy || !connected || !state?.ready || running;
     $('record').disabled = busy || !connected || !state?.ready;
     $('global-stop').disabled = busy || !connected;
@@ -92,9 +93,9 @@ function updateButtons() {
     $('shutdown-pi').disabled = busy || !!state?.recording || running;
     $('reboot-pi').disabled = busy || !!state?.recording || running;
     $('capture-title').textContent = busy ? 'Working…' : running ? 'Sequence running' : state?.recording ? 'Recording' : 'Ready';
-    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start stills' : mode === 'test' ? 'Start camera test' : 'Record video';
+    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start stills' : mode === 'test' ? 'Start still sweep' : mode === 'road' ? 'Start road experiment' : 'Record video';
     $('global-stop').hidden = !state?.recording && !running;
-    if (running) $('global-timer').textContent = `${state.sequence.completed} photos`;
+    if (running) $('global-timer').textContent = `${state.sequence.completed} ${state.sequence.mode === 'road' ? 'slots' : 'photos'}`;
     updateSelection();
 }
 
@@ -115,6 +116,44 @@ function preview() {
     if (page === 'live' && !document.hidden && connected && state?.ready && !$('feed').hasAttribute('src')) $('feed').src = '/stream.mjpg';
     else if (page !== 'live' || document.hidden || !connected || !state?.ready) $('feed').removeAttribute('src');
 }
+
+async function loadExperiments() {
+    const result = await api('/api/experiments');
+    const target = $('road-experiments');
+    target.replaceChildren();
+    if (!result.items.length) {
+        const empty = document.createElement('p');
+        empty.className = 'help';
+        empty.textContent = 'No road experiments yet.';
+        target.append(empty);
+        return;
+    }
+    for (const item of result.items) {
+        const row = document.createElement('div');
+        row.className = 'two-col';
+        const summary = document.createElement('span');
+        summary.textContent = `${new Date(item.created).toLocaleString()} · ${item.state} · ${item.blocks} blocks · ${bytes(item.bytes)}`;
+        const actions = document.createElement('span');
+        const download = document.createElement('a');
+        download.className = 'button';
+        download.textContent = 'Download';
+        download.href = `/api/experiments/${item.id}/download`;
+        if (item.state === 'active') download.hidden = true;
+        const remove = document.createElement('button');
+        remove.className = 'danger';
+        remove.textContent = 'Delete';
+        remove.disabled = item.state === 'active';
+        remove.onclick = () => action(async () => {
+            if (!confirm('Permanently delete this road experiment from the Pi?')) return;
+            await api(`/api/experiments/${item.id}`, {}, 'DELETE');
+            await loadExperiments();
+        });
+        actions.append(download, remove);
+        row.append(summary, actions);
+        target.append(row);
+    }
+}
+
 async function poll() {
     if (document.hidden || $('login').open || polling || shuttingDown) return;
     polling = true;
@@ -123,7 +162,8 @@ async function poll() {
         state = await api('/api/status');
         if (!connected && state.sequence_settings) {
             const s = state.sequence_settings.stills,
-                t = state.sequence_settings.test;
+                t = state.sequence_settings.test,
+                r = state.sequence_settings.road;
             $('still-interval').value = s.interval;
             $('still-count').value = s.count;
             $('still-controls').value = JSON.stringify(s.controls);
@@ -131,14 +171,22 @@ async function poll() {
             $('test-gains').value = t.gains.join(', ');
             $('test-settle').value = t.settle;
             $('test-samples').value = t.samples;
+            $('road-reference-shutter').value = r.reference_shutter_us;
+            $('road-reference-gain').value = r.reference_gain;
+            $('road-comparison-shutter').value = r.comparison_shutter_us;
+            $('road-blocks').value = r.blocks;
+            $('road-roi').value = r.roi.join(', ');
         }
         const run = state.sequence;
         if (run?.active) $('capture-mode').value = run.mode;
         else if (state.recording) $('capture-mode').value = 'video';
-        $('sequence-status').textContent = run ? `${run.mode === 'test' ? 'Camera test' : 'Periodic stills'} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''} photos${run.error ? ' · ' + run.error : ''}` : '';
+        const runName = run?.mode === 'test' ? 'Still sweep' : run?.mode === 'road' ? 'Road experiment' : 'Periodic stills';
+        const runUnit = run?.mode === 'road' ? ' slots' : ' photos';
+        $('sequence-status').textContent = run ? `${runName} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''}${runUnit}${run.error ? ' · ' + run.error : ''}` : '';
         $('test-results').hidden = run?.mode !== 'test' || !run.results.length;
         if (run?.id !== previousSequence?.id || run?.completed !== previousSequence?.completed) {
             await recent();
+            await loadExperiments();
             $('test-comparisons').replaceChildren();
             if (run?.mode === 'test')
                 for (const result of run.results) {
@@ -549,12 +597,22 @@ $('capture').onclick = () => action(async () => {
 $('record').onclick = () => action(async () => {
     if (state.sequence?.active) {
         await api('/api/sequence/stop', {});
-        toast('Stopping after the current photo; restoring camera settings.');
+        toast(state.sequence.mode === 'road' ? 'Stopping after the current road slot; restoring camera settings.' : 'Stopping after the current photo; restoring camera settings.');
         return;
     }
     const mode = $('capture-mode').value;
     if (mode !== 'video') {
-        const settings = mode === 'stills' ? {
+        let settings;
+        if (mode === 'road') {
+            if (!$('road-roi-confirm').checked) throw new Error('Confirm that the ROI covers the road before starting.');
+            settings = {
+                reference_shutter_us: Number($('road-reference-shutter').value),
+                reference_gain: Number($('road-reference-gain').value),
+                comparison_shutter_us: Number($('road-comparison-shutter').value),
+                blocks: Number($('road-blocks').value),
+                roi: $('road-roi').value.split(',').map(Number)
+            };
+        } else settings = mode === 'stills' ? {
             interval: Number($('still-interval').value),
             count: Number($('still-count').value),
             controls: JSON.parse($('still-controls').value)
@@ -579,7 +637,7 @@ $('record').onclick = () => action(async () => {
 $('global-stop').onclick = () => action(async () => {
     if (state.sequence?.active) {
         await api('/api/sequence/stop', {});
-        toast('Stopping after the current photo; restoring camera settings.');
+        toast(state.sequence.mode === 'road' ? 'Stopping after the current road slot; restoring camera settings.' : 'Stopping after the current photo; restoring camera settings.');
         return;
     }
     await api('/api/record/stop', {});
@@ -588,6 +646,11 @@ $('global-stop').onclick = () => action(async () => {
     if (page === 'library') await loadLibrary();
 });
 $('capture-mode').onchange = updateButtons;
+for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter'])
+    $(id).oninput = () => {
+        const gain = Number($('road-reference-shutter').value) * Number($('road-reference-gain').value) / Number($('road-comparison-shutter').value);
+        $('road-derived-gain').textContent = Number.isFinite(gain) ? `${gain.toFixed(2)}×` : '—';
+    };
 $('focus-toggle').onchange = () => action(async () => {
     await api('/api/focus', {
         enabled: $('focus-toggle').checked
@@ -823,6 +886,7 @@ $('set-time').onclick = () => action(async () => {
     await poll();
     if (connected) {
         await recent();
+        await loadExperiments();
         try {
             s3Endpoint = (await api('/api/settings')).s3_endpoint;
         } catch (e) {}

@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import signal
 import tempfile
 import threading
@@ -24,6 +25,7 @@ from camera import CameraDeck
 from power import PowerManager
 
 ID = re.compile(r"^\d{8}_\d{6}_[a-f0-9]{8}$")
+EXPERIMENT_ID = re.compile(r"^[a-f0-9]{32}$")
 BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 MAX_BATCH = 100
 
@@ -435,6 +437,93 @@ def create_app(
         except Exception:
             Path(temporary.name).unlink(missing_ok=True)
             raise
+
+    def experiment(ident):
+        if not EXPERIMENT_ID.fullmatch(ident):
+            abort(404)
+        directory = (deck.root / "experiments" / ident).resolve()
+        experiments = (deck.root / "experiments").resolve()
+        manifest_path = directory / "manifest.json"
+        if directory.parent != experiments or not manifest_path.is_file():
+            abort(404)
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            abort(404)
+        if manifest.get("id") != ident:
+            abort(404)
+        return directory, manifest
+
+    @app.get("/api/experiments")
+    def experiments():
+        items = []
+        root = deck.root / "experiments"
+        for path in sorted(root.glob("*/manifest.json"), reverse=True):
+            try:
+                manifest = json.loads(path.read_text())
+                ident = manifest["id"]
+                if path.parent.name != ident or not EXPERIMENT_ID.fullmatch(ident):
+                    continue
+                size = sum(
+                    p.stat().st_size for p in path.parent.rglob("*") if p.is_file()
+                )
+                items.append(
+                    {
+                        key: manifest.get(key)
+                        for key in ("id", "created", "finished", "state", "settings")
+                    }
+                    | {
+                        "blocks": len(manifest.get("blocks", [])),
+                        "completed_slots": manifest.get("completed_slots", 0),
+                        "bytes": size,
+                    }
+                )
+            except (OSError, ValueError, KeyError):
+                continue
+        return jsonify(items=items)
+
+    @app.get("/api/experiments/<ident>/manifest")
+    def experiment_manifest(ident):
+        return jsonify(experiment(ident)[1])
+
+    @app.get("/api/experiments/<ident>/download")
+    def download_experiment(ident):
+        directory, manifest = experiment(ident)
+        if manifest.get("state") == "active":
+            raise ValueError("Stop the experiment before downloading it.")
+        temporary = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        temporary.close()
+        try:
+            with zipfile.ZipFile(
+                temporary.name, "w", compression=zipfile.ZIP_STORED, allowZip64=True
+            ) as archive:
+                for path in directory.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, f"{ident}/{path.relative_to(directory)}")
+            response = send_file(
+                temporary.name,
+                mimetype="application/zip",
+                as_attachment=True,
+                download_name=f"cameradeck-road-{ident}.zip",
+                max_age=0,
+            )
+            response.call_on_close(lambda: Path(temporary.name).unlink(missing_ok=True))
+            return response
+        except Exception:
+            Path(temporary.name).unlink(missing_ok=True)
+            raise
+
+    @app.delete("/api/experiments/<ident>")
+    def delete_experiment(ident):
+        directory, manifest = experiment(ident)
+        if manifest.get("state") == "active" or (
+            deck.sequence
+            and deck.sequence.get("active")
+            and deck.sequence.get("experiment_id") == ident
+        ):
+            raise ValueError("Stop the experiment before deleting it.")
+        shutil.rmtree(directory)
+        return jsonify(ok=True)
 
     @app.get("/api/settings")
     def settings():

@@ -1,6 +1,8 @@
 import json
 import io
 import subprocess
+import threading
+import time
 import zipfile
 from unittest.mock import Mock
 
@@ -104,6 +106,33 @@ def test_library_derivatives_ranges_and_delete(deck, client):
 def test_corrupt_sidecar_does_not_break_library(deck, client):
     (deck.root / "20260907_100000_12345678.json").write_text("{")
     assert client.get("/api/media").json["items"] == []
+
+
+def test_road_experiment_list_download_and_delete(deck, client):
+    ident = "a" * 32
+    directory = deck.root / "experiments" / ident
+    (directory / "frames").mkdir(parents=True)
+    manifest = {
+        "id": ident,
+        "schema_version": 1,
+        "state": "complete",
+        "created": "2026-09-21T12:00:00+00:00",
+        "settings": {},
+        "blocks": [{"index": 0}],
+        "completed_slots": 4,
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    (directory / "frames" / "000000.pgm").write_bytes(b"P5\n1 1\n255\n\x80")
+    listed = client.get("/api/experiments").json["items"]
+    assert listed[0]["id"] == ident and listed[0]["blocks"] == 1
+    assert client.get(f"/api/experiments/{ident}/manifest").json["state"] == "complete"
+    downloaded = client.get(f"/api/experiments/{ident}/download")
+    assert downloaded.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(downloaded.data)) as archive:
+        assert f"{ident}/manifest.json" in archive.namelist()
+        assert f"{ident}/frames/000000.pgm" in archive.namelist()
+    assert client.delete(f"/api/experiments/{ident}").status_code == 200
+    assert not directory.exists()
 
 
 def test_pending_recording_is_not_published(deck, client):
@@ -529,6 +558,189 @@ def test_test_sweep_all_pairs_metadata_and_restore(sequence_deck, modern):
     else:
         assert all(r["settings"]["AeEnable"] is False for r in results)
     assert deck.applied == {}
+
+
+def test_road_plan_is_seeded_balanced_and_equal_exposure(sequence_deck):
+    deck = sequence_deck
+    deck._run_road = Mock()
+    deck.start_sequence(
+        "road",
+        {
+            "reference_shutter_us": 4000,
+            "reference_gain": 2,
+            "comparison_shutter_us": 2000,
+            "blocks": 4,
+            "seed": 17,
+        },
+    )
+    deck.sequence_worker.join(2)
+    plan = deck._run_road.call_args.args[0]
+    assert sorted(plan["orders"]) == ["ABBA", "ABBA", "BAAB", "BAAB"]
+    assert plan["arms"]["A"]["ExposureTime"] == 4000
+    assert plan["arms"]["A"]["AnalogueGain"] == 2
+    assert plan["arms"]["B"]["ExposureTime"] == 2000
+    assert plan["arms"]["B"]["AnalogueGain"] == 4
+    assert (
+        plan["arms"]["A"]["ExposureTime"] * plan["arms"]["A"]["AnalogueGain"]
+        == plan["arms"]["B"]["ExposureTime"] * plan["arms"]["B"]["AnalogueGain"]
+    )
+    assert deck.camera.switch_mode_and_capture_file.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "settings,message",
+    [
+        ({"blocks": 5}, "even"),
+        ({"roi": [0, 0.5, 1, 0.6]}, "roi"),
+        (
+            {
+                "reference_shutter_us": 4000,
+                "reference_gain": 4,
+                "comparison_shutter_us": 1000,
+            },
+            "AnalogueGain",
+        ),
+        ({"reference_shutter_us": 40000}, "frame period"),
+    ],
+)
+def test_road_plan_rejects_invalid_before_controls(sequence_deck, settings, message):
+    deck = sequence_deck
+    with pytest.raises(ValueError, match=message):
+        deck.start_sequence("road", settings)
+    deck.camera.set_controls.assert_not_called()
+
+
+def test_road_plan_requires_motion_capable_frame_rate(sequence_deck):
+    deck = sequence_deck
+    deck.fps = 5
+    with pytest.raises(ValueError, match="at least 10 fps"):
+        deck.start_sequence("road", {})
+    deck.camera.set_controls.assert_not_called()
+
+
+class RoadRequest:
+    def __init__(self, metadata, array):
+        self.metadata = metadata
+        self.array = array
+        self.references = 0
+
+    def get_metadata(self):
+        return self.metadata
+
+    def make_array(self, stream):
+        assert stream == "main"
+        return self.array
+
+    def acquire(self):
+        self.references += 1
+
+    def release(self):
+        self.references -= 1
+
+
+def test_road_slot_waits_for_measured_controls_and_releases_requests(deck):
+    deck.schema = {
+        "ExposureTime": spec("Integer32", 100, 10000),
+        "AnalogueGain": spec("Float", 1, 8),
+        "AeEnable": spec("Bool"),
+    }
+    deck.camera = Mock()
+    deck.camera.stream_configuration.return_value = {"size": (16, 12)}
+    deck.sequence_stop.clear()
+    with deck.road_condition:
+        deck.road_armed = True
+    requests = []
+
+    def feed():
+        values = [(6000, 1)] + [(2000, 4)] * 5
+        for index, (exposure, gain) in enumerate(values):
+            request = RoadRequest(
+                {
+                    "ExposureTime": exposure,
+                    "AnalogueGain": gain,
+                    "DigitalGain": 1.0,
+                    "SensorTimestamp": (index + 1) * 100_000_000,
+                    "FrameDuration": 100_000,
+                },
+                np.full((18, 16), index, dtype=np.uint8),
+            )
+            requests.append(request)
+            deck._metadata(request)
+            time.sleep(0.01)
+
+    producer = threading.Thread(target=feed)
+    producer.start()
+    frames, timestamp, settling = deck._road_slot(
+        "B", {"ExposureTime": 2000, "AnalogueGain": 4}, True, -1
+    )
+    producer.join(1)
+    deck._road_disarm()
+    assert len(frames) == 3 and timestamp == 600_000_000
+    assert all(md["ExposureTime"] == 2000 for _, md in frames)
+    assert settling["discarded"] == 3
+    assert all(request.references == 0 for request in requests)
+
+
+def test_road_mailbox_is_bounded_and_reports_drop(deck):
+    deck.road_armed = True
+    first = RoadRequest({"SensorTimestamp": 1}, np.zeros((2, 2), dtype=np.uint8))
+    second = RoadRequest({"SensorTimestamp": 2}, np.zeros((2, 2), dtype=np.uint8))
+    deck._metadata(first)
+    deck._metadata(second)
+    assert deck.road_request is second and deck.road_drops == 1
+    assert first.references == 0 and second.references == 1
+    deck._road_disarm()
+    assert second.references == 0
+
+
+@pytest.mark.parametrize(
+    "failure,expected_state",
+    [("lock", "failed"), ("cancel", "cancelled")],
+)
+def test_road_manifest_is_finalized_during_preparation_failure_or_cancel(
+    deck, failure, expected_state
+):
+    from types import SimpleNamespace
+
+    deck.camera = Mock()
+    deck.camera.stream_configuration.return_value = {"size": (16, 12)}
+    deck.camera.camera_configuration.return_value = {
+        "colour_space": SimpleNamespace(range="Range.Limited")
+    }
+    deck.schema = {
+        "ExposureTime": spec("Integer32", 100, 10000),
+        "AnalogueGain": spec("Float", 1, 8),
+        "AeEnable": spec("Bool"),
+    }
+    if failure == "lock":
+        deck.schema["AwbEnable"] = spec("Bool")
+    else:
+        deck._road_slot = Mock(side_effect=InterruptedError)
+    deck.sequence = {
+        "settings": {"roi": [0, 0, 1, 1]},
+        "completed": 0,
+        "current": {},
+        "active": True,
+    }
+    deck.sequence_worker = threading.current_thread()
+    plan = {
+        "arms": {
+            "A": {"ExposureTime": 4000, "AnalogueGain": 2, "AeEnable": False},
+            "B": {"ExposureTime": 2000, "AnalogueGain": 4, "AeEnable": False},
+        },
+        "orders": ["ABBA"],
+    }
+    if failure == "lock":
+        with pytest.raises(ValueError, match="white balance"):
+            deck._run_road(plan)
+    else:
+        deck._run_road(plan)
+    manifest_path = next((deck.root / "experiments").glob("*/manifest.json"))
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["state"] == expected_state
+    assert "finished" in manifest
+    assert manifest["pipeline"]["y_range"] == "limited"
+    assert manifest["pipeline"]["y_range_source"] == "negotiated colour space"
 
 
 def test_sequence_stop_interrupts_settle_and_blocks_conflicts(sequence_deck):

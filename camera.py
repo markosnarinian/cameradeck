@@ -3,6 +3,7 @@
 import io
 import json
 import math
+import random
 import shutil
 import threading
 import time
@@ -89,7 +90,19 @@ class CameraDeck:
                 "settle": 2,
                 "samples": 3,
             },
+            "road": {
+                "reference_shutter_us": 4000,
+                "reference_gain": 2,
+                "comparison_shutter_us": 2000,
+                "blocks": 8,
+                "roi": [0.15, 0.45, 0.7, 0.45],
+                "seed": None,
+            },
         }
+        self.road_condition = threading.Condition()
+        self.road_armed = False
+        self.road_request = None
+        self.road_drops = 0
         self._offset_path = self.root / ".time_offset"
         self.time_offset = self._load_offset()
 
@@ -222,6 +235,17 @@ class CameraDeck:
 
     def _metadata(self, request):
         self.metadata = plain(request.get_metadata())
+        with self.road_condition:
+            if not self.road_armed:
+                return
+            request.acquire()
+            previous = self.road_request
+            self.road_request = request
+            if previous is not None:
+                self.road_drops += 1
+            self.road_condition.notify_all()
+        if previous is not None:
+            previous.release()
 
     def _analyze(self):
         while not self.shutdown.wait(0.5):
@@ -278,7 +302,7 @@ class CameraDeck:
                 or mode not in self.sequence_settings
                 or not isinstance(settings, dict)
             ):
-                raise ValueError("Choose stills or test with a settings object.")
+                raise ValueError("Choose stills, test, or road with a settings object.")
             if set(settings) - set(self.sequence_settings[mode]):
                 raise ValueError("Unknown sequence setting.")
             settings = {**self.sequence_settings[mode], **settings}
@@ -303,7 +327,7 @@ class CameraDeck:
                     raise ValueError("Still controls must be a JSON object.")
                 plan = [validate_controls(values, self.schema) if values else {}]
                 total = settings["count"]
-            else:
+            elif mode == "test":
                 number("settle", 0.5, 30)
                 number("samples", 1, 5, True)
                 for name in ("shutters", "gains"):
@@ -325,6 +349,76 @@ class CameraDeck:
                     for g in settings["gains"]
                 ]
                 total = len(plan) * settings["samples"]
+            else:
+                if self.fps < 10:
+                    raise ValueError(
+                        "Road experiments require a video rate of at least 10 fps."
+                    )
+                for name in (
+                    "reference_shutter_us",
+                    "reference_gain",
+                    "comparison_shutter_us",
+                ):
+                    number(name, 0.01, 1_000_000)
+                number("blocks", 4, 12, True)
+                if settings["blocks"] % 2:
+                    raise ValueError("blocks must be an even number between 4 and 12.")
+                roi = settings["roi"]
+                if (
+                    not isinstance(roi, list)
+                    or len(roi) != 4
+                    or any(
+                        type(v) not in (int, float) or not math.isfinite(v) for v in roi
+                    )
+                    or roi[0] < 0
+                    or roi[1] < 0
+                    or roi[2] <= 0
+                    or roi[3] <= 0
+                    or roi[0] + roi[2] > 1
+                    or roi[1] + roi[3] > 1
+                ):
+                    raise ValueError("roi must be normalized [x, y, width, height].")
+                seed = settings["seed"]
+                if seed is None:
+                    seed = int.from_bytes(uuid4().bytes[:4], "big")
+                if type(seed) is not int or not 0 <= seed <= 0xFFFFFFFF:
+                    raise ValueError("seed must be an integer from 0 to 4294967295.")
+                settings["seed"] = seed
+                product = settings["reference_shutter_us"] * settings["reference_gain"]
+                comparison_gain = product / settings["comparison_shutter_us"]
+                if (
+                    comparison_gain == settings["reference_gain"]
+                    and settings["comparison_shutter_us"]
+                    == settings["reference_shutter_us"]
+                ):
+                    raise ValueError(
+                        "Road experiment arms must use different settings."
+                    )
+                frame_budget = 1_000_000 / self.fps
+                if (
+                    max(
+                        settings["reference_shutter_us"],
+                        settings["comparison_shutter_us"],
+                    )
+                    > frame_budget
+                ):
+                    raise ValueError(
+                        f"Shutter must not exceed the {frame_budget:.0f} µs frame period."
+                    )
+                arms = {
+                    "A": self._manual_exposure(
+                        settings["reference_shutter_us"], settings["reference_gain"]
+                    ),
+                    "B": self._manual_exposure(
+                        settings["comparison_shutter_us"], comparison_gain
+                    ),
+                }
+                orders = ["ABBA"] * (settings["blocks"] // 2) + ["BAAB"] * (
+                    settings["blocks"] // 2
+                )
+                random.Random(seed).shuffle(orders)
+                plan = {"arms": arms, "orders": orders}
+                total = settings["blocks"] * 4
             self._space()
             self.sequence_settings[mode] = plain(settings)
             self.sequence_stop.clear()
@@ -355,51 +449,57 @@ class CameraDeck:
     def stop_sequence(self):
         # Do not wait for the camera lock: a full-resolution capture may be in progress.
         self.sequence_stop.set()
+        with self.road_condition:
+            self.road_condition.notify_all()
         return {"ok": True}
 
     def _run_sequence(self, plan, saved):
         run = self.sequence
         settings = run["settings"]
         try:
-            while not self.sequence_stop.is_set() and not self.shutdown.is_set():
-                started = time.monotonic()
-                index = run["completed"]
-                values = (
-                    plan[index // settings["samples"]]
-                    if run["mode"] == "test"
-                    else plan[0]
-                )
-                with self.lock:
-                    run["current"] = plain(values)
-                    if values:
-                        self.set_controls(values)
-                if run["mode"] == "test" and self.sequence_stop.wait(
-                    settings["settle"]
-                ):
-                    break
-                if self.sequence_stop.is_set() or self.shutdown.is_set():
-                    break
-                item = self.capture()
-                with self.lock:
-                    run["completed"] += 1
-                    result = {
-                        k: item[k] for k in ("id", "metadata", "focus", "settings")
-                    }
-                    run["results"] = (
-                        (run["results"] + [result])
+            if run["mode"] == "road":
+                self._run_road(plan)
+            else:
+                while not self.sequence_stop.is_set() and not self.shutdown.is_set():
+                    started = time.monotonic()
+                    index = run["completed"]
+                    values = (
+                        plan[index // settings["samples"]]
                         if run["mode"] == "test"
-                        else [result]
+                        else plan[0]
                     )
-                if run["total"] and run["completed"] >= run["total"]:
-                    break
-                if run["mode"] == "stills":
-                    if self.sequence_stop.wait(
-                        max(0, settings["interval"] - (time.monotonic() - started))
+                    with self.lock:
+                        run["current"] = plain(values)
+                        if values:
+                            self.set_controls(values)
+                    if run["mode"] == "test" and self.sequence_stop.wait(
+                        settings["settle"]
                     ):
                         break
+                    if self.sequence_stop.is_set() or self.shutdown.is_set():
+                        break
+                    item = self.capture()
+                    with self.lock:
+                        run["completed"] += 1
+                        result = {
+                            k: item[k] for k in ("id", "metadata", "focus", "settings")
+                        }
+                        run["results"] = (
+                            (run["results"] + [result])
+                            if run["mode"] == "test"
+                            else [result]
+                        )
+                    if run["total"] and run["completed"] >= run["total"]:
+                        break
+                    if run["mode"] == "stills":
+                        if self.sequence_stop.wait(
+                            max(0, settings["interval"] - (time.monotonic() - started))
+                        ):
+                            break
         except Exception as exc:
             run["error"] = str(exc)
         finally:
+            self._road_disarm()
             with self.lock:
                 try:
                     # Reconfigure to restore automatic defaults as well as explicitly set controls.
@@ -411,6 +511,255 @@ class CameraDeck:
                         run["error"] or ""
                     ) + f" Could not restore camera: {exc}"
                 run["active"] = False
+
+    def _road_disarm(self):
+        with self.road_condition:
+            self.road_armed = False
+            request = self.road_request
+            self.road_request = None
+            self.road_condition.notify_all()
+        if request is not None:
+            request.release()
+
+    def _road_next(self, last_timestamp, timeout):
+        deadline = time.monotonic() + timeout
+        while not self.sequence_stop.is_set() and not self.shutdown.is_set():
+            with self.road_condition:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Camera produced no fresh road-experiment frame."
+                    )
+                self.road_condition.wait_for(
+                    lambda: self.road_request is not None
+                    or self.sequence_stop.is_set()
+                    or self.shutdown.is_set(),
+                    timeout=remaining,
+                )
+                request = self.road_request
+                self.road_request = None
+            if request is None:
+                continue
+            try:
+                metadata = plain(request.get_metadata())
+                timestamp = metadata.get("SensorTimestamp")
+                if type(timestamp) not in (int, float) or timestamp <= last_timestamp:
+                    continue
+                width, height = self.camera.stream_configuration("main")["size"]
+                array = np.asarray(request.make_array("main"))[:height, :width].copy()
+                return timestamp, metadata, array
+            finally:
+                request.release()
+        raise InterruptedError
+
+    @staticmethod
+    def _road_matches(metadata, controls):
+        exposure = metadata.get("ExposureTime")
+        gain = metadata.get("AnalogueGain")
+        target_exposure = controls["ExposureTime"]
+        target_gain = controls["AnalogueGain"]
+        return (
+            type(exposure) in (int, float)
+            and type(gain) in (int, float)
+            and abs(exposure - target_exposure) <= max(50, target_exposure * 0.03)
+            and abs(gain - target_gain) <= max(0.05, target_gain * 0.05)
+        )
+
+    def _road_slot(self, arm, controls, changed, last_timestamp):
+        started = time.monotonic()
+        stable_since = None
+        consecutive = 0
+        discarded = 0
+        frames = []
+        while len(frames) < 3:
+            if time.monotonic() - started > 3:
+                raise TimeoutError(
+                    f"Arm {arm} controls did not settle within 3 seconds."
+                )
+            timestamp, metadata, array = self._road_next(last_timestamp, 1)
+            last_timestamp = timestamp
+            if not self._road_matches(metadata, controls):
+                stable_since = None
+                consecutive = 0
+                discarded += 1
+                continue
+            consecutive += 1
+            stable_since = stable_since or timestamp
+            settled = not changed or (
+                consecutive >= 3 and timestamp - stable_since >= 200_000_000
+            )
+            if not settled:
+                discarded += 1
+                continue
+            frames.append((array, metadata))
+        return (
+            frames,
+            last_timestamp,
+            {
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "discarded": discarded,
+                "matching_frames": consecutive,
+            },
+        )
+
+    def _write_manifest(self, path, manifest):
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(plain(manifest)))
+        temporary.replace(path)
+
+    def _run_road(self, plan):
+        run = self.sequence
+        settings = run["settings"]
+        experiment_id = uuid4().hex
+        directory = self.root / "experiments" / experiment_id
+        frames_dir = directory / "frames"
+        frames_dir.mkdir(parents=True)
+        width, height = self.camera.stream_configuration("main")["size"]
+        configured = self.camera.camera_configuration()
+        colour_space = configured.get("colour_space")
+        negotiated_range = getattr(colour_space, "range", None)
+        range_name = str(negotiated_range).lower()
+        y_range = "full" if "full" in range_name else "limited"
+        estimated_block = width * height * 12
+        if shutil.disk_usage(self.root).free < 256 * 1024 * 1024 + estimated_block:
+            raise ValueError("Not enough free space for one road-experiment block.")
+        manifest = {
+            "id": experiment_id,
+            "schema_version": 1,
+            "state": "active",
+            "created": datetime.now(timezone.utc).isoformat(),
+            "settings": settings,
+            "schedule": plan["orders"],
+            "pipeline": {
+                "camera": self.properties.get("Model"),
+                "profile": self.profile,
+                "fps": self.fps,
+                "rotation": self.rotation,
+                "width": width,
+                "height": height,
+                "format": "YUV420",
+                "colour_space": plain(colour_space),
+                "y_range": y_range,
+                "y_range_source": (
+                    "negotiated colour space"
+                    if negotiated_range is not None
+                    else "Picamera2 YUV420 video default"
+                ),
+                "applied_controls": dict(self.applied),
+            },
+            "arms": {
+                arm: {
+                    "ExposureTime": values["ExposureTime"],
+                    "AnalogueGain": values["AnalogueGain"],
+                }
+                for arm, values in plan["arms"].items()
+            },
+            "blocks": [],
+            "drops": 0,
+        }
+        run["experiment_id"] = experiment_id
+        run["schedule"] = plan["orders"]
+        self._write_manifest(directory / "manifest.json", manifest)
+        self.road_drops = 0
+        last_timestamp = -1
+        previous_arm = None
+        frame_number = 0
+        try:
+            # Lock colour and electronic focus where the camera exposes reliable values.
+            locks = {}
+            if "AwbEnable" in self.schema:
+                if (
+                    "ColourGains" not in self.schema
+                    or "ColourGains" not in self.metadata
+                ):
+                    raise ValueError(
+                        "Road experiment cannot lock automatic white balance."
+                    )
+                locks.update(AwbEnable=False, ColourGains=self.metadata["ColourGains"])
+            if "AfMode" in self.schema:
+                manual = self.schema["AfMode"]["options"].get("Manual")
+                if manual is None or "LensPosition" not in self.metadata:
+                    raise ValueError("Road experiment cannot lock automatic focus.")
+                locks.update(AfMode=manual, LensPosition=self.metadata["LensPosition"])
+            if locks:
+                with self.lock:
+                    self.set_controls(locks)
+
+            with self.road_condition:
+                self.road_armed = True
+            for block_index, order in enumerate(plan["orders"]):
+                if self.sequence_stop.is_set() or self.shutdown.is_set():
+                    break
+                if (
+                    shutil.disk_usage(self.root).free
+                    < 256 * 1024 * 1024 + estimated_block
+                ):
+                    raise ValueError(
+                        "Not enough free space for another road-experiment block."
+                    )
+                block = {"index": block_index, "order": order, "slots": []}
+                buffered = []
+                for slot_index, arm in enumerate(order):
+                    controls = plan["arms"][arm]
+                    changed = arm != previous_arm
+                    if changed:
+                        with self.lock:
+                            run["current"] = {
+                                "arm": arm,
+                                "ExposureTime": controls["ExposureTime"],
+                                "AnalogueGain": controls["AnalogueGain"],
+                            }
+                            self.set_controls(controls)
+                    frames, last_timestamp, settling = self._road_slot(
+                        arm, controls, changed, last_timestamp
+                    )
+                    slot = {
+                        "index": slot_index,
+                        "arm": arm,
+                        "requested_controls": {
+                            "ExposureTime": controls["ExposureTime"],
+                            "AnalogueGain": controls["AnalogueGain"],
+                        },
+                        "settling": settling,
+                        "frames": [],
+                    }
+                    for array, metadata in frames:
+                        name = f"{frame_number:06d}.pgm"
+                        frame_number += 1
+                        buffered.append((name, array))
+                        slot["frames"].append(
+                            {
+                                "file": "frames/" + name,
+                                "width": width,
+                                "height": height,
+                                "metadata": metadata,
+                            }
+                        )
+                    block["slots"].append(slot)
+                    previous_arm = arm
+                    run["completed"] += 1
+                for name, array in buffered:
+                    (frames_dir / name).write_bytes(
+                        f"P5\n{width} {height}\n255\n".encode() + array.tobytes()
+                    )
+                manifest["blocks"].append(block)
+                manifest["drops"] = self.road_drops
+                self._write_manifest(directory / "manifest.json", manifest)
+            manifest["state"] = (
+                "cancelled"
+                if self.sequence_stop.is_set() or self.shutdown.is_set()
+                else "complete"
+            )
+        except InterruptedError:
+            manifest["state"] = "cancelled"
+        except Exception:
+            manifest["state"] = "failed"
+            raise
+        finally:
+            manifest["drops"] = self.road_drops
+            manifest["completed_slots"] = run["completed"]
+            manifest["finished"] = datetime.now(timezone.utc).isoformat()
+            self._write_manifest(directory / "manifest.json", manifest)
 
     def _space(self):
         if shutil.disk_usage(self.root).free < 256 * 1024 * 1024:

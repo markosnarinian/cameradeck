@@ -8,7 +8,7 @@
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="CameraDeck home">CameraDeck</a>
-    <nav aria-label="Main navigation"><button class="tab active" id="live-tab" aria-current="page">Live view</button><button class="tab" id="library-tab">Library <span id="library-count">0</span></button></nav>
+    <nav aria-label="Main navigation"><button class="tab active" id="live-tab" aria-current="page">Live view</button><button class="tab" id="library-tab">Library <span id="library-count">0</span></button><button class="tab" id="help-tab">Help</button></nav>
     <button id="global-stop" class="danger" hidden>■ Stop <span id="global-timer">00:00</span></button>
     <span class="connection" id="connection">Connecting…</span>
     <span class="athens-clock" id="athens-clock"></span>
@@ -22,9 +22,10 @@
           <section class="view-card" aria-label="Live camera preview">
             <div class="view-toolbar"><strong id="camera-name">Camera</strong><span class="muted" id="sensor-label"></span></div>
             <div class="viewfinder" id="viewfinder">
-              <img id="feed" alt="Live camera preview">
+              <img id="feed" alt="Live camera preview" draggable="false">
               <div class="view-badge" id="live-badge">● LIVE</div><div class="record-badge" id="record-badge" hidden>● REC <span id="timer">00:00</span></div>
               <div class="grid-overlay" id="live-grid" hidden></div>
+              <div class="roi-overlay" id="road-roi-overlay" hidden><div class="roi-box" id="road-roi-box"><span>Road analysis area</span></div></div>
               <div class="camera-offline" id="camera-offline" hidden><strong>Camera unavailable</strong><p id="camera-error"></p><button id="retry">Reconnect camera</button></div>
             </div>
             <div class="telemetry"><span><small>SHUTTER</small><strong id="shutter">—</strong></span><span><small>GAIN</small><strong id="gain">—</strong></span><span><small>WHITE BALANCE</small><strong id="temperature">—</strong></span><span><small>SENSOR RATE</small><strong id="actual-fps">—</strong></span></div>
@@ -40,36 +41,51 @@
         <aside class="controls-panel">
           <div class="panel-title"><h2>Camera controls</h2></div>
           <label>Capture mode<select id="capture-mode"><option value="video">Video</option><option value="stills">Periodic stills</option><option value="road">Road A/B experiment</option><option value="test">Still sweep · stationary only</option></select></label>
+          <div class="mode-intro"><p id="mode-description" class="help"></p><button type="button" id="mode-help" class="text-button">Help with this mode</button></div>
+          <div id="mode-error" class="field-error" role="alert" hidden></div>
           <div id="stills-settings" class="config-form" hidden>
             <h2>Periodic still settings</h2>
-            <label>Interval · seconds<input id="still-interval" type="number" min="1" max="86400" value="1"></label>
-            <label>Photo limit · 0 until stopped<input id="still-count" type="number" min="0" max="10000" value="0"></label>
-            <label>Still-only control overrides · JSON<textarea id="still-controls" rows="3" spellcheck="false">{}</textarea></label>
-            <p class="help">Truck default: one full-sensor JPEG per second (about 8.3 m apart at 30 km/h). Slower captures increase that gap; use video for continuous coverage. First photo immediately. Overrides apply only to this run; otherwise current camera controls apply. Runs until stopped, storage is low, or the limit is reached.</p>
+            <label>Capture every · seconds<input id="still-interval" type="number" min="1" max="86400" value="1"></label>
+            <label class="switch"><input id="still-unlimited" type="checkbox" checked> Continue until stopped</label>
+            <label id="still-count-wrap" hidden>Stop after · photos<input id="still-count" type="number" min="1" max="10000" value="100"></label>
+            <details><summary>Advanced · controls for this run</summary><label>Control overrides · JSON<textarea id="still-controls" rows="3" spellcheck="false">{}</textarea></label><p class="help">Optional libcamera controls. Must be a JSON object. Current camera controls are used when empty.</p></details>
+            <p class="mode-summary" id="stills-summary"></p>
+            <p class="help">The first full-sensor photo is immediate. Slow captures extend the interval; missed captures do not queue. Use video when continuous coverage matters.</p>
           </div>
           <div id="test-settings" class="config-form" hidden>
             <h2>Stationary still sweep</h2>
+            <p class="mode-warning">Stationary scene only — not a driving comparison.</p>
             <label>Shutter times · µs, comma-separated<input id="test-shutters" value="1000, 2000, 4000, 8000"></label>
             <label>Analogue gains · comma-separated<input id="test-gains" value="2, 4, 8"></label>
-            <label>Settle time · seconds<input id="test-settle" type="number" min="0.5" max="30" step="0.5" value="2"></label>
+            <label>Settle before each photo · seconds<input id="test-settle" type="number" min="0.5" max="30" step="0.5" value="2"></label>
             <label>Photos per combination<input id="test-samples" type="number" min="1" max="5" value="3"></label>
+            <p class="mode-summary" id="test-summary"></p>
             <p class="help">Captures an ordered full-resolution grid. Use only with a stationary, repeatable scene: while driving, each combination sees a different location. Higher gain adds noise. Previous settings are restored afterward.</p>
           </div>
           <div id="road-settings" class="config-form" hidden>
             <h2>Randomized road experiment</h2>
-            <div class="two-col"><label>A shutter · µs<input id="road-reference-shutter" type="number" min="1" value="4000"></label><label>A analogue gain<input id="road-reference-gain" type="number" min="1" step="0.01" value="2"></label></div>
-            <label>B shutter · µs<input id="road-comparison-shutter" type="number" min="1" value="2000"></label>
-            <p class="help">B gain is derived to keep shutter × analogue gain equal: <strong id="road-derived-gain">4×</strong>.</p>
-            <label>Balanced ABBA / BAAB blocks<input id="road-blocks" type="number" min="4" max="12" step="2" value="8"></label>
-            <label>Road ROI · normalized x, y, width, height<input id="road-roi" value="0.15, 0.45, 0.70, 0.45"></label>
-            <label class="switch"><input type="checkbox" id="road-roi-confirm"> I confirmed the ROI covers road, not sky or bonnet</label>
-            <p class="help">Collects lossless video-pipeline luminance frames with actual request metadata. Arms are randomized and controls must settle before every sample. Expect roughly 200 MB at 1080p for eight blocks. Passenger operation only.</p>
+            <h3><span>1</span> Choose the comparison</h3>
+            <div class="two-col"><label>A · Reference shutter (µs)<input id="road-reference-shutter" type="number" min="1" value="4000"><small id="road-a-equivalent" class="help"></small></label><label>A · Analogue gain (×)<input id="road-reference-gain" type="number" min="1" step="0.01" value="2"></label></div>
+            <label>B · Comparison shutter (µs)<input id="road-comparison-shutter" type="number" min="1" value="2000"><small id="road-b-equivalent" class="help"></small></label>
+            <p class="derived-value">B · Calculated gain: <strong id="road-derived-gain">4×</strong></p>
+            <p class="help">Calculated to keep shutter × analogue gain equal. This does not guarantee identical brightness; higher gain can increase noise.</p>
+            <label>Experiment length<select id="road-blocks"><option value="4">4 blocks · setup check only</option><option value="6">6 blocks · minimum evidence</option><option value="8" selected>8 blocks · recommended</option><option value="10">10 blocks</option><option value="12">12 blocks</option></select></label>
+            <h3><span>2</span> Select the road area</h3>
+            <p class="help">Drag across road surface in the live preview. Exclude sky, bonnet, and irrelevant foreground. Full luminance frames are still saved; this area is used for offline analysis.</p>
+            <div class="button-row"><button type="button" id="road-roi-draw">Draw / redraw area</button><button type="button" id="road-roi-cancel" hidden>Cancel drawing</button><button type="button" id="road-roi-reset">Reset suggested area</button></div>
+            <p id="road-roi-instruction" class="help" role="status">Suggested area shown on the preview.</p>
+            <details id="road-roi-precise"><summary>Precise area · percentages</summary><div class="roi-inputs"><label>Left<input id="road-roi-x" type="number" min="0" max="100" step="0.1" value="15"></label><label>Top<input id="road-roi-y" type="number" min="0" max="100" step="0.1" value="45"></label><label>Width<input id="road-roi-width" type="number" min="0.1" max="100" step="0.1" value="70"></label><label>Height<input id="road-roi-height" type="number" min="0.1" max="100" step="0.1" value="45"></label></div></details>
+            <label class="switch"><input type="checkbox" id="road-roi-confirm"> I checked that this area covers the road</label>
+            <h3><span>3</span> Review and start</h3>
+            <p class="mode-summary" id="road-summary"></p>
+            <p class="mode-warning">Passenger operation only — do not operate while driving.</p>
           </div>
           <form id="configure-form" class="config-form">
+            <h2>Camera setup</h2>
             <label>Connected camera<select id="camera-select" aria-label="Connected camera"></select></label>
             <div class="two-col"><label>Video resolution<select id="profile"><option value="720p">1280 × 720</option><option value="1080p" selected>1920 × 1080</option></select></label><label>Target fps<input id="fps" type="number" min="1" max="30" step="0.01" value="30"></label></div>
             <label>Mounting orientation<select id="rotation"><option value="0">Normal · 0°</option><option value="180">Upside-down mount · 180°</option></select></label>
-            <button class="wide" id="apply-config">Apply video settings</button><small class="help">Truck default: 1080p, up to 30 fps (sensor-limited). Applying settings restores automatic exposure/gain and short-exposure preference where supported; preview pauses briefly. AE Short depends on camera tuning, not a fixed shutter cap. Check actual shutter time for blur.</small>
+            <button class="wide" id="apply-config">Apply camera settings</button><small class="help">Truck default: 1080p, up to 30 fps (sensor-limited). Applying pauses preview briefly and restores automatic exposure/gain plus short-exposure preference where supported. Road experiments require at least 10 fps.</small>
           </form>
           <details open><summary>Exposure</summary><div id="exposure-controls" class="control-group"></div></details>
           <details><summary>Colour & detail</summary><div id="colour-controls" class="control-group"></div></details>
@@ -88,6 +104,19 @@
       <div class="selection-toolbar" id="selection-toolbar"><strong id="selection-count">0 selected</strong><button id="select-page">Select page</button><button id="clear-selection" disabled>Clear</button><span class="selection-spacer"></span><button id="download-selected" disabled>↓ Download</button><button id="upload-selected" disabled>Upload to S3</button><button id="delete-selected" class="danger" disabled>Delete</button></div>
       <div class="library-grid" id="library-grid"></div><div class="empty-state" id="library-empty" hidden><h2>No captures yet</h2><p>Photos and videos will appear here.</p><button class="primary" id="empty-live">Go to live view</button></div>
       <nav class="pagination" id="pagination" aria-label="Library pages" hidden><button id="previous-page">← Previous</button><span id="page-status">Page 1 of 1</span><button id="next-page">Next →</button></nav>
+    </section>
+    <section id="help-page" class="help-page" hidden>
+      <div class="page-heading"><h1 tabindex="-1" id="help-heading">Help</h1><button id="help-live" class="primary">Return to live view</button></div>
+      <nav class="help-contents" aria-label="Help contents"><a href="#help-modes">Choose a mode</a><a href="#help-road">Road A/B</a><a href="#help-analysis">Analyze results</a><a href="#help-captures">Photos & video</a><a href="#help-controls">Camera controls</a><a href="#help-storage">Library & storage</a><a href="#help-safety">Connection & safety</a></nav>
+      <article>
+        <section id="help-modes"><h2>Choose a capture mode</h2><p><strong>Video</strong> provides continuous road coverage. <strong>Periodic stills</strong> collect full-sensor photos at an interval but leave gaps. <strong>Road A/B experiment</strong> compares two equal-nominal-exposure shutter/gain settings while driving. <strong>Stationary still sweep</strong> tests an ordered grid only when the camera and scene are stationary.</p></section>
+        <section id="help-road"><h2>Run a Road A/B experiment</h2><ol><li>Choose reference shutter and gain. CameraDeck calculates B gain from B shutter so shutter × gain remains equal.</li><li>Draw the analysis area over road surface in the live preview, or enter percentages. Exclude sky and bonnet, then confirm the area.</li><li>Use eight blocks as a starting point. CameraDeck alternates randomized ABBA/BAAB blocks and waits for measured controls to settle.</li></ol><p>The ROI selects offline analysis only; full lossless luminance frames and request metadata are saved. An unfinished block may be discarded when stopping, while completed blocks remain.</p></section>
+        <section id="help-analysis"><h2>Analyze an experiment</h2><p>Download and extract the experiment ZIP on a workstation containing CameraDeck, then run:</p><pre><code>uv run python -m quality RUN_DIR --output REPORT_DIR</code></pre><p>The analyzer writes <code>report.json</code>, <code>pairs.csv</code>, and <code>contact-sheet.jpg</code>. It can report A preferred, B preferred, trade-off, or insufficient evidence. It rejects metadata, exposure, timing, and scene-drift faults and never applies a winner automatically.</p></section>
+        <section id="help-captures"><h2>Photos, video, and stationary sweeps</h2><p>Video snapshots use video resolution without stopping recording. A normal photo uses the full sensor and briefly pauses preview. Periodic stills take the first photo immediately; slow captures extend the interval rather than queuing missed photos. Stationary sweeps settle before every photo and restore previous settings afterward.</p></section>
+        <section id="help-controls"><h2>Understand camera controls</h2><p>Shorter shutter reduces motion blur but gathers less light. Higher gain brightens the result while increasing noise. Frame rate controls sampling, not shutter blur. The Short AE preference is camera tuning, not a fixed shutter cap. Sharpness-grid values measure local detail and can rise with noise; compare like scenes and exposures.</p></section>
+        <section id="help-storage"><h2>Library and storage</h2><p>Captures remain local until explicitly downloaded or uploaded. Metadata is available beside every capture. Delete is permanent. CameraDeck preserves a 256 MiB storage reserve and does not automatically loop-delete old footage.</p></section>
+        <section id="help-safety"><h2>Connection and safety</h2><p>All browsers share one Pi camera. Recording and capture sequences continue when a browser leaves Live view or disconnects. If disconnected, assume a run may still be active until status returns. Settings are session-local. Use a passenger to operate CameraDeck and never adjust it while driving.</p></section>
+      </article>
     </section>
   </main>
   <div id="toast" class="toast" role="status" hidden></div>

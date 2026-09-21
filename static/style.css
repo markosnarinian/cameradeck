@@ -97,6 +97,12 @@ textarea:disabled {
     cursor: not-allowed;
 }
 
+[aria-invalid=true] {
+    border-color: #111;
+    outline: 2px solid #111;
+    outline-offset: 1px;
+}
+
 #capture-mode {
     margin-bottom: 18px;
 }
@@ -132,6 +138,21 @@ h1 {
 h2 {
     font-size: 15px;
     font-weight: 600;
+}
+
+h3 {
+    font-size: 13px;
+    margin: 22px 0 12px;
+}
+
+h3 span {
+    display: inline-grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    margin-right: 7px;
+    border: 1px solid #111;
+    border-radius: 50%;
 }
 
 p {
@@ -298,12 +319,47 @@ main {
 .view-badge,
 .record-badge {
     position: absolute;
+    z-index: 3;
     top: 10px;
     left: 10px;
     background: #000c;
     color: #fff;
     padding: 5px 8px;
     font-size: 11px;
+}
+
+.roi-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+}
+
+.roi-overlay.drawing {
+    pointer-events: auto;
+    cursor: crosshair;
+    touch-action: none;
+}
+
+.roi-box {
+    position: absolute;
+    border: 2px solid #fff;
+    outline: 2px solid #111;
+    box-shadow: 0 0 0 9999px #0004;
+    min-width: 2px;
+    min-height: 2px;
+    pointer-events: none;
+}
+
+.roi-box span {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    padding: 3px 6px;
+    background: #111;
+    color: #fff;
+    font-size: 10px;
+    white-space: nowrap;
 }
 
 .record-badge {
@@ -475,6 +531,57 @@ main {
     padding-left: 24px;
 }
 
+.mode-intro {
+    margin: -8px 0 18px;
+}
+
+.mode-intro .text-button {
+    min-height: 36px;
+    padding: 6px 0;
+    font-size: 12px;
+}
+
+.field-error,
+.mode-warning {
+    border: 1px solid #111;
+    padding: 10px 12px;
+    margin: 0 0 14px;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.mode-summary,
+.derived-value {
+    background: #f4f4f4;
+    padding: 10px 12px;
+    margin: 12px 0;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.button-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.button-row button {
+    flex: 1 1 120px;
+    font-size: 12px;
+}
+
+.roi-inputs {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    padding-bottom: 14px;
+}
+
+.roi-inputs label {
+    min-width: 0;
+}
+
 .panel-title {
     margin: 0 0 20px;
 }
@@ -577,6 +684,56 @@ footer {
     color: var(--muted);
 }
 
+.help-page {
+    max-width: 980px;
+    margin: auto;
+}
+
+.help-contents {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 16px 0 28px;
+    border-bottom: 1px solid var(--line);
+}
+
+.help-contents a {
+    color: #111;
+    border: 1px solid var(--line);
+    padding: 9px 12px;
+    text-decoration: none;
+}
+
+.help-page article {
+    max-width: 760px;
+}
+
+.help-page article section {
+    padding: 28px 0;
+    border-bottom: 1px solid var(--line);
+    scroll-margin-top: 24px;
+}
+
+.help-page article h2 {
+    font-size: 18px;
+    margin-bottom: 12px;
+}
+
+.help-page article p,
+.help-page article li {
+    line-height: 1.7;
+}
+
+.help-page article ol {
+    padding-left: 22px;
+}
+
+.help-page article pre {
+    max-height: none;
+    padding: 12px;
+    background: #f4f4f4;
+}
+
 .grid-overlay {
     position: absolute;
     inset: 0;
@@ -610,6 +767,7 @@ footer {
 .camera-offline {
     position: absolute;
     inset: 0;
+    z-index: 4;
     background: #111;
     color: #fff;
     display: flex;
@@ -887,7 +1045,7 @@ dialog::backdrop {
     }
 
     main {
-        padding: 24px 5%;
+        padding: 24px 5% calc(100px + env(safe-area-inset-bottom));
     }
 
     h1 {
@@ -904,6 +1062,14 @@ dialog::backdrop {
         padding-left: 0;
         border-top: 1px solid var(--line);
         padding-top: 20px;
+    }
+
+    .two-col {
+        grid-template-columns: 1fr;
+    }
+
+    .roi-inputs {
+        grid-template-columns: repeat(2, 1fr);
     }
 
     .telemetry {

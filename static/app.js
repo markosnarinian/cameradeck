@@ -14,7 +14,11 @@ let state = null,
     libraryRequest = 0,
     s3Endpoint = 'http://192.168.1.10:3900',
     powerAction = null,
-    shuttingDown = false;
+    shuttingDown = false,
+    roi = [0.15, 0.45, 0.7, 0.45],
+    roiDrawing = false,
+    roiDrag = null,
+    roiBeforeDraw = null;
 const selectedIds = new Set();
 const bytes = n => n >= 1e9 ? `${(n/1e9).toFixed(1)} GB` : `${(n/1e6).toFixed(1)} MB`;
 const duration = n => `${Math.floor(n/60).toString().padStart(2,'0')}:${Math.floor(n%60).toString().padStart(2,'0')}`;
@@ -77,6 +81,197 @@ async function action(task) {
     }
 }
 
+const modeDescriptions = {
+    video: 'Continuous 720p/1080p footage. Best when gaps are unacceptable.',
+    stills: 'Full-sensor photos at a chosen interval. The first photo is immediate.',
+    road: 'Randomized equal-exposure A/B evidence for comparing motion detail while driving.',
+    test: 'An ordered full-resolution settings grid for a stationary, repeatable scene.'
+};
+
+function showModeError(message, field) {
+    $('mode-error').textContent = message;
+    $('mode-error').hidden = false;
+    if (field) {
+        const disclosure = $(field).closest('details');
+        if (disclosure) disclosure.open = true;
+        $(field).setAttribute('aria-invalid', 'true');
+        $(field).focus();
+    }
+}
+
+function clearModeError() {
+    $('mode-error').hidden = true;
+    $('mode-error').textContent = '';
+    document.querySelectorAll('[aria-invalid="true"]').forEach(input => input.removeAttribute('aria-invalid'));
+}
+
+function invalid(field, message) {
+    showModeError(message, field);
+    throw new Error(message);
+}
+
+function numberValue(id, low, high, integer = false) {
+    const raw = $(id).value.trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value) || value < low || value > high || (integer && !Number.isInteger(value)))
+        invalid(id, `${$(id).closest('label')?.childNodes[0]?.textContent.trim() || id} must be ${integer?'an integer':'a number'} from ${low} to ${high}.`);
+    return value;
+}
+
+function numberList(id, label) {
+    const parts = $(id).value.split(',').map(value => value.trim());
+    if (!parts.length || parts.length > 8 || parts.some(value => !value)) invalid(id, `${label}: enter 1–8 comma-separated values without empty entries.`);
+    const values = parts.map(Number);
+    if (values.some(value => !Number.isFinite(value) || value <= 0)) invalid(id, `${label}: every value must be a positive number.`);
+    return values;
+}
+
+function shutterEquivalent(value) {
+    if (!Number.isFinite(value) || value <= 0) return 'Enter a shutter time';
+    return `${(value/1000).toFixed(value < 1000 ? 2 : 1)} ms · approximately 1/${Math.round(1e6/value)} s`;
+}
+
+function setRoi(next, clearConfirmation = true) {
+    roi = next.map(Number);
+    ['x', 'y', 'width', 'height'].forEach((name, index) => {
+        $(`road-roi-${name}`).value = Number((roi[index] * 100).toFixed(2));
+    });
+    if (clearConfirmation) $('road-roi-confirm').checked = false;
+    drawRoi();
+    updateModeSummary();
+}
+
+function imageGeometry() {
+    const feed = $('feed');
+    if (!feed.naturalWidth || !feed.naturalHeight) return null;
+    const rect = feed.getBoundingClientRect();
+    const scale = Math.min(rect.width / feed.naturalWidth, rect.height / feed.naturalHeight);
+    const width = feed.naturalWidth * scale;
+    const height = feed.naturalHeight * scale;
+    return {
+        left: rect.left + (rect.width - width) / 2,
+        top: rect.top + (rect.height - height) / 2,
+        width,
+        height,
+        parent: $('viewfinder').getBoundingClientRect()
+    };
+}
+
+function drawRoi() {
+    const overlay = $('road-roi-overlay');
+    const geometry = imageGeometry();
+    const visible = $('capture-mode').value === 'road' && geometry;
+    overlay.hidden = !visible;
+    if (!visible) return;
+    const box = $('road-roi-box');
+    box.style.left = `${geometry.left - geometry.parent.left + roi[0] * geometry.width}px`;
+    box.style.top = `${geometry.top - geometry.parent.top + roi[1] * geometry.height}px`;
+    box.style.width = `${roi[2] * geometry.width}px`;
+    box.style.height = `${roi[3] * geometry.height}px`;
+}
+
+function roiPoint(event, clamp = false) {
+    const geometry = imageGeometry();
+    if (!geometry) return null;
+    let x = (event.clientX - geometry.left) / geometry.width;
+    let y = (event.clientY - geometry.top) / geometry.height;
+    if (!clamp && (x < 0 || y < 0 || x > 1 || y > 1)) return null;
+    x = Math.max(0, Math.min(1, x));
+    y = Math.max(0, Math.min(1, y));
+    return [x, y];
+}
+
+function finishRoiDrawing(cancelled = false) {
+    if (cancelled && roiBeforeDraw) setRoi(roiBeforeDraw);
+    roiDrawing = false;
+    roiDrag = null;
+    roiBeforeDraw = null;
+    $('road-roi-overlay').classList.remove('drawing');
+    $('road-roi-draw').hidden = false;
+    $('road-roi-cancel').hidden = true;
+    $('road-roi-instruction').textContent = cancelled ? 'Drawing cancelled; the previous area was restored.' : 'Area updated. Check it and confirm below.';
+    updateButtons();
+}
+
+function updateModeSummary() {
+    const mode = $('capture-mode').value;
+    $('mode-description').textContent = modeDescriptions[mode];
+    const interval = Number($('still-interval').value);
+    $('stills-summary').textContent = Number.isFinite(interval) ? `First photo immediately, then approximately every ${interval} second${interval===1?'':'s'}${$('still-unlimited').checked ? ' until stopped' : `, up to ${$('still-count').value || '—'} photos`}.` : 'Enter an interval to preview this run.';
+    const shutters = $('test-shutters').value.split(',').filter(value => value.trim());
+    const gains = $('test-gains').value.split(',').filter(value => value.trim());
+    const samples = Number($('test-samples').value);
+    const settle = Number($('test-settle').value);
+    const photos = shutters.length * gains.length * (Number.isFinite(samples) ? samples : 0);
+    $('test-summary').textContent = `${shutters.length} shutter values × ${gains.length} gains × ${Number.isFinite(samples)?samples:'—'} repeats = ${photos || '—'} photos${photos && Number.isFinite(settle) ? ` · at least ${Math.round(photos*settle)} seconds settling, plus capture time` : ''}.`;
+    const aShutter = Number($('road-reference-shutter').value);
+    const aGain = Number($('road-reference-gain').value);
+    const bShutter = Number($('road-comparison-shutter').value);
+    const bGain = aShutter * aGain / bShutter;
+    const blocks = Number($('road-blocks').value);
+    $('road-derived-gain').textContent = Number.isFinite(bGain) ? `${bGain.toFixed(2)}×` : '—';
+    $('road-a-equivalent').textContent = shutterEquivalent(aShutter);
+    $('road-b-equivalent').textContent = shutterEquivalent(bShutter);
+    const profile = state?.profile || $('profile').value;
+    const [width, height] = profile === '720p' ? [1280, 720] : [1920, 1080];
+    const estimate = Number.isFinite(blocks) ? bytes(width * height * blocks * 12) : '—';
+    $('road-summary').textContent = Number.isFinite(bGain) && Number.isFinite(blocks) ? `A: ${aShutter} µs / ${aGain}× → B: ${bShutter} µs / ${bGain.toFixed(2)}× · ${blocks} blocks · ${blocks*4} slots · ${blocks*12} frames · approximately ${estimate} · ${profile} at ${state?.fps ?? '—'} fps.` : 'Complete the settings to review this experiment.';
+    drawRoi();
+}
+
+function settingsForMode(mode) {
+    clearModeError();
+    if (mode === 'stills') {
+        const interval = numberValue('still-interval', 1, 86400);
+        const count = $('still-unlimited').checked ? 0 : numberValue('still-count', 1, 10000, true);
+        let controls;
+        try {
+            controls = JSON.parse($('still-controls').value);
+        } catch (_) {
+            invalid('still-controls', 'Advanced controls must be valid JSON.');
+        }
+        if (!controls || Array.isArray(controls) || typeof controls !== 'object') invalid('still-controls', 'Advanced controls must be a JSON object.');
+        return {
+            interval,
+            count,
+            controls
+        };
+    }
+    if (mode === 'test') return {
+        shutters: numberList('test-shutters', 'Shutter times'),
+        gains: numberList('test-gains', 'Analogue gains'),
+        settle: numberValue('test-settle', 0.5, 30),
+        samples: numberValue('test-samples', 1, 5, true)
+    };
+    const reference_shutter_us = numberValue('road-reference-shutter', 0.01, 1e6);
+    const reference_gain = numberValue('road-reference-gain', 0.01, 1e6);
+    const comparison_shutter_us = numberValue('road-comparison-shutter', 0.01, 1e6);
+    const blocks = numberValue('road-blocks', 4, 12, true);
+    const comparisonGain = reference_shutter_us * reference_gain / comparison_shutter_us;
+    if (reference_shutter_us === comparison_shutter_us && reference_gain === comparisonGain) invalid('road-comparison-shutter', 'A and B must use different shutter/gain settings.');
+    if ((state?.fps || 0) < 10) invalid('fps', 'Road experiments require an applied camera rate of at least 10 fps.');
+    const framePeriod = 1e6 / state.fps;
+    if (Math.max(reference_shutter_us, comparison_shutter_us) > framePeriod) invalid('road-comparison-shutter', `Shutter must not exceed the ${Math.round(framePeriod)} µs frame period.`);
+    const gainSpec = state?.controls?.AnalogueGain;
+    if (gainSpec && comparisonGain > gainSpec.max) invalid('road-comparison-shutter', `Calculated B gain ${comparisonGain.toFixed(2)}× exceeds this camera's ${gainSpec.max}× maximum.`);
+    roi = [
+        numberValue('road-roi-x', 0, 100) / 100,
+        numberValue('road-roi-y', 0, 100) / 100,
+        numberValue('road-roi-width', 0.1, 100) / 100,
+        numberValue('road-roi-height', 0.1, 100) / 100
+    ];
+    if (!roi.every(Number.isFinite) || roi[0] < 0 || roi[1] < 0 || roi[2] <= 0 || roi[3] <= 0 || roi[0] + roi[2] > 1.000001 || roi[1] + roi[3] > 1.000001) invalid('road-roi-x', 'The road area must stay inside the frame and have positive width and height.');
+    if (roiDrawing) invalid('road-roi-draw', 'Finish or cancel drawing the road area first.');
+    if (!$('road-roi-confirm').checked) invalid('road-roi-confirm', 'Check and confirm that the analysis area covers the road.');
+    return {
+        reference_shutter_us,
+        reference_gain,
+        comparison_shutter_us,
+        blocks,
+        roi: [...roi]
+    };
+}
+
 function updateButtons() {
     const running = !!state?.sequence?.active;
     const mode = $('capture-mode').value;
@@ -84,18 +279,20 @@ function updateButtons() {
     $('stills-settings').hidden = mode !== 'stills';
     $('test-settings').hidden = mode !== 'test';
     $('road-settings').hidden = mode !== 'road';
-    $('configure-form').hidden = mode !== 'video';
-    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings textarea, #test-settings input, #road-settings input, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
+    $('configure-form').hidden = !['video', 'road'].includes(mode);
+    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings select, #stills-settings textarea, #stills-settings button, #test-settings input, #test-settings select, #road-settings input, #road-settings select, #road-settings button, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
     $('capture').disabled = busy || !connected || !state?.ready || running;
-    $('record').disabled = busy || !connected || !state?.ready;
+    $('record').disabled = busy || !connected || !state?.ready || roiDrawing;
     $('global-stop').disabled = busy || !connected;
     $('apply-config').disabled = busy || !!state?.recording || running;
     $('shutdown-pi').disabled = busy || !!state?.recording || running;
     $('reboot-pi').disabled = busy || !!state?.recording || running;
     $('capture-title').textContent = busy ? 'Working…' : running ? 'Sequence running' : state?.recording ? 'Recording' : 'Ready';
-    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start stills' : mode === 'test' ? 'Start still sweep' : mode === 'road' ? 'Start road experiment' : 'Record video';
+    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start periodic stills' : mode === 'test' ? 'Start stationary sweep' : mode === 'road' ? 'Start road experiment' : 'Start recording';
     $('global-stop').hidden = !state?.recording && !running;
     if (running) $('global-timer').textContent = `${state.sequence.completed} ${state.sequence.mode === 'road' ? 'slots' : 'photos'}`;
+    $('still-count-wrap').hidden = $('still-unlimited').checked;
+    updateModeSummary();
     updateSelection();
 }
 
@@ -165,7 +362,8 @@ async function poll() {
                 t = state.sequence_settings.test,
                 r = state.sequence_settings.road;
             $('still-interval').value = s.interval;
-            $('still-count').value = s.count;
+            $('still-unlimited').checked = s.count === 0;
+            if (s.count) $('still-count').value = s.count;
             $('still-controls').value = JSON.stringify(s.controls);
             $('test-shutters').value = t.shutters.join(', ');
             $('test-gains').value = t.gains.join(', ');
@@ -175,16 +373,17 @@ async function poll() {
             $('road-reference-gain').value = r.reference_gain;
             $('road-comparison-shutter').value = r.comparison_shutter_us;
             $('road-blocks').value = r.blocks;
-            $('road-roi').value = r.roi.join(', ');
+            setRoi(r.roi, false);
         }
         const run = state.sequence;
         if (run?.active) $('capture-mode').value = run.mode;
         else if (state.recording) $('capture-mode').value = 'video';
+        if (run?.active && run.mode === 'road' && run.settings?.roi) setRoi(run.settings.roi, false);
         const runName = run?.mode === 'test' ? 'Still sweep' : run?.mode === 'road' ? 'Road experiment' : 'Periodic stills';
         const runUnit = run?.mode === 'road' ? ' slots' : ' photos';
         $('sequence-status').textContent = run ? `${runName} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''}${runUnit}${run.error ? ' · ' + run.error : ''}` : '';
         $('test-results').hidden = run?.mode !== 'test' || !run.results.length;
-        if (run?.id !== previousSequence?.id || run?.completed !== previousSequence?.completed) {
+        if (run?.id !== previousSequence?.id || run?.completed !== previousSequence?.completed || run?.active !== previousSequence?.active || run?.error !== previousSequence?.error) {
             await recent();
             await loadExperiments();
             $('test-comparisons').replaceChildren();
@@ -216,10 +415,10 @@ async function poll() {
         $('actual-fps').textContent = state.metadata.FrameDuration ? `${(1e6/state.metadata.FrameDuration).toFixed(1)} fps` : '—';
         $('record-badge').hidden = !state.recording;
         $('timer').textContent = duration(state.elapsed);
-        $('global-stop').hidden = !state.recording;
-        $('global-timer').textContent = duration(state.elapsed);
+        $('global-stop').hidden = !state.recording && !run?.active;
+        $('global-timer').textContent = run?.active ? `${run.completed} ${run.mode === 'road' ? 'slots' : 'photos'}` : duration(state.elapsed);
         $('record').classList.toggle('recording', !!state.recording);
-        $('record-label').textContent = state.recording ? 'Stop recording' : 'Record video';
+        $('record-label').textContent = state.recording ? 'Stop recording' : 'Start recording';
         $('capture-detail').textContent = state.recording ? `${state.profile} snapshot · no interruption` : 'Full-resolution JPEG · saved locally';
         $('live-grid').hidden = !state.focus_enabled;
         $('focus-note').hidden = !state.focus_enabled;
@@ -334,6 +533,10 @@ function buildControls() {
                 if (name === 'LensPosition') values.AfMode = 0;
                 if (name === 'AwbMode') values.AwbEnable = true;
                 await api('/api/controls', values);
+                if (name === 'ScalerCrop') {
+                    $('road-roi-confirm').checked = false;
+                    $('road-roi-instruction').textContent = 'Camera crop changed. Check the road area again.';
+                }
                 toast(`${title} updated`);
             });
             if (spec.type === 'Bool') {
@@ -384,16 +587,19 @@ function advanced() {
 }
 
 function showPage(next) {
+    if (roiDrawing) finishRoiDrawing(true);
     page = next;
     $('live-page').hidden = next !== 'live';
     $('library-page').hidden = next !== 'library';
-    for (const name of ['live', 'library']) {
+    $('help-page').hidden = next !== 'help';
+    for (const name of ['live', 'library', 'help']) {
         $(name + '-tab').classList.toggle('active', name === next);
         if (name === next) $(name + '-tab').setAttribute('aria-current', 'page');
         else $(name + '-tab').removeAttribute('aria-current');
     }
     preview();
     if (next === 'library') loadLibrary();
+    if (next === 'help') $('help-heading').focus();
 }
 
 function card(item, selectable = false) {
@@ -588,6 +794,13 @@ function openPower(actionName) {
 
 $('live-tab').onclick = () => showPage('live');
 $('library-tab').onclick = $('see-library').onclick = () => showPage('library');
+$('help-tab').onclick = () => showPage('help');
+$('help-live').onclick = () => showPage('live');
+$('mode-help').onclick = () => {
+    const section = $('capture-mode').value === 'road' ? 'help-road' : $('capture-mode').value === 'video' ? 'help-captures' : $('capture-mode').value === 'stills' ? 'help-captures' : 'help-modes';
+    showPage('help');
+    $(section).scrollIntoView();
+};
 $('empty-live').onclick = () => showPage('live');
 $('capture').onclick = () => action(async () => {
     const item = await api('/api/capture', {});
@@ -597,35 +810,22 @@ $('capture').onclick = () => action(async () => {
 $('record').onclick = () => action(async () => {
     if (state.sequence?.active) {
         await api('/api/sequence/stop', {});
-        toast(state.sequence.mode === 'road' ? 'Stopping after the current road slot; restoring camera settings.' : 'Stopping after the current photo; restoring camera settings.');
+        toast(state.sequence.mode === 'road' ? 'Stop requested. An unfinished block may be discarded; saved blocks remain available.' : 'Stop requested. Waiting for the current photo and camera restoration.');
+        $('sequence-status').textContent = 'Stop requested — waiting for the Pi to finish and restore settings.';
         return;
     }
     const mode = $('capture-mode').value;
     if (mode !== 'video') {
-        let settings;
-        if (mode === 'road') {
-            if (!$('road-roi-confirm').checked) throw new Error('Confirm that the ROI covers the road before starting.');
-            settings = {
-                reference_shutter_us: Number($('road-reference-shutter').value),
-                reference_gain: Number($('road-reference-gain').value),
-                comparison_shutter_us: Number($('road-comparison-shutter').value),
-                blocks: Number($('road-blocks').value),
-                roi: $('road-roi').value.split(',').map(Number)
-            };
-        } else settings = mode === 'stills' ? {
-            interval: Number($('still-interval').value),
-            count: Number($('still-count').value),
-            controls: JSON.parse($('still-controls').value)
-        } : {
-            shutters: $('test-shutters').value.split(',').map(Number),
-            gains: $('test-gains').value.split(',').map(Number),
-            settle: Number($('test-settle').value),
-            samples: Number($('test-samples').value)
-        };
-        await api('/api/sequence/start', {
-            mode,
-            settings
-        });
+        const settings = settingsForMode(mode);
+        try {
+            await api('/api/sequence/start', {
+                mode,
+                settings
+            });
+        } catch (error) {
+            showModeError(error.message);
+            throw error;
+        }
         toast('Capture sequence started on the Pi.');
         return;
     }
@@ -637,7 +837,8 @@ $('record').onclick = () => action(async () => {
 $('global-stop').onclick = () => action(async () => {
     if (state.sequence?.active) {
         await api('/api/sequence/stop', {});
-        toast(state.sequence.mode === 'road' ? 'Stopping after the current road slot; restoring camera settings.' : 'Stopping after the current photo; restoring camera settings.');
+        toast(state.sequence.mode === 'road' ? 'Stop requested. An unfinished block may be discarded; saved blocks remain available.' : 'Stop requested. Waiting for the current photo and camera restoration.');
+        $('sequence-status').textContent = 'Stop requested — waiting for the Pi to finish and restore settings.';
         return;
     }
     await api('/api/record/stop', {});
@@ -645,12 +846,74 @@ $('global-stop').onclick = () => action(async () => {
     await recent();
     if (page === 'library') await loadLibrary();
 });
-$('capture-mode').onchange = updateButtons;
-for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter'])
-    $(id).oninput = () => {
-        const gain = Number($('road-reference-shutter').value) * Number($('road-reference-gain').value) / Number($('road-comparison-shutter').value);
-        $('road-derived-gain').textContent = Number.isFinite(gain) ? `${gain.toFixed(2)}×` : '—';
+$('capture-mode').onchange = () => {
+    clearModeError();
+    if (roiDrawing) finishRoiDrawing(true);
+    updateButtons();
+};
+for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter', 'road-blocks', 'still-interval', 'still-count', 'test-shutters', 'test-gains', 'test-settle', 'test-samples'])
+    $(id).oninput = updateModeSummary;
+$('still-unlimited').onchange = updateButtons;
+for (const name of ['x', 'y', 'width', 'height'])
+    $(`road-roi-${name}`).oninput = () => {
+        $('road-roi-confirm').checked = false;
+        const values = ['x', 'y', 'width', 'height'].map(key => Number($(`road-roi-${key}`).value) / 100);
+        if (values.every(Number.isFinite) && values[0] >= 0 && values[1] >= 0 && values[2] > 0 && values[3] > 0 && values[0] + values[2] <= 1 && values[1] + values[3] <= 1) {
+            roi = values;
+            drawRoi();
+        }
     };
+$('road-roi-reset').onclick = () => {
+    setRoi([0.15, 0.45, 0.7, 0.45]);
+    $('road-roi-instruction').textContent = 'Suggested road area restored. Check it and confirm below.';
+};
+$('road-roi-draw').onclick = () => {
+    if (!state?.ready || state.frame_age == null || state.frame_age > 5 || !imageGeometry()) {
+        showModeError('Waiting for a fresh live preview before selecting an area.');
+        return;
+    }
+    clearModeError();
+    roiBeforeDraw = [...roi];
+    roiDrawing = true;
+    $('road-roi-confirm').checked = false;
+    $('road-roi-overlay').classList.add('drawing');
+    $('road-roi-draw').hidden = true;
+    $('road-roi-cancel').hidden = false;
+    $('road-roi-instruction').textContent = 'Drag on the live image to draw the road area. Press Escape to cancel.';
+    updateButtons();
+};
+$('road-roi-cancel').onclick = () => finishRoiDrawing(true);
+const roiOverlay = $('road-roi-overlay');
+roiOverlay.onpointerdown = event => {
+    if (!roiDrawing || !event.isPrimary) return;
+    const point = roiPoint(event);
+    if (!point) return;
+    roiDrag = point;
+    roiOverlay.setPointerCapture(event.pointerId);
+};
+roiOverlay.onpointermove = event => {
+    if (!roiDrawing || !roiDrag || !event.isPrimary) return;
+    const point = roiPoint(event, true);
+    const left = Math.min(roiDrag[0], point[0]);
+    const top = Math.min(roiDrag[1], point[1]);
+    setRoi([left, top, Math.abs(point[0] - roiDrag[0]), Math.abs(point[1] - roiDrag[1])]);
+};
+roiOverlay.onpointerup = event => {
+    if (!roiDrawing || !roiDrag || !event.isPrimary) return;
+    if (roi[2] < 0.01 || roi[3] < 0.01) {
+        finishRoiDrawing(true);
+        $('road-roi-instruction').textContent = 'That area was too small; the previous area was restored.';
+    } else finishRoiDrawing(false);
+};
+roiOverlay.onpointercancel = () => roiDrawing && finishRoiDrawing(true);
+roiOverlay.onlostpointercapture = () => roiDrawing && roiDrag && finishRoiDrawing(true);
+document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && roiDrawing) finishRoiDrawing(true);
+});
+new ResizeObserver(() => {
+    if (roiDrawing) finishRoiDrawing(true);
+    drawRoi();
+}).observe($('viewfinder'));
 $('focus-toggle').onchange = () => action(async () => {
     await api('/api/focus', {
         enabled: $('focus-toggle').checked
@@ -659,25 +922,35 @@ $('focus-toggle').onchange = () => action(async () => {
 $('configure-form').onsubmit = e => {
     e.preventDefault();
     action(async () => {
+        if (roiDrawing) finishRoiDrawing(true);
         await api('/api/configure', {
             index: Number($('camera-select').value),
             profile: $('profile').value,
             fps: Number($('fps').value),
             rotation: Number($('rotation').value)
         });
+        $('road-roi-confirm').checked = false;
+        $('road-roi-instruction').textContent = 'Camera setup changed. Wait for the new preview, then check this area again.';
         schemaKey = '';
-        toast('Video settings applied');
+        toast('Camera settings applied');
     });
 };
 $('retry').onclick = () => action(async () => {
     await api('/api/configure', {});
+    $('road-roi-confirm').checked = false;
+    $('road-roi-instruction').textContent = 'Camera reconnected. Wait for the preview, then check this area again.';
     schemaKey = '';
 });
 $('advanced-select').onchange = advanced;
 $('apply-advanced').onclick = () => action(async () => {
+    const name = $('advanced-select').value;
     await api('/api/controls', {
-        [$('advanced-select').value]: JSON.parse($('advanced-value').value)
+        [name]: JSON.parse($('advanced-value').value)
     });
+    if (name === 'ScalerCrop') {
+        $('road-roi-confirm').checked = false;
+        $('road-roi-instruction').textContent = 'Camera crop changed. Check the road area again.';
+    }
     schemaKey = '';
     toast('Control applied');
 });
@@ -685,6 +958,7 @@ $('fullscreen').onclick = () => {
     const promise = document.fullscreenElement ? document.exitFullscreen() : $('viewfinder').requestFullscreen?.();
     promise?.catch(e => toast(e.message, true));
 };
+document.addEventListener('fullscreenchange', drawRoi);
 $('refresh-library').onclick = () => loadLibrary();
 $('previous-page').onclick = () => loadLibrary(Math.max(1, libraryPage - 1));
 $('next-page').onclick = () => loadLibrary(Math.min(libraryPages, libraryPage + 1));
@@ -828,9 +1102,12 @@ document.addEventListener('visibilitychange', () => {
     if (!document.hidden) poll();
 });
 $('feed').onerror = () => {
+    if (roiDrawing) finishRoiDrawing(true);
+    $('road-roi-confirm').checked = false;
     $('feed').removeAttribute('src');
     $('live-badge').textContent = '○ RECONNECTING';
 };
+$('feed').onload = drawRoi;
 setInterval(poll, 1200);
 setInterval(videoFocus, 500);
 

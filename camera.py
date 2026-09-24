@@ -3,6 +3,7 @@
 import io
 import json
 import math
+import queue
 import random
 import shutil
 import threading
@@ -55,6 +56,82 @@ class Frames(io.BufferedIOBase):
         return len(data)
 
 
+def yuv420_planes(array, width, height):
+    """Split Picamera2's YUV420 array (height × 1.5 rows of stride bytes) into Y, U, V views."""
+    y = array[:height, :width]
+    # Chroma rows are half a stride wide, so view the buffer as rows of half the stride.
+    halves = array.reshape(array.shape[0] * 2, array.shape[1] // 2)
+    u = halves[2 * height : 2 * height + height // 2, : width // 2]
+    v = halves[2 * height + height // 2 : 3 * height, : width // 2]
+    return y, u, v
+
+
+def fitted(size, box):
+    """Size of an image scaled to fit inside box, as Image.thumbnail would produce."""
+    scale = min(box[0] / size[0], box[1] / size[1], 1)
+    return max(1, round(size[0] * scale)), max(1, round(size[1] * scale))
+
+
+class BurstSampler:
+    """Selects frames at a target rate inside the camera callback without ever blocking it.
+
+    A selected request waits in a one-slot mailbox. If the encoders have not emptied it by
+    the next due frame, that frame is skipped and counted rather than stalling the camera.
+    """
+
+    def __init__(self, rate, count=0):
+        self.period = 1e9 / rate  # SensorTimestamp is in nanoseconds.
+        self.remaining = count or None
+        self.mailbox = queue.Queue(maxsize=1)
+        self.lock = threading.Lock()
+        self.due = None
+        self.selected = 0
+        self.skipped = 0
+        self.closed = False
+
+    @property
+    def done(self):
+        return self.remaining == 0
+
+    def offer(self, request, metadata):
+        timestamp = metadata.get("SensorTimestamp")
+        with self.lock:
+            if self.closed or self.done or type(timestamp) is not int:
+                return
+            if self.due is not None and timestamp < self.due:
+                return
+            request.acquire()
+            captured = datetime.now(timezone.utc)
+            try:
+                self.mailbox.put_nowait(
+                    (request, metadata, self.selected + 1, captured)
+                )
+            except queue.Full:
+                request.release()
+                self.skipped += 1
+                return
+            self.selected += 1
+            if self.remaining:
+                self.remaining -= 1
+            # Stay on the rate grid after a short delay so the average rate holds; after a
+            # longer stall, restart the grid instead of catching up with back-to-back frames.
+            late = self.due is None or timestamp - self.due >= self.period
+            self.due = (timestamp if late else self.due) + self.period
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+
+    def drain(self):
+        """Release requests nobody will encode, so the camera gets its buffers back."""
+        while True:
+            try:
+                request = self.mailbox.get_nowait()[0]
+            except queue.Empty:
+                return
+            request.release()
+
+
 class CameraDeck:
     def __init__(self, root):
         self.root = Path(root).resolve()
@@ -84,6 +161,13 @@ class CameraDeck:
         self.sequence_worker = None
         self.sequence_settings = {
             "stills": {"interval": 1, "count": 0, "controls": {}},
+            "burst": {
+                "rate": 4,
+                "count": 0,
+                "quality": 90,
+                "threads": 3,
+                "controls": {},
+            },
             "test": {
                 "shutters": [1000, 2000, 4000, 8000],
                 "gains": [2, 4, 8],
@@ -103,6 +187,7 @@ class CameraDeck:
         self.road_armed = False
         self.road_request = None
         self.road_drops = 0
+        self.burst = None
         self._offset_path = self.root / ".time_offset"
         self.time_offset = self._load_offset()
 
@@ -236,6 +321,9 @@ class CameraDeck:
 
     def _metadata(self, request):
         self.metadata = plain(request.get_metadata())
+        burst = self.burst
+        if burst is not None:
+            burst.offer(request, self.metadata)
         with self.road_condition:
             if not self.road_armed:
                 return
@@ -306,7 +394,9 @@ class CameraDeck:
                 or mode not in self.sequence_settings
                 or not isinstance(settings, dict)
             ):
-                raise ValueError("Choose stills, test, or road with a settings object.")
+                raise ValueError(
+                    "Choose stills, burst, test, or road with a settings object."
+                )
             if set(settings) - set(self.sequence_settings[mode]):
                 raise ValueError("Unknown sequence setting.")
             settings = {**self.sequence_settings[mode], **settings}
@@ -330,6 +420,18 @@ class CameraDeck:
                 if not isinstance(values, dict):
                     raise ValueError("Still controls must be a JSON object.")
                 plan = [validate_controls(values, self.schema) if values else {}]
+                total = settings["count"]
+            elif mode == "burst":
+                number("rate", 0.1, 30)
+                number("count", 0, 100000, True)
+                number("quality", 1, 100, True)
+                number("threads", 1, 4, True)
+                values = settings["controls"]
+                if not isinstance(values, dict):
+                    raise ValueError("Burst controls must be a JSON object.")
+                plan = {
+                    "controls": validate_controls(values, self.schema) if values else {}
+                }
                 total = settings["count"]
             elif mode == "test":
                 number("settle", 0.5, 30)
@@ -440,6 +542,8 @@ class CameraDeck:
                 results=[],
                 error=None,
                 settings=plain(settings),
+                # Created up front: status() serializes this dict while workers update it.
+                **(dict(rate=None, skipped=0) if mode == "burst" else {}),
             )
             saved = (
                 self.index,
@@ -467,6 +571,8 @@ class CameraDeck:
         try:
             if run["mode"] == "road":
                 self._run_road(plan)
+            elif run["mode"] == "burst":
+                self._run_burst(plan)
             else:
                 while not self.sequence_stop.is_set() and not self.shutdown.is_set():
                     started = time.monotonic()
@@ -769,16 +875,159 @@ class CameraDeck:
             manifest["finished"] = datetime.now(timezone.utc).isoformat()
             self._write_manifest(directory / "manifest.json", manifest)
 
+    def _burst_fps(self):
+        """Rate of the largest advertised sensor mode, which a full-resolution burst uses."""
+        if not self.modes:
+            return None
+        area = max(m["size"][0] * m["size"][1] for m in self.modes)
+        return max(m["fps"] for m in self.modes if m["size"][0] * m["size"][1] == area)
+
+    def _configure_burst(self, controls):
+        """Stream the full sensor continuously, so no photo waits for a mode switch."""
+        from libcamera import ColorSpace
+
+        p = self.camera
+        p.stop_encoder(self.preview)
+        transform = p.camera_configuration()["transform"]
+        p.stop()
+        fps = self._burst_fps() or self.fps
+        config = p.create_video_configuration(
+            main={"size": p.sensor_resolution, "format": "YUV420"},
+            lores={"size": (640, 360), "format": "YUV420"},
+            controls={"FrameRate": fps},
+            transform=transform,
+            # JPEG stores full-range BT.601 YCbCr (sYCC), so the planes need no conversion.
+            colour_space=ColorSpace.Sycc(),
+            buffer_count=4,
+        )
+        p.configure(config)
+        p.set_controls(self.applied)
+        if controls:
+            self.set_controls(controls)
+        self.preview.frame_skip_count = max(1, round(fps / 10))
+        p.start()
+        p.start_encoder(self.preview, name="lores")
+        return tuple(p.stream_configuration("main")["size"]), fps
+
+    def _run_burst(self, plan):
+        # simplejpeg ships with Picamera2 and encodes YUV planes without an RGB conversion.
+        from simplejpeg import encode_jpeg_yuv_planes
+
+        run = self.sequence
+        settings = run["settings"]
+        with self.lock:
+            size, fps = self._configure_burst(plan["controls"])
+        width, height = size
+        preview = fitted(size, (1600, 1200))
+        sampler = BurstSampler(settings["rate"], settings["count"])
+        progress = threading.Lock()
+        span = []
+        failures = []
+
+        def encode():
+            while True:
+                try:
+                    request, metadata, number, captured = sampler.mailbox.get(
+                        timeout=0.1
+                    )
+                except queue.Empty:
+                    # Nothing is queued after close, so an empty mailbox stays empty.
+                    if sampler.closed and sampler.mailbox.empty():
+                        return
+                    continue
+                try:
+                    try:
+                        # make_array copies, so the camera gets its buffer back before encoding.
+                        array = request.make_array("main")
+                    finally:
+                        request.release()
+                    jpeg = encode_jpeg_yuv_planes(
+                        *yuv420_planes(array, width, height),
+                        quality=settings["quality"],
+                    )
+                    item = self._new("still", captured)
+                    item.update(
+                        file=item["id"] + ".jpg",
+                        capture_mode="burst",
+                        width=width,
+                        height=height,
+                        fps=fps,
+                        metadata=metadata,
+                        sequence={
+                            "id": run["id"],
+                            "mode": "burst",
+                            "number": number,
+                            "settings": settings,
+                        },
+                    )
+                    (self.root / item["file"]).write_bytes(jpeg)
+                    with Image.open(io.BytesIO(jpeg)) as image:
+                        # Decode at reduced scale; the derivatives never need full resolution.
+                        image.draft("RGB", preview)
+                        item = self._finish(item, image)
+                except Exception as exc:
+                    failures.append(exc)
+                    return
+                timestamp = metadata["SensorTimestamp"]
+                with progress:
+                    run["completed"] += 1
+                    run["results"] = [
+                        {k: item[k] for k in ("id", "metadata", "focus", "settings")}
+                    ]
+                    span[:] = (
+                        [min(span[0], timestamp), max(span[1], timestamp)]
+                        if span
+                        else [timestamp, timestamp]
+                    )
+                    if span[1] > span[0]:
+                        run["rate"] = round(
+                            (run["completed"] - 1) * 1e9 / (span[1] - span[0]), 2
+                        )
+
+        workers = [
+            threading.Thread(target=encode, daemon=True)
+            for _ in range(settings["threads"])
+        ]
+        for worker in workers:
+            worker.start()
+        self.burst = sampler
+        try:
+            while not (
+                sampler.done
+                or failures
+                or self.sequence_stop.is_set()
+                or self.shutdown.is_set()
+            ):
+                self.sequence_stop.wait(0.2)
+                run["skipped"] = sampler.skipped
+        finally:
+            self.burst = None
+            sampler.close()
+            # Photos already selected are still encoded and published.
+            for worker in workers:
+                worker.join()
+            sampler.drain()
+            run["skipped"] = sampler.skipped
+        if failures:
+            raise failures[0]
+
     def _space(self):
         if shutil.disk_usage(self.root).free < 256 * 1024 * 1024:
             raise ValueError(
                 "Less than 256 MB free. Download and remove captures before continuing."
             )
 
-    def _new(self, kind):
+    def _new(self, kind, captured=None):
         self._space()
-        stamp = datetime.now(timezone.utc) + timedelta(seconds=self.time_offset)
-        ident = stamp.strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:8]
+        stamp = (captured or datetime.now(timezone.utc)) + timedelta(
+            seconds=self.time_offset
+        )
+        # Milliseconds lead the suffix so several captures per second list in order.
+        ident = (
+            stamp.strftime("%Y%m%d_%H%M%S_")
+            + f"{stamp.microsecond // 1000:03d}"
+            + uuid4().hex[:5]
+        )
         return dict(
             id=ident,
             kind=kind,
@@ -792,7 +1041,8 @@ class CameraDeck:
 
     def _finish(self, item, image):
         item["focus"] = focus_grid(image)
-        if item["kind"] == "still":
+        # Burst stills pass a reduced-scale decode and record their full size beforehand.
+        if item["kind"] == "still" and "width" not in item:
             item["width"], item["height"] = image.size
         for suffix, size in [("thumb", (480, 320)), ("preview", (1600, 1200))]:
             copy = image.copy()
@@ -961,6 +1211,7 @@ class CameraDeck:
             recording=rec["item"]["id"] if rec else None,
             sequence=self.sequence,
             sequence_settings=self.sequence_settings,
+            burst_fps=self._burst_fps(),
             elapsed=round(time.monotonic() - rec["started"], 1) if rec else 0,
             free_bytes=shutil.disk_usage(self.root).free,
         )

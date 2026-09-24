@@ -1,9 +1,12 @@
 import json
 import io
 import subprocess
+import sys
 import threading
 import time
 import zipfile
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -11,8 +14,14 @@ import pytest
 from botocore.exceptions import ClientError
 from PIL import Image, ImageFilter
 
-from app import create_app
-from camera import CameraDeck, focus_grid, validate_controls
+from app import ID, create_app
+from camera import (
+    BurstSampler,
+    CameraDeck,
+    focus_grid,
+    validate_controls,
+    yuv420_planes,
+)
 from storage import S3Uploader
 
 
@@ -793,6 +802,14 @@ def test_sequence_stop_interrupts_settle_and_blocks_conflicts(sequence_deck):
         ("test", {"samples": 6}),
         ("test", {"settle": 0}),
         ("test", {"gains": [True]}),
+        ("burst", {"rate": 0}),
+        ("burst", {"rate": 31}),
+        ("burst", {"count": -1}),
+        ("burst", {"quality": 0}),
+        ("burst", {"quality": 90.5}),
+        ("burst", {"threads": 5}),
+        ("burst", {"controls": []}),
+        ("burst", {"controls": {"Unknown": 1}}),
     ],
 )
 def test_sequence_rejects_invalid_before_camera_changes(sequence_deck, mode, settings):
@@ -939,3 +956,195 @@ def test_motion_defaults_modern_modes_and_unsupported_short(deck, short_name, ma
         expected["AeExposureMode"] = 1
     deck.camera.set_controls.assert_called_once_with(expected)
     assert "ExposureTime" not in deck.applied and "AnalogueGain" not in deck.applied
+
+
+def yuv420(width, height, stride, y, u, v):
+    """A Picamera2-shaped YUV420 buffer: full-stride Y rows, then half-stride U and V rows."""
+    planes = []
+    for rows, pitch, columns, value in [
+        (height, stride, width, y),
+        (height // 2, stride // 2, width // 2, u),
+        (height // 2, stride // 2, width // 2, v),
+    ]:
+        plane = np.full((rows, pitch), 7, dtype=np.uint8)  # 7 marks stride padding
+        plane[:, :columns] = value
+        planes.append(plane.ravel())
+    return np.concatenate(planes).reshape(height * 3 // 2, stride)
+
+
+def test_yuv420_planes_skip_stride_padding():
+    y = np.arange(6 * 8, dtype=np.uint8).reshape(6, 8)
+    u = np.arange(100, 112, dtype=np.uint8).reshape(3, 4)
+    v = np.arange(200, 212, dtype=np.uint8).reshape(3, 4)
+    planes = yuv420_planes(yuv420(8, 6, 16, y, u, v), 8, 6)
+    for actual, expected in zip(planes, (y, u, v)):
+        assert np.array_equal(actual, expected)
+
+
+def test_burst_sampler_keeps_average_rate_then_skips_and_counts():
+    period = 1e9 / 15.75
+    sampler = BurstSampler(4)
+    taken = []
+    for index in range(158):  # ten seconds of frames at the B0569's 15.75 fps
+        sampler.offer(RoadRequest({}, None), {"SensorTimestamp": round(index * period)})
+        if not sampler.mailbox.empty():
+            request, _, number, _ = sampler.mailbox.get_nowait()
+            request.release()
+            taken.append(index)
+            assert number == len(taken)
+    assert len(taken) == 40
+    assert {b - a for a, b in zip(taken, taken[1:])} <= {3, 4}
+
+    busy = BurstSampler(30, count=2)
+    first, second, third, late = (RoadRequest({}, None) for _ in range(4))
+    busy.offer(first, {"SensorTimestamp": 0})
+    busy.offer(second, {"SensorTimestamp": 10**9})
+    assert busy.skipped == 1 and first.references == 1 and second.references == 0
+    busy.mailbox.get_nowait()[0].release()
+    busy.offer(RoadRequest({}, None), {"SensorTimestamp": "invalid"})
+    busy.offer(third, {"SensorTimestamp": 2 * 10**9})
+    assert busy.done and busy.selected == 2
+    busy.offer(late, {"SensorTimestamp": 3 * 10**9})
+    assert late.references == 0
+    busy.close()
+    busy.drain()
+    assert third.references == 0
+
+
+def test_capture_ids_list_in_capture_order_within_a_second(deck):
+    start = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
+    ids = [
+        deck._new("still", start + timedelta(milliseconds=ms))["id"]
+        for ms in (999, 250, 5)
+    ]
+    assert all(ID.fullmatch(ident) for ident in ids)
+    assert sorted(ids) == ids[::-1]
+
+
+def fake_simplejpeg(calls):
+    def encode_jpeg_yuv_planes(y, u, v, quality):
+        calls.append((y.shape, u.shape, v.shape, quality))
+        size = (y.shape[1], y.shape[0])
+        planes = [
+            Image.fromarray(np.ascontiguousarray(plane)).resize(size)
+            for plane in (y, u, v)
+        ]
+        output = io.BytesIO()
+        Image.merge("YCbCr", planes).save(output, "JPEG", quality=quality)
+        return output.getvalue()
+
+    return SimpleNamespace(encode_jpeg_yuv_planes=encode_jpeg_yuv_planes)
+
+
+@pytest.fixture
+def burst_deck(sequence_deck, monkeypatch):
+    deck = sequence_deck
+    deck.encoded = []
+    monkeypatch.setitem(sys.modules, "simplejpeg", fake_simplejpeg(deck.encoded))
+    monkeypatch.setitem(
+        sys.modules,
+        "libcamera",
+        SimpleNamespace(ColorSpace=SimpleNamespace(Sycc=lambda: "sycc")),
+    )
+    # A faster binned mode must not be mistaken for the full-resolution rate.
+    deck.modes = [{"size": [40, 30], "fps": 60}, {"size": [80, 60], "fps": 15.75}]
+    deck.preview = Mock()
+    deck.camera.stream_configuration.return_value = {"size": (80, 60)}
+    return deck
+
+
+def feed_frames(deck, requests):
+    """Stream 15.75 fps frames once the burst is armed, one at a time so none is skipped."""
+    period = 1e9 / 15.75
+    deadline = time.monotonic() + 5
+    while deck.burst is None and deck.sequence["active"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    index = 0
+    while deck.sequence["active"]:
+        assert time.monotonic() < deadline
+        burst = deck.burst
+        if burst is not None and not burst.mailbox.empty():
+            time.sleep(0.001)
+            continue
+        request = RoadRequest(
+            {
+                "SensorTimestamp": round(index * period),
+                "ExposureTime": 1000,
+                "AnalogueGain": 4.0,
+            },
+            yuv420(80, 60, 96, 200, 128, 128),
+        )
+        requests.append(request)
+        deck._metadata(request)
+        index += 1
+
+
+def test_burst_streams_full_resolution_photos_and_restores(burst_deck):
+    deck = burst_deck
+    deck.applied = {"ExposureTime": 1000, "AeEnable": False}
+    deck.start_sequence(
+        "burst",
+        {
+            "rate": 4,
+            "count": 3,
+            "quality": 70,
+            "threads": 2,
+            "controls": {"AnalogueGain": 4},
+        },
+    )
+    requests = []
+    feed_frames(deck, requests)
+    deck.sequence_worker.join(5)
+    run = deck.sequence
+    assert run["error"] is None and not run["active"]
+    assert run["completed"] == 3 and run["skipped"] == 0
+    period = 1e9 / 15.75
+    assert run["rate"] == round(2e9 / (round(8 * period)), 2)
+    assert all(request.references == 0 for request in requests)
+
+    config = deck.camera.create_video_configuration.call_args.kwargs
+    assert config["main"] == {"size": (80, 60), "format": "YUV420"}
+    assert config["colour_space"] == "sycc"
+    assert config["controls"] == {"FrameRate": 15.75}
+    assert deck.encoded == [((60, 80), (30, 40), (30, 40), 70)] * 3
+
+    items = sorted(
+        (json.loads(p.read_text()) for p in deck.root.glob("*.json")),
+        key=lambda item: item["sequence"]["number"],
+    )
+    assert [i["sequence"]["number"] for i in items] == [1, 2, 3]
+    assert [i["metadata"]["SensorTimestamp"] for i in items] == [
+        round(n * period) for n in (0, 4, 8)
+    ]
+    for item in items:
+        assert item["capture_mode"] == "burst"
+        assert (item["width"], item["height"], item["fps"]) == (80, 60, 15.75)
+        assert item["settings"]["AnalogueGain"] == 4
+        assert len(item["focus"]) == 9
+        with Image.open(deck.root / item["file"]) as image:
+            assert image.size == (80, 60)
+            assert all(
+                abs(c - 200) <= 3 for c in image.convert("RGB").getpixel((40, 30))
+            )
+        assert (deck.root / (item["id"] + ".thumb.jpg")).exists()
+        assert (deck.root / (item["id"] + ".preview.jpg")).exists()
+
+    assert deck.applied == {"ExposureTime": 1000, "AeEnable": False}
+    deck.open.assert_called_once_with(0, "1080p", 30, 0)
+
+
+def test_burst_failure_stops_releases_frames_and_restores(burst_deck):
+    deck = burst_deck
+    deck.applied = {"AeEnable": True}
+    deck._space = Mock(side_effect=[None, ValueError("256 MB")])
+    deck.start_sequence("burst", {"threads": 1})
+    requests = []
+    feed_frames(deck, requests)
+    deck.sequence_worker.join(5)
+    assert not deck.sequence["active"]
+    assert "256 MB" in deck.sequence["error"]
+    assert deck.sequence["completed"] == 0
+    assert requests and all(request.references == 0 for request in requests)
+    assert not list(deck.root.glob("*.json"))
+    assert deck.applied == {"AeEnable": True}

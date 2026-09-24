@@ -20,6 +20,7 @@ let state = null,
     roiDrag = null,
     roiBeforeDraw = null,
     sequenceFormLoaded = false,
+    recentRefreshed = 0,
     timeEdited = false;
 const selectedIds = new Set();
 const bytes = n => n >= 1e9 ? `${(n/1e9).toFixed(1)} GB` : `${(n/1e6).toFixed(1)} MB`;
@@ -86,6 +87,7 @@ async function action(task) {
 const modeDescriptions = {
     video: 'Continuous 720p/1080p footage. Best when gaps are unacceptable.',
     stills: 'Full-sensor photos at a chosen interval. The first photo is immediate.',
+    burst: 'Several full-sensor photos per second from a continuous full-resolution stream, without a mode switch between photos.',
     road: 'Randomized equal-exposure A/B evidence for comparing motion detail while driving.',
     test: 'An ordered full-resolution settings grid for a stationary, repeatable scene.'
 };
@@ -118,6 +120,17 @@ function numberValue(id, low, high, integer = false) {
     if (!raw || !Number.isFinite(value) || value < low || value > high || (integer && !Number.isInteger(value)))
         invalid(id, `${$(id).closest('label')?.childNodes[0]?.textContent.trim() || id} must be ${integer?'an integer':'a number'} from ${low} to ${high}.`);
     return value;
+}
+
+function controlOverrides(id) {
+    let controls;
+    try {
+        controls = JSON.parse($(id).value);
+    } catch (_) {
+        invalid(id, 'Advanced controls must be valid JSON.');
+    }
+    if (!controls || Array.isArray(controls) || typeof controls !== 'object') invalid(id, 'Advanced controls must be a JSON object.');
+    return controls;
 }
 
 function numberList(id, label) {
@@ -200,6 +213,10 @@ function updateModeSummary() {
     $('mode-description').textContent = modeDescriptions[mode];
     const interval = Number($('still-interval').value);
     $('stills-summary').textContent = Number.isFinite(interval) ? `First photo immediately, then approximately every ${interval} second${interval===1?'':'s'}${$('still-unlimited').checked ? ' until stopped' : `, up to ${$('still-count').value || '—'} photos`}.` : 'Enter an interval to preview this run.';
+    const rate = Number($('burst-rate').value);
+    const sensorFps = state?.burst_fps;
+    const sampling = !sensorFps ? '' : rate >= sensorFps ? ` The sensor streams ${sensorFps} full-resolution frames per second, so every frame is offered for saving.` : ` The sensor streams ${sensorFps} full-resolution frames per second; about one in ${(sensorFps / rate).toFixed(1)} is saved.`;
+    $('burst-summary').textContent = Number.isFinite(rate) && rate > 0 ? `Target ${rate} photo${rate===1?'':'s'} per second${$('burst-unlimited').checked ? ' until stopped' : `, up to ${$('burst-count').value || '—'} photos`}.${sampling}` : 'Enter a rate to preview this run.';
     const shutters = $('test-shutters').value.split(',').filter(value => value.trim());
     const gains = $('test-gains').value.split(',').filter(value => value.trim());
     const samples = Number($('test-samples').value);
@@ -226,19 +243,19 @@ function settingsForMode(mode) {
     if (mode === 'stills') {
         const interval = numberValue('still-interval', 1, 86400);
         const count = $('still-unlimited').checked ? 0 : numberValue('still-count', 1, 10000, true);
-        let controls;
-        try {
-            controls = JSON.parse($('still-controls').value);
-        } catch (_) {
-            invalid('still-controls', 'Advanced controls must be valid JSON.');
-        }
-        if (!controls || Array.isArray(controls) || typeof controls !== 'object') invalid('still-controls', 'Advanced controls must be a JSON object.');
         return {
             interval,
             count,
-            controls
+            controls: controlOverrides('still-controls')
         };
     }
+    if (mode === 'burst') return {
+        rate: numberValue('burst-rate', 0.1, 30),
+        count: $('burst-unlimited').checked ? 0 : numberValue('burst-count', 1, 100000, true),
+        quality: numberValue('burst-quality', 1, 100, true),
+        threads: numberValue('burst-threads', 1, 4, true),
+        controls: controlOverrides('burst-controls')
+    };
     if (mode === 'test') return {
         shutters: numberList('test-shutters', 'Shutter times'),
         gains: numberList('test-gains', 'Analogue gains'),
@@ -279,10 +296,11 @@ function updateButtons() {
     const mode = $('capture-mode').value;
     $('capture-mode').disabled = busy || running || !!state?.recording;
     $('stills-settings').hidden = mode !== 'stills';
+    $('burst-settings').hidden = mode !== 'burst';
     $('test-settings').hidden = mode !== 'test';
     $('road-settings').hidden = mode !== 'road';
     $('configure-form').hidden = !['video', 'road'].includes(mode);
-    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings select, #stills-settings textarea, #stills-settings button, #test-settings input, #test-settings select, #road-settings input, #road-settings select, #road-settings button, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
+    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings select, #stills-settings textarea, #stills-settings button, #burst-settings input, #burst-settings textarea, #test-settings input, #test-settings select, #road-settings input, #road-settings select, #road-settings button, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
     $('capture').disabled = busy || !connected || !state?.ready || running;
     $('record').disabled = busy || !connected || !state?.ready || roiDrawing;
     $('global-stop').disabled = busy || !connected;
@@ -290,10 +308,11 @@ function updateButtons() {
     $('shutdown-pi').disabled = busy || !!state?.recording || running;
     $('reboot-pi').disabled = busy || !!state?.recording || running;
     $('capture-title').textContent = busy ? 'Working…' : running ? 'Sequence running' : state?.recording ? 'Recording' : 'Ready';
-    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start periodic stills' : mode === 'test' ? 'Start stationary sweep' : mode === 'road' ? 'Start road experiment' : 'Start recording';
+    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start periodic stills' : mode === 'burst' ? 'Start burst' : mode === 'test' ? 'Start stationary sweep' : mode === 'road' ? 'Start road experiment' : 'Start recording';
     $('global-stop').hidden = !state?.recording && !running;
     if (running) $('global-timer').textContent = `${state.sequence.completed} ${state.sequence.mode === 'road' ? 'slots' : 'photos'}`;
     $('still-count-wrap').hidden = $('still-unlimited').checked;
+    $('burst-count-wrap').hidden = $('burst-unlimited').checked;
     updateModeSummary();
     updateSelection();
 }
@@ -363,12 +382,19 @@ async function poll() {
         if (!sequenceFormLoaded && state.sequence_settings) {
             sequenceFormLoaded = true;
             const s = state.sequence_settings.stills,
+                b = state.sequence_settings.burst,
                 t = state.sequence_settings.test,
                 r = state.sequence_settings.road;
             $('still-interval').value = s.interval;
             $('still-unlimited').checked = s.count === 0;
             if (s.count) $('still-count').value = s.count;
             $('still-controls').value = JSON.stringify(s.controls);
+            $('burst-rate').value = b.rate;
+            $('burst-unlimited').checked = b.count === 0;
+            if (b.count) $('burst-count').value = b.count;
+            $('burst-quality').value = b.quality;
+            $('burst-threads').value = b.threads;
+            $('burst-controls').value = JSON.stringify(b.controls);
             $('test-shutters').value = t.shutters.join(', ');
             $('test-gains').value = t.gains.join(', ');
             $('test-settle').value = t.settle;
@@ -383,11 +409,20 @@ async function poll() {
         if (run?.active) $('capture-mode').value = run.mode;
         else if (state.recording) $('capture-mode').value = 'video';
         if (run?.active && run.mode === 'road' && run.settings?.roi) setRoi(run.settings.roi, false);
-        const runName = run?.mode === 'test' ? 'Still sweep' : run?.mode === 'road' ? 'Road experiment' : 'Periodic stills';
+        const runName = {
+            test: 'Still sweep',
+            road: 'Road experiment',
+            burst: 'Full-resolution burst'
+        } [run?.mode] || 'Periodic stills';
         const runUnit = run?.mode === 'road' ? ' slots' : ' photos';
-        $('sequence-status').textContent = run ? `${runName} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''}${runUnit}${run.error ? ' · ' + run.error : ''}` : '';
+        const burstDetail = run?.mode !== 'burst' ? '' : `${run.rate ? ` · ${run.rate} photos/s achieved` : ''}${run.skipped ? ` · ${run.skipped} frames skipped while encoders were busy` : ''}`;
+        $('sequence-status').textContent = run ? `${runName} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''}${runUnit}${burstDetail}${run.error ? ' · ' + run.error : ''}` : '';
         $('test-results').hidden = run?.mode !== 'test' || !run.results.length;
-        if (run?.id !== previousSequence?.id || run?.completed !== previousSequence?.completed || run?.active !== previousSequence?.active || run?.error !== previousSequence?.error) {
+        const runChanged = run?.id !== previousSequence?.id || run?.active !== previousSequence?.active || run?.error !== previousSequence?.error;
+        // A burst saves several photos per second; reloading the library on every poll would compete with encoding.
+        const photosAdded = run?.completed !== previousSequence?.completed && (run?.mode !== 'burst' || Date.now() - recentRefreshed > 10000);
+        if (runChanged || photosAdded) {
+            recentRefreshed = Date.now();
             await recent();
             await loadExperiments();
             $('test-comparisons').replaceChildren();
@@ -800,8 +835,14 @@ $('live-tab').onclick = () => showPage('live');
 $('library-tab').onclick = $('see-library').onclick = () => showPage('library');
 $('help-tab').onclick = () => showPage('help');
 $('help-live').onclick = () => showPage('live');
+
+function stopMessage(mode) {
+    if (mode === 'road') return 'Stop requested. An unfinished block may be discarded; saved blocks remain available.';
+    if (mode === 'burst') return 'Stop requested. Photos already selected finish saving, then camera settings are restored.';
+    return 'Stop requested. Waiting for the current photo and camera restoration.';
+}
 $('mode-help').onclick = () => {
-    const section = $('capture-mode').value === 'road' ? 'help-road' : $('capture-mode').value === 'video' ? 'help-captures' : $('capture-mode').value === 'stills' ? 'help-captures' : 'help-modes';
+    const section = $('capture-mode').value === 'road' ? 'help-road' : $('capture-mode').value === 'video' ? 'help-captures' : ['stills', 'burst'].includes($('capture-mode').value) ? 'help-captures' : 'help-modes';
     showPage('help');
     $(section).scrollIntoView();
 };
@@ -814,7 +855,7 @@ $('capture').onclick = () => action(async () => {
 $('record').onclick = () => action(async () => {
     if (state.sequence?.active) {
         await api('/api/sequence/stop', {});
-        toast(state.sequence.mode === 'road' ? 'Stop requested. An unfinished block may be discarded; saved blocks remain available.' : 'Stop requested. Waiting for the current photo and camera restoration.');
+        toast(stopMessage(state.sequence.mode));
         $('sequence-status').textContent = 'Stop requested — waiting for the Pi to finish and restore settings.';
         return;
     }
@@ -841,7 +882,7 @@ $('record').onclick = () => action(async () => {
 $('global-stop').onclick = () => action(async () => {
     if (state.sequence?.active) {
         await api('/api/sequence/stop', {});
-        toast(state.sequence.mode === 'road' ? 'Stop requested. An unfinished block may be discarded; saved blocks remain available.' : 'Stop requested. Waiting for the current photo and camera restoration.');
+        toast(stopMessage(state.sequence.mode));
         $('sequence-status').textContent = 'Stop requested — waiting for the Pi to finish and restore settings.';
         return;
     }
@@ -855,9 +896,10 @@ $('capture-mode').onchange = () => {
     if (roiDrawing) finishRoiDrawing(true);
     updateButtons();
 };
-for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter', 'road-blocks', 'still-interval', 'still-count', 'test-shutters', 'test-gains', 'test-settle', 'test-samples'])
+for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter', 'road-blocks', 'still-interval', 'still-count', 'burst-rate', 'burst-count', 'test-shutters', 'test-gains', 'test-settle', 'test-samples'])
     $(id).oninput = updateModeSummary;
 $('still-unlimited').onchange = updateButtons;
+$('burst-unlimited').onchange = updateButtons;
 for (const name of ['x', 'y', 'width', 'height'])
     $(`road-roi-${name}`).oninput = () => {
         $('road-roi-confirm').checked = false;

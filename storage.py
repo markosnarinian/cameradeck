@@ -202,14 +202,26 @@ class S3Uploader:
                         },
                         IfNoneMatch="*",
                     )
-                except (NoCredentialsError, ParamValidationError) as exc:
-                    with self._connect() as db:
-                        db.execute(
-                            "DELETE FROM uploads WHERE sha256=? AND destination=?",
-                            (digest, destination),
-                        )
-                    return UploadResult("error", key, str(exc))
                 except Exception as exc:
+                    status = (
+                        exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                        if isinstance(exc, ClientError)
+                        else None
+                    )
+                    # A 4xx response is a definite rejection, so nothing was stored and a
+                    # later attempt is safe. 409/412 mean a conditional write raced another
+                    # and stay uncertain, like lost responses, to be reconciled with HEAD.
+                    if isinstance(exc, (NoCredentialsError, ParamValidationError)) or (
+                        isinstance(status, int)
+                        and 400 <= status < 500
+                        and status not in (409, 412)
+                    ):
+                        with self._connect() as db:
+                            db.execute(
+                                "DELETE FROM uploads WHERE sha256=? AND destination=?",
+                                (digest, destination),
+                            )
+                        return UploadResult("error", key, str(exc))
                     self._set_state(digest, destination, "uncertain")
                     return UploadResult("uncertain", key, str(exc))
 

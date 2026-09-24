@@ -129,6 +129,7 @@ class CameraDeck:
         except Exception as exc:
             self.error = str(exc)
         self.recover_recordings()
+        self.recover_experiments()
         self.worker = threading.Thread(target=self._analyze, daemon=True)
         self.worker.start()
 
@@ -268,7 +269,10 @@ class CameraDeck:
             self.require_camera()
             checked = validate_controls(values, self.schema)
             self.camera.set_controls(checked)
-            self.applied.update(plain(checked))
+            # AfTrigger is a one-shot action; re-sending it would restart AF on every capture.
+            self.applied.update(
+                plain({k: v for k, v in checked.items() if k != "AfTrigger"})
+            )
 
     def _sequence_guard(self):
         if (
@@ -374,8 +378,9 @@ class CameraDeck:
                     or roi[1] < 0
                     or roi[2] <= 0
                     or roi[3] <= 0
-                    or roi[0] + roi[2] > 1
-                    or roi[1] + roi[3] > 1
+                    # Same rounding tolerance as the browser and quality._roi_box.
+                    or roi[0] + roi[2] > 1.000001
+                    or roi[1] + roi[3] > 1.000001
                 ):
                     raise ValueError("roi must be normalized [x, y, width, height].")
                 seed = settings["seed"]
@@ -421,6 +426,9 @@ class CameraDeck:
                 total = settings["blocks"] * 4
             self._space()
             self.sequence_settings[mode] = plain(settings)
+            if mode == "road":
+                # Draw a fresh seed next time; this run keeps its own in run settings.
+                self.sequence_settings[mode]["seed"] = None
             self.sequence_stop.clear()
             self.sequence = dict(
                 id=uuid4().hex,
@@ -916,6 +924,17 @@ class CameraDeck:
                 path.unlink()
             except Exception as exc:
                 self.error = f"An interrupted clip could not be recovered: {path.name}. Original preserved. {exc}"
+
+    def recover_experiments(self):
+        """No sequence runs at startup, so an "active" manifest was cut off by a crash."""
+        for path in (self.root / "experiments").glob("*/manifest.json"):
+            try:
+                manifest = json.loads(path.read_text())
+                if manifest.get("state") == "active":
+                    manifest["state"] = "interrupted"
+                    self._write_manifest(path, manifest)
+            except (OSError, ValueError, AttributeError):
+                continue
 
     def status(self):
         rec = self.recording

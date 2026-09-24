@@ -26,11 +26,11 @@ curl -LsSf astral.sh/uv/install.sh | sh
 git clone https://github.com/markosnarinian/cameradeck.git
 cd cameradeck
 uv venv --system-site-packages
-uv sync --frozen
-uv run python app.py
+uv sync --frozen --no-dev
+uv run --no-dev python app.py
 ```
 
-Open **http://127.0.0.1:8080** on the Pi. The system-site-packages flag is important: use Raspberry Pi OS's Picamera2, libcamera, NumPy, and PyAV rather than unrelated pip camera packages (`uv venv --system-site-packages` followed by `uv sync --frozen` preserves this). No Node, frontend build, CDN, internet connection, or cloud account is needed to run the app.
+Open **http://127.0.0.1:8080** on the Pi. The system-site-packages flag is important: use Raspberry Pi OS's Picamera2 and libcamera rather than unrelated pip camera packages. NumPy, PyAV and the other Python dependencies are installed into the venv at the locked versions and take precedence over apt copies. The locked NumPy is 2.x, so the apt camera stack's compiled modules (such as `python3-simplejpeg`) must be built for NumPy 2, as on Raspberry Pi OS based on Debian 13 "Trixie"; on Bookworm (apt NumPy 1.24) they fail to import. `--no-dev` leaves out the test and formatting tools. No Node, frontend build, CDN, internet connection, or cloud account is needed to run the app.
 
 ### Access from your phone
 
@@ -39,7 +39,7 @@ Join the Pi and phone to the same trusted Wi-Fi network or hotspot. Stop the loc
 ```bash
 read -rs -p 'Choose a CameraDeck password (8+ characters): ' CAMERADECK_PASSWORD; echo
 export CAMERADECK_PASSWORD
-uv run python app.py --host 0.0.0.0
+uv run --no-dev python app.py --host 0.0.0.0
 ```
 
 Open `http://<pi-ip>:8080` on the phone (`hostname -I` on the Pi shows its IP addresses). All clients share the same camera and recording state. Up to four simultaneous live viewers are allowed, leaving server capacity for capture and stop commands. Browsing the library or hiding the tab disconnects that browser's preview, **not its recording**.

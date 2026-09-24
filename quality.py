@@ -29,6 +29,11 @@ METRIC_DIRECTIONS = {
 }
 
 MIN_BLOCKS = 6
+# Materiality floors avoid pretending tiny numerical differences decide.  Darkness
+# and clipping are pixel fractions and smear is in source pixels.  Detail and noise
+# scale with scene and gain, so they must change by a fraction of arm A's level.
+MATERIALITY = {"darkness": 0.002, "clipping": 0.002, "smear": 0.25}
+RELATIVE_MATERIALITY = 0.05
 REQUIRED_METADATA = (
     "ExposureTime",
     "AnalogueGain",
@@ -122,8 +127,10 @@ def frame_metrics(image: np.ndarray, y_range: str = "full") -> dict[str, float |
         # A perfectly featureless synthetic frame carries no evidence that the
         # high-frequency estimator is working, so report it as unavailable.
         noise = estimate if estimate > 1e-6 else None
-    # Correct gradient energy for the amount expected from independent noise.
-    detail = float(max(0.0, np.mean(grad * grad) - (2.0 * (noise or 0.0) ** 2)))
+    # Correct gradient energy for the amount expected from independent noise.  The
+    # smoothed central differences pass 15/32 of white-noise variance, and the
+    # residual above measures 5/4 of it, so expected noise energy is 3/8 * noise².
+    detail = float(max(0.0, np.mean(grad * grad) - (0.375 * (noise or 0.0) ** 2)))
     return {
         "luminance": float(np.percentile(norm, 50)),
         "luminance_p10": float(np.percentile(norm, 10)),
@@ -186,8 +193,15 @@ def _motion(
                 )
                 best = min(best, (err, dx, dy))
         if best[0] < 0.18:
-            # Convert from 64-wide matching image to source pixels.
-            velocity = math.hypot(best[1], best[2]) * (before.shape[1] / 64) / dt
+            # Convert from the matching image to source pixels.  _small does not keep
+            # the aspect ratio, so each axis has its own scale.
+            velocity = (
+                math.hypot(
+                    best[1] * before.shape[1] / a.shape[1],
+                    best[2] * before.shape[0] / a.shape[0],
+                )
+                / dt
+            )
             shifts.append(velocity * exposure_us / 1e6)
             pairs += 1
     coverage = pairs / max(1, len(images) - 1)
@@ -441,17 +455,16 @@ def analyze_run(
     if orders != {"ABBA", "BAAB"}:
         report["reasons"].append("both ABBA and BAAB orders are required")
     if len(accepted) >= MIN_BLOCKS and orders == {"ABBA", "BAAB"}:
-        # Materiality floors avoid pretending tiny numerical differences decide.
-        quality = [
-            aggregate[k]
-            for k in ("detail", "noise", "smear")
-            if aggregate[k] is not None
-        ]
-        exposure = [
-            aggregate[k] for k in ("darkness", "clipping") if aggregate[k] is not None
-        ]
-        good = any(x > 0.002 for x in quality + exposure)
-        bad = any(x < -0.002 for x in quality + exposure)
+        good = bad = False
+        for key in ("detail", "noise", "smear", "darkness", "clipping"):
+            if aggregate[key] is None:
+                continue
+            floor = MATERIALITY.get(key)
+            if floor is None:
+                levels = [x["A"][key] for x in accepted if x["A"][key] is not None]
+                floor = RELATIVE_MATERIALITY * abs(median(levels))
+            good = good or aggregate[key] > floor
+            bad = bad or aggregate[key] < -floor
         report["conclusion"] = (
             "trade-off"
             if good and bad

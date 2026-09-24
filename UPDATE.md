@@ -53,13 +53,20 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 
 4. **Re-sync dependencies.**
    ```bash
-   uv sync --frozen
+   uv sync --frozen --no-dev
    ```
-   Keep using the existing `--system-site-packages` venv (created once at
-   install time) so Picamera2/libcamera/NumPy/PyAV keep resolving to
-   Raspberry Pi OS's apt-installed versions rather than PyPI wheels. Only
-   recreate the venv (`uv venv --system-site-packages`) if `uv sync` reports
-   it is missing or broken.
+   `--no-dev` leaves out the test and formatting tools, and removes them if
+   an earlier sync installed them. Keep using the existing
+   `--system-site-packages` venv (created once at install time) so
+   Picamera2/libcamera keep resolving to Raspberry Pi OS's apt-installed
+   versions. NumPy, PyAV and the other Python dependencies are installed into
+   the venv at the locked versions and take precedence over any apt copies.
+   Because the locked NumPy is 2.x, the apt camera stack's compiled modules
+   (such as `python3-simplejpeg`, used by Picamera2's JPEG encoder) must be
+   built for NumPy 2, as on Raspberry Pi OS based on Debian 13 "Trixie". On
+   Bookworm, whose apt NumPy is 1.24, they fail to import. Only recreate the
+   venv (`uv venv --system-site-packages`) if `uv sync` reports it is missing
+   or broken.
 
 5. **Check for changed deployment files.** `deploy/cameradeck.service` and
    `deploy/90-cameradeck-power.rules` are not automatically re-installed.
@@ -85,7 +92,8 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    ```
    For a manual run, export `CAMERADECK_PASSWORD` in the current shell
    first (see README's "Access from your phone"; `.env` is only read by the
-   service), then run `uv run python app.py --host 0.0.0.0`.
+   service), then run `uv run --no-dev python app.py --host 0.0.0.0`
+   (without `--no-dev`, `uv run` installs the dev tools again).
 
 7. **Verify.** Open the web UI, confirm the camera initializes, take a test
    still, and check `git log -1` matches what you expect. If the UI shows an
@@ -102,7 +110,7 @@ If the update causes a regression:
    sudo systemctl stop cameradeck   # or Ctrl+C a manual run
    git log --oneline -10            # find the last known-good commit
    git checkout <previous-commit-or-tag>
-   uv sync --frozen
+   uv sync --frozen --no-dev
    ```
 3. Repeat step 5 so the installed unit and polkit rule match the
    rolled-back checkout (including `sudo systemctl daemon-reload`).

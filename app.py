@@ -244,30 +244,30 @@ def create_app(
             )
 
         def frames():
-            try:
-                sequence = -1
-                while not deck.shutdown.is_set():
-                    with deck.frames.condition:
-                        ready = deck.frames.condition.wait_for(
-                            lambda: sequence != deck.frames.sequence
-                            or deck.shutdown.is_set(),
-                            timeout=10,
-                        )
-                        if not ready:
-                            continue
-                        sequence, frame = deck.frames.sequence, deck.frames.frame
-                    if frame:
-                        yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(
-                            len(frame)
-                        ).encode() + b"\r\n\r\n" + frame + b"\r\n"
-            finally:
-                viewers.release()
+            sequence = -1
+            while not deck.shutdown.is_set():
+                with deck.frames.condition:
+                    ready = deck.frames.condition.wait_for(
+                        lambda: sequence != deck.frames.sequence
+                        or deck.shutdown.is_set(),
+                        timeout=10,
+                    )
+                    if not ready:
+                        continue
+                    sequence, frame = deck.frames.sequence, deck.frames.frame
+                if frame:
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(
+                        len(frame)
+                    ).encode() + b"\r\n\r\n" + frame + b"\r\n"
 
-        return Response(
+        response = Response(
             frames(),
             mimetype="multipart/x-mixed-replace; boundary=frame",
             headers={"Cache-Control": "no-store"},
         )
+        # Release on close, not in the generator: HEAD responses never start it.
+        response.call_on_close(viewers.release)
+        return response
 
     def item(ident):
         if not ID.fullmatch(ident):
@@ -480,6 +480,8 @@ def create_app(
                 )
             except (OSError, ValueError, KeyError):
                 continue
+        # Directory names are random, so order newest first by creation time.
+        items.sort(key=lambda entry: str(entry["created"] or ""), reverse=True)
         return jsonify(items=items)
 
     @app.get("/api/experiments/<ident>/manifest")

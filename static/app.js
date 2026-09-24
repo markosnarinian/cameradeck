@@ -18,7 +18,9 @@ let state = null,
     roi = [0.15, 0.45, 0.7, 0.45],
     roiDrawing = false,
     roiDrag = null,
-    roiBeforeDraw = null;
+    roiBeforeDraw = null,
+    sequenceFormLoaded = false,
+    timeEdited = false;
 const selectedIds = new Set();
 const bytes = n => n >= 1e9 ? `${(n/1e9).toFixed(1)} GB` : `${(n/1e6).toFixed(1)} MB`;
 const duration = n => `${Math.floor(n/60).toString().padStart(2,'0')}:${Math.floor(n%60).toString().padStart(2,'0')}`;
@@ -357,7 +359,9 @@ async function poll() {
     try {
         const previousSequence = state?.sequence;
         state = await api('/api/status');
-        if (!connected && state.sequence_settings) {
+        // Fill the forms once; a later reconnect must not revert edits or an unconfirmed road area.
+        if (!sequenceFormLoaded && state.sequence_settings) {
+            sequenceFormLoaded = true;
             const s = state.sequence_settings.stills,
                 t = state.sequence_settings.test,
                 r = state.sequence_settings.road;
@@ -645,7 +649,7 @@ async function recent() {
         const result = await api('/api/media');
         $('library-count').textContent = result.total;
         if (result.items.length) {
-            $('recent').replaceChildren(...result.items.slice(0, 4).map(card));
+            $('recent').replaceChildren(...result.items.slice(0, 4).map(item => card(item)));
         } else {
             const empty = document.createElement('p');
             empty.className = 'empty-inline';
@@ -1092,6 +1096,7 @@ $('login-form').onsubmit = async e => {
         $('login').close();
         await poll();
         await recent();
+        await loadExperiments();
         s3Endpoint = (await api('/api/settings')).s3_endpoint;
     } catch (e) {
         $('login-error').textContent = e.message;
@@ -1141,11 +1146,12 @@ async function checkServerTime() {
         } else {
             $('time-drift').hidden = true;
         }
-        const athensDate = new Date(t.athens);
-        $('set-time-value').value = athensDate.toISOString().slice(0, 16);
+        // t.athens is ISO with the Athens offset, so its first 16 characters are Athens wall time.
+        if (!timeEdited && document.activeElement !== $('set-time-value')) $('set-time-value').value = t.athens.slice(0, 16);
     } catch (e) {}
 }
 
+$('set-time-value').oninput = () => timeEdited = true;
 $('set-time').onclick = () => action(async () => {
     const raw = $('set-time-value').value;
     if (!raw) {
@@ -1156,6 +1162,7 @@ $('set-time').onclick = () => action(async () => {
         time: raw
     });
     toast('Time offset applied to Camera Deck');
+    timeEdited = false;
     await checkServerTime();
 });
 

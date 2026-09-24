@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# CameraDeck has no backing services or per-thread authentication to restore.
+echo "CameraDeck orb ready"

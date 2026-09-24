@@ -5,3 +5,4 @@ media/
 .env
 *.log
 test-results/
+.amp/portals/*

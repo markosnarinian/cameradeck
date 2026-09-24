@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Checking system dependencies"
+if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+  sudo apt-get update
+  sudo apt-get install -y ffmpeg
+fi
+
+if ! command -v uv >/dev/null; then
+  echo "uv is required but is not installed in this orb" >&2
+  exit 1
+fi
+
+echo "==> Installing locked Python dependencies"
+time uv sync --frozen
+
+echo "==> CameraDeck orb setup complete"

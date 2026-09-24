@@ -1,6 +1,6 @@
 # Motion blur and sharpness in CameraDeck: review and plan
 
-*Status: review of commit `0613875` plus a proposal. No code has changed yet.*
+*Status: review of commit `0613875` plus a proposal. No code has changed yet. Updated 2026-09-24 with your answers (Section 8) and the video-vs-stills analysis (Section 9).*
 
 ## 1. Short answer
 
@@ -447,22 +447,158 @@ the confound Part A shows the metrics can't handle yet.
 - **Docs:** README sections, and `UPDATE.md` if Mechanism B's tuning handling
   changes deployment.
 
-## 8. Decisions needed from you
+## 8. Decisions
 
-1. **Primary output:** 1080p video, periodic full-sensor stills, or both? The blur
-   budget is set in the pixels of that output, and stills need about 2× shorter
-   shutters for the same px budget.
-2. **What must be sharp:** the near road surface (cracks, texture), mid-distance
-   road, or roadside signs and objects? This sets the ROI and the likely budget.
-3. **Downstream consumer:** people looking at footage, or a model (e.g.
-   road-defect detection)? A model may tolerate noise better than blur, or the
-   reverse. That decides the "too dark" policy default.
-4. **Speed range**, and whether a GPS/OBD speed source is available on the truck.
-5. **Phase 1 mechanism:** app loop (adaptive, a little more code) or tuning-file cap
-   (native AE, static)? I recommend the **app loop**, because Phase 2 needs it
-   anyway.
-6. Should the Phase 0 analyzer fixes land first? I recommend **yes**: the current
-   verdicts are not trustworthy for this decision (F1–F4).
+**Answered (2026-09-24):**
+
+| Question | Answer | What it means for the plan |
+| --- | --- | --- |
+| Primary output | Frames from video, or stills every ~0.5 s | Section 9 compares the two. **Recommendation: frames tapped from the video stream** |
+| What must be sharp | Near road surface, **3–5 m** ahead | Fixed road-band ROI. This is where image motion is fastest, so blur is the limiting factor |
+| Consumer | An **object-detection model on the edge** | Set the blur budget in *model-input* pixels. Collect frames the same way the deployed model will receive them |
+| Speed | **5–40 km/h**, no GPS/OBD | The Phase 2 optical-flow estimator becomes the speed signal. It drives both the shutter and the sampling cadence |
+| Phase 0 first? | **Yes** | Fix the analyzer before trusting any verdict |
+| Phase 1 mechanism | Not answered | I still recommend the app loop |
+
+**Still open. These don't block Phase 0, but Phases 1–2 need them:**
+
+1. **Model input:** does the detector take the whole frame resized (e.g. 640 px
+   wide), or crops/tiles of the road band at native resolution? This sets the blur
+   budget in camera pixels (up to 3× apart) and decides whether full-sensor
+   resolution can ever help.
+2. **Mounting geometry:** camera height, downward tilt, and the lens's horizontal
+   field of view. A level camera at about 2.5 m cannot see 3 m ahead; it has to be
+   tilted down about 30–40°. Replace the example numbers below with the real ones.
+3. **Where the model runs:** on the Pi 4 itself, or on an accelerator or separate
+   device? This sets the CPU budget left for frame selection and encoding.
+
+## 9. Video-stream frames vs. stills for this use case
+
+**Recommendation: take frames from the video stream, as uncompressed YUV tapped
+from the ISP (the way the Road A/B experiment already does it).** Do not decode
+them from the H.264 file, and do not use the periodic full-sensor still path.
+
+### Numbers for the 3–5 m band
+
+These assume 2.5 m camera height, 90° horizontal field of view and the same field
+of view in both modes; point-at-image-centre approximation.
+
+| | 1080p video frame | Full-sensor still (3864 px) |
+| --- | --- | --- |
+| Ground size of one pixel, along the road, at 3 m / 5 m | 6.4 / 13 mm | 3.2 / 6.5 mm |
+| Blur at 40 km/h, 1 ms shutter, at 3 m | 1.75 px | 3.5 px |
+| Blur at 20 km/h, 1 ms shutter, at 3 m | 0.9 px | 1.8 px |
+
+In 1 ms the road moves the same distance on the ground (11 mm at 40 km/h)
+whichever path you use. Full resolution adds real detail only when that movement is
+smaller than one full-res pixel (3.2 mm at 3 m). That requires a shutter no longer
+than:
+
+| Speed | Max shutter for full-res to help |
+| --- | --- |
+| 40 km/h | 0.28 ms |
+| 20 km/h | 0.57 ms |
+| 10 km/h | 1.1 ms |
+| 5 km/h | 2.3 ms |
+
+In twilight, shutters that short need very high gain. Check the shutter AE actually
+picks in your twilight telemetry. If it is 1 ms or more, **blur, not pixel count,
+limits detail above roughly 10–15 km/h**, and 1080p already samples finer than the
+blur.
+
+### Why video-stream frames win here
+
+1. **Coverage.** The 3–5 m band is only 2 m deep. For every piece of road to appear
+   in at least one frame, frames must come at least this often:
+
+   | Speed | Minimum rate |
+   | --- | --- |
+   | 5 km/h | 0.7 Hz |
+   | 14 km/h | 2 Hz |
+   | 20 km/h | 2.8 Hz |
+   | 40 km/h | 5.6 Hz |
+
+   **At 2 Hz, the band has gaps above about 14 km/h**, and at 40 km/h about two
+   thirds of the road is never imaged. The sensor delivers 15.75 fps, so each road
+   point appears in about 3 frames at 40 km/h and about 23 at 5 km/h. From that you
+   can choose a cadence based on distance travelled (below).
+2. **Best-of-window selection.** Truck vibration makes blur vary from frame to
+   frame. With about 8 candidate frames per 0.5 s window, CameraDeck can keep the
+   sharpest one. A still gets one attempt. (The selection metric must be
+   noise-robust; this is Phase 0 work.)
+3. **The current still path can't do 0.5 s.**
+   - Periodic stills are validated at a **1 s minimum interval** (`camera.py:323`,
+     `static/index.html:48`).
+   - Every photo stops the camera, switches to a full-sensor configuration,
+     captures after 2 frames, and switches back.
+   - Then CameraDeck decodes the full-res JPEG again to make the sharpness scores,
+     thumbnail and preview.
+   - A slow capture stretches the interval.
+
+   You can measure the real cadence from the `created` timestamps in the sidecars
+   of an existing periodic-stills run. The video stream never stops, so frame
+   timing is exact (from `SensorTimestamp`), and AE and the motion-priority
+   controller run without interruption.
+4. **The same sensor readout, with less noise per pixel.** The B0569/IMX415
+   advertises a single 3864×2192 mode, so video and stills read the sensor
+   identically, with the same photons and the same rolling-shutter skew.
+   - The ISP's 2× downscale to 1080p averages neighbouring pixels, which gives up
+     to about 2× lower per-pixel noise.
+   - This matters at the high gains that short shutters need.
+   - When blur limits detail, that is a free gain.
+   - On a Module 3 the case is stronger still: its 1080p video mode is binned, with
+     faster readout and better signal-to-noise ratio than its full-res mode.
+5. **It matches deployment.** An on-truck detector will consume the live stream.
+   Training data taken the same way avoids a mismatch between how training and
+   deployment images were produced (different processing, denoise mode, colour
+   range, JPEG). Picamera2's still and video configurations use different default
+   noise-reduction modes and colour spaces; verify on the Pi.
+6. **Cost.** Compared with full-sensor JPEGs, 1080p frames (or just the road band)
+   mean about 4× less data to write, and less CPU to encode.
+
+**Avoid the H.264 file as a frame source.** At 10 Mb/s and 15.75 fps, each frame
+gets about 80 KB on average. Fast-moving fine texture, plus noise from high gain,
+is the worst case for the encoder, and it wipes out exactly the detail the
+detector needs (finding F8). Recording can continue alongside the frame tap for
+human review.
+
+### When stills or full resolution would win
+
+- **Low speed in good light.** If the detector uses the road band at native
+  resolution *and* the shutter can go below the thresholds above (for example
+  daylight at 5–10 km/h), full resolution resolves about 2× finer detail.
+- **Hybrid option.** If that case matters, don't use mode-switched stills. Run a
+  continuous full-sensor YUV stream and tap it in the same way. That keeps coverage,
+  selection and exact timing.
+  - H.264 recording would have to stop, because the Pi 4 encoder is limited to
+    1080p.
+  - Preview would need rework: the Pi 4 ISP has only main and lores outputs.
+  - Memory, CPU and storage cost is about 4×.
+  - Treat this as a later option to test, not the default.
+
+### What this adds to the plan: a "Road frames" capture mode (after Phase 0, alongside Phases 1–2)
+
+- **Frame tap:** the main 1080p YUV stream, reusing the Road A/B tap
+  (`_metadata`/`_road_next`) without holding requests.
+  - Score each frame's road band on a cheap downsampled crop.
+  - Copy a frame only when it beats the best in its window.
+- **Cadence:**
+  - *Time-based:* for example 2 Hz, choosing the best of each window.
+  - *Distance-based:* trigger a new window whenever the road has advanced about
+    70 % of the band depth, measured by the Phase 2 flow estimate. This needs no
+    GPS and no metric calibration, and it gives gap-free coverage at any speed:
+    about 1 Hz at 5 km/h and about 8 Hz at 40 km/h.
+- **Output:**
+  - The road-band crop, or the full frame, as JPEG q≥92 or lossless.
+  - A sidecar per frame with `SensorTimestamp`, exposure, gain, estimated image
+    speed, predicted blur px, and the frame's sharpness score and rank in its
+    window.
+  - Optionally, hand frames straight to the detector in memory.
+- **Exposure:** motion-priority (Phases 1–2), with the blur budget in model-input
+  pixels.
+  - Example: whole 1920 px frame resized to 640 → 1.5 model px = 4.5 video px →
+    about 2.6 ms at 40 km/h.
+  - If the model reads native crops, 1.5 video px → about 0.9 ms.
 
 ---
 

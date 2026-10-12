@@ -151,7 +151,8 @@ class CameraDeck:
         self.index = 0
         self.profile = "1080p"
         self.fps = 30
-        self.rotation = 0
+        self._rotation_path = self.root / ".rotation"
+        self.rotation = self._load_rotation()
         self.schema = {}
         self.modes = []
         self.properties = {}
@@ -191,6 +192,13 @@ class CameraDeck:
         self._offset_path = self.root / ".time_offset"
         self.time_offset = self._load_offset()
 
+    def _load_rotation(self):
+        try:
+            rotation = int(self._rotation_path.read_text().strip())
+            return rotation if rotation in {0, 180} else 0
+        except (OSError, ValueError):
+            return 0
+
     def _load_offset(self):
         try:
             return float(self._offset_path.read_text().strip())
@@ -218,13 +226,15 @@ class CameraDeck:
         self.worker = threading.Thread(target=self._analyze, daemon=True)
         self.worker.start()
 
-    def open(self, index, profile, fps, rotation=0):
+    def open(self, index, profile, fps, rotation=None):
         with self.lock:
             self._sequence_guard()
             if self.recording:
                 raise ValueError(
                     "Stop recording before changing camera or video settings."
                 )
+            if rotation is None:
+                rotation = self.rotation
             from libcamera import Transform, controls
             from picamera2 import Picamera2
             from picamera2.encoders import JpegEncoder
@@ -291,6 +301,10 @@ class CameraDeck:
                 p.post_callback = self._metadata
                 p.start()
                 p.start_encoder(self.preview, name="lores")
+                # Replace atomically so an interrupted write leaves the last saved orientation.
+                temporary = self._rotation_path.with_suffix(".tmp")
+                temporary.write_text(str(rotation))
+                temporary.replace(self._rotation_path)
                 self.index, self.profile, self.fps = index, profile, fps
                 self.rotation = rotation
                 self.error = None

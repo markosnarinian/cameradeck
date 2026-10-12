@@ -19,6 +19,10 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   files and are left alone by `git pull`.
 - `.env` (password, S3 credentials/endpoint) is not tracked in git and is
   not touched by an update.
+- Mounting orientation now persists in `.rotation` inside the configured
+  media directory. After updating an older install, apply your preferred
+  orientation once while idle to save it. Keep this file when backing up or
+  moving the media directory; no migration or service changes are needed.
 
 ## Update steps
 

@@ -875,15 +875,13 @@ def test_recording_blocks_sequence_and_close_stops_worker(sequence_deck):
     assert deck.camera is None
 
 
-@pytest.mark.parametrize("ceiling,expected", [(15.75, 15.75), (60, 30)])
-def test_truck_defaults_applied_on_camera_open(deck, monkeypatch, ceiling, expected):
+@pytest.fixture
+def camera_stack(monkeypatch):
     import enum
-    import sys
-    from types import SimpleNamespace
 
     exposure = enum.IntEnum("AeExposureModeEnum", {"Normal": 0, "Short": 1, "Long": 2})
     camera = Mock()
-    camera.sensor_modes = [{"size": (1920, 1080), "fps": ceiling}]
+    camera.sensor_modes = [{"size": (1920, 1080), "fps": 60}]
     camera.camera_properties = {"Model": "test sensor"}
     camera.camera_controls = {
         "AeEnable": (False, True, True),
@@ -904,7 +902,8 @@ def test_truck_defaults_applied_on_camera_open(deck, monkeypatch, ceiling, expec
         sys.modules,
         "libcamera",
         SimpleNamespace(
-            Transform=Mock(), controls=SimpleNamespace(AeExposureModeEnum=exposure)
+            Transform=lambda **kwargs: SimpleNamespace(**kwargs),
+            controls=SimpleNamespace(AeExposureModeEnum=exposure),
         ),
     )
     monkeypatch.setitem(sys.modules, "picamera2", SimpleNamespace(Picamera2=picamera))
@@ -914,7 +913,13 @@ def test_truck_defaults_applied_on_camera_open(deck, monkeypatch, ceiling, expec
     monkeypatch.setitem(
         sys.modules, "picamera2.outputs", SimpleNamespace(FileOutput=Mock())
     )
+    return camera
 
+
+@pytest.mark.parametrize("ceiling,expected", [(15.75, 15.75), (60, 30)])
+def test_truck_defaults_applied_on_camera_open(deck, camera_stack, ceiling, expected):
+    camera = camera_stack
+    camera.sensor_modes[0]["fps"] = ceiling
     deck.open(deck.index, deck.profile, deck.fps)
     config = camera.create_video_configuration.call_args.kwargs
     assert config["main"]["size"] == (1920, 1080)
@@ -935,6 +940,51 @@ def test_truck_defaults_applied_on_camera_open(deck, monkeypatch, ceiling, expec
         "settle": 2,
         "samples": 3,
     }
+
+
+def test_orientation_persists_across_sessions_and_restart(deck, client, camera_stack):
+    assert client.post("/api/configure", json={"rotation": 180}).json["rotation"] == 180
+    fresh_client = create_app(deck).test_client()
+    assert fresh_client.get("/api/status").json["rotation"] == 180
+    assert (
+        fresh_client.post("/api/configure", json={"profile": "720p"}).json["rotation"]
+        == 180
+    )
+
+    restarted = CameraDeck(deck.root)
+    restarted.start()
+    try:
+        assert restarted.status()["ready"] is True
+        assert restarted.status()["rotation"] == 180
+        transform = camera_stack.create_video_configuration.call_args.kwargs[
+            "transform"
+        ]
+        assert transform.hflip is True and transform.vflip is True
+        restarted.open(0, "1080p", 15)
+        assert restarted.status()["rotation"] == 180
+
+        # A failed change must not overwrite the last successfully applied orientation.
+        camera_stack.start.side_effect = RuntimeError("Camera failed to start")
+        with pytest.raises(RuntimeError, match="Camera failed to start"):
+            restarted.open(0, "1080p", 15, 0)
+        assert CameraDeck(deck.root).status()["rotation"] == 180
+        camera_stack.start.side_effect = None
+        restarted.open(0, "1080p", 15, 0)
+        assert CameraDeck(deck.root).status()["rotation"] == 0
+        transform = camera_stack.create_video_configuration.call_args.kwargs[
+            "transform"
+        ]
+        assert transform.hflip is False and transform.vflip is False
+    finally:
+        restarted.close()
+        restarted.worker.join(2)
+
+
+@pytest.mark.parametrize("saved", [None, "", "bad", "90", "180", "0"])
+def test_saved_orientation_defaults_and_validation(tmp_path, saved):
+    if saved is not None:
+        (tmp_path / ".rotation").write_text(saved)
+    assert CameraDeck(tmp_path).status()["rotation"] == (180 if saved == "180" else 0)
 
 
 @pytest.mark.parametrize(

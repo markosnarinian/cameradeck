@@ -723,8 +723,8 @@ async function loadLibrary(targetPage = libraryPage) {
         $('library-empty').hidden = result.total !== 0;
         $('pagination').hidden = result.pages <= 1;
         $('page-status').textContent = `Page ${result.page} of ${Math.max(1, result.pages)}`;
-        $('previous-page').disabled = result.page <= 1;
-        $('next-page').disabled = result.page >= result.pages;
+        for (const button of $('previous-pages').children) button.disabled = result.page <= 1;
+        for (const button of $('next-pages').children) button.disabled = result.page >= result.pages;
         updateSelection();
     } catch (e) {
         toast(e.message, true);
@@ -1028,8 +1028,18 @@ $('fullscreen').onclick = () => {
 };
 document.addEventListener('fullscreenchange', drawRoi);
 $('refresh-library').onclick = () => loadLibrary();
-$('previous-page').onclick = () => loadLibrary(Math.max(1, libraryPage - 1));
-$('next-page').onclick = () => loadLibrary(Math.min(libraryPages, libraryPage + 1));
+for (const direction of ['previous', 'next']) {
+    for (const step of [1, 3, 5, 10, 20, 50, 200]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = direction === 'previous' ? `← ${step}` : `${step} →`;
+        const label = `${direction === 'previous' ? 'Previous' : 'Next'} ${step} ${step === 1 ? 'page' : 'pages'}`;
+        button.setAttribute('aria-label', label);
+        button.title = label;
+        button.onclick = () => loadLibrary(Math.max(1, Math.min(libraryPages, libraryPage + (direction === 'previous' ? -step : step))));
+        $(direction + '-pages').append(button);
+    }
+}
 $('select-page').onclick = () => {
     pageItems.forEach(item => selectedIds.add(item.id));
     loadLibrary();

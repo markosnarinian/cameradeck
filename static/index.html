@@ -104,7 +104,7 @@
       <div class="library-toolbar"><div class="filter-group" role="group" aria-label="Filter media"><button class="selected" data-kind="all">All captures</button><button data-kind="still">Photos</button><button data-kind="video">Videos</button></div><span class="muted" id="results-count"></span></div>
       <div class="selection-toolbar" id="selection-toolbar"><strong id="selection-count">0 selected</strong><button id="select-page">Select page</button><button id="clear-selection" disabled>Clear</button><span class="selection-spacer"></span><button id="download-selected" disabled>↓ Download</button><button id="upload-selected" disabled>Upload to S3</button><button id="delete-selected" class="danger" disabled>Delete</button></div>
       <div class="library-grid" id="library-grid"></div><div class="empty-state" id="library-empty" hidden><h2>No captures yet</h2><p>Photos and videos will appear here.</p><button class="primary" id="empty-live">Go to live view</button></div>
-      <nav class="pagination" id="pagination" aria-label="Library pages" hidden><button id="previous-page">← Previous</button><span id="page-status">Page 1 of 1</span><button id="next-page">Next →</button></nav>
+      <nav class="pagination" id="pagination" aria-label="Library pages" hidden><span id="page-status" aria-live="polite">Page 1 of 1</span><div id="previous-pages" class="page-jumps" role="group" aria-label="Previous pages"></div><div id="next-pages" class="page-jumps" role="group" aria-label="Next pages"></div></nav>
     </section>
     <section id="help-page" class="help-page" hidden>
       <div class="page-heading"><h1 tabindex="-1" id="help-heading">Help</h1><button id="help-live" class="primary">Return to live view</button></div>

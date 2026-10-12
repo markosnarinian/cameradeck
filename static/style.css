@@ -841,6 +841,7 @@ footer {
 
 .pagination {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: center;
     gap: 16px;
@@ -848,9 +849,20 @@ footer {
 }
 
 .pagination span {
-    min-width: 90px;
+    width: 100%;
     text-align: center;
     font-variant-numeric: tabular-nums;
+}
+
+.page-jumps {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+}
+
+.page-jumps button {
+    padding-inline: 12px;
 }
 
 .notice {

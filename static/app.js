@@ -8,6 +8,7 @@ let state = null,
     libraryPage = 1,
     libraryPages = 0,
     pageItems = [],
+    selectionAnchor = null,
     viewed = null,
     toastTimer, connected = false,
     polling = false,
@@ -682,10 +683,16 @@ function card(item, selectable = false) {
     checkbox.type = 'checkbox';
     checkbox.checked = selectedIds.has(item.id);
     checkbox.setAttribute('aria-label', `Select ${item.kind} ${date(item.created)}`);
-    checkbox.onchange = () => {
-        if (checkbox.checked) selectedIds.add(item.id);
-        else selectedIds.delete(item.id);
-        wrapper.classList.toggle('selected', checkbox.checked);
+    checkbox.onclick = event => {
+        const index = pageItems.findIndex(entry => entry.id === item.id);
+        const anchor = pageItems.findIndex(entry => entry.id === selectionAnchor);
+        const start = (event.shiftKey || event.ctrlKey) && anchor !== -1 ? anchor : index;
+        const checked = event.ctrlKey ? false : event.shiftKey ? true : checkbox.checked;
+        for (const entry of pageItems.slice(Math.min(start, index), Math.max(start, index) + 1)) {
+            if (checked) selectedIds.add(entry.id);
+            else selectedIds.delete(entry.id);
+        }
+        selectionAnchor = item.id;
         updateSelection();
     };
     label.append(checkbox);
@@ -716,6 +723,7 @@ async function loadLibrary(targetPage = libraryPage) {
         libraryPage = result.page;
         libraryPages = result.pages;
         pageItems = result.items;
+        selectionAnchor = null;
         $('library-grid').replaceChildren(...result.items.map(item => card(item, true)));
         const first = result.total ? (result.page - 1) * result.per_page + 1 : 0;
         const last = first ? first + result.items.length - 1 : 0;
@@ -732,6 +740,11 @@ async function loadLibrary(targetPage = libraryPage) {
 }
 
 function updateSelection() {
+    for (const [index, wrapper] of [...$('library-grid').children].entries()) {
+        const checked = selectedIds.has(pageItems[index].id);
+        wrapper.classList.toggle('selected', checked);
+        wrapper.querySelector('input').checked = checked;
+    }
     const count = selectedIds.size;
     $('selection-count').textContent = `${count} selected`;
     for (const id of ['clear-selection', 'download-selected', 'upload-selected', 'delete-selected']) $(id).disabled = !count || busy;

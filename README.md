@@ -126,12 +126,13 @@ The polkit rule grants only the `pi` service user the logind power-off/reboot ac
 
 ```bash
 uv sync --frozen
+# Includes synthetic library browser tests; Chromium must be installed.
 uv run python -m pytest -q
 # With CameraDeck already running and Chromium installed:
 uv run python tests/browser_smoke.py
 ```
 
-Unit/API tests do not open a real camera. The explicit browser smoke test **does** change camera settings, take real stills, record video, exercise playback/seek/focus/download/delete, and check desktop/mobile layouts. It restores the initial video settings and deletes only its own captures. Override `CAMERADECK_TEST_URL`, `CAMERADECK_PASSWORD`, or `CHROMIUM` as needed. Screenshots/downloads remain in ignored `test-results/`; inspect them locally and do not publish private camera scenes.
+Unit/API and synthetic library browser tests do not open a real camera. The library tests start their own temporary server and use synthetic captures to check page jumps and modifier-key selection. The explicit browser smoke test **does** change camera settings, take real stills, record video, exercise playback/seek/focus/download/delete, and check desktop/mobile layouts. It restores the initial video settings and deletes only its own captures. Override `CAMERADECK_TEST_URL`, `CAMERADECK_PASSWORD`, or `CHROMIUM` as needed. Screenshots/downloads remain in ignored `test-results/`; inspect them locally and do not publish private camera scenes.
 
 Code formatting: `uv run black app.py camera.py power.py storage.py tests`, `uv run js-beautify -r static/app.js`, `uv run css-beautify -r static/style.css`.
 

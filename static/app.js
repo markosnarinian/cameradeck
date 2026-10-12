@@ -86,8 +86,7 @@ async function action(task) {
 
 const modeDescriptions = {
     video: 'Continuous 720p/1080p footage. Best when gaps are unacceptable.',
-    stills: 'Full-sensor photos at a chosen interval. The first photo is immediate.',
-    burst: 'Several full-sensor photos per second from a continuous full-resolution stream, without a mode switch between photos.',
+    photos: 'Full-sensor photos at your chosen frequency, until stopped or for a fixed count.',
     road: 'Randomized equal-exposure A/B evidence for comparing motion detail while driving.',
     test: 'An ordered full-resolution settings grid for a stationary, repeatable scene.'
 };
@@ -211,12 +210,19 @@ function finishRoiDrawing(cancelled = false) {
 function updateModeSummary() {
     const mode = $('capture-mode').value;
     $('mode-description').textContent = modeDescriptions[mode];
-    const interval = Number($('still-interval').value);
-    $('stills-summary').textContent = Number.isFinite(interval) ? `First photo immediately, then approximately every ${interval} second${interval===1?'':'s'}${$('still-unlimited').checked ? ' until stopped' : `, up to ${$('still-count').value || '—'} photos`}.` : 'Enter an interval to preview this run.';
-    const rate = Number($('burst-rate').value);
+    const frequency = Number($('photo-frequency').value);
+    const perSecond = $('photo-unit').value === 'rate';
+    const rate = perSecond ? frequency : 1 / frequency;
+    const continuous = $('photo-method').value === 'burst';
+    $('photo-frequency').min = perSecond ? 1 / 86400 : continuous ? 1 / 30 : 1;
+    $('photo-frequency').max = perSecond ? continuous ? 30 : 1 : 86400;
+    $('photo-count').max = continuous ? 100000 : 10000;
+    $('photo-encoding').hidden = !continuous;
+    $('photo-method-help').textContent = continuous ? 'Keeps the full sensor streaming and preview running. Busy encoders skip frames rather than queue them. Up to 30 photos/second; actual rate depends on the sensor, encoding, and storage.' : 'Switches into still mode for each photo, briefly pausing preview. The first photo is immediate. Slow captures extend the interval. At most 1 photo/second.';
     const sensorFps = state?.burst_fps;
-    const sampling = !sensorFps ? '' : rate >= sensorFps ? ` The sensor streams ${sensorFps} full-resolution frames per second, so every frame is offered for saving.` : ` The sensor streams ${sensorFps} full-resolution frames per second; about one in ${(sensorFps / rate).toFixed(1)} is saved.`;
-    $('burst-summary').textContent = Number.isFinite(rate) && rate > 0 ? `Target ${rate} photo${rate===1?'':'s'} per second${$('burst-unlimited').checked ? ' until stopped' : `, up to ${$('burst-count').value || '—'} photos`}.${sampling}` : 'Enter a rate to preview this run.';
+    const sampling = continuous && sensorFps && rate > sensorFps ? ` The sensor ceiling is ${sensorFps} photos/second.` : '';
+    const cadence = perSecond ? `${frequency} photos/second` : `one photo every ${frequency} seconds`;
+    $('photos-summary').textContent = Number.isFinite(frequency) && frequency > 0 ? `Target ${cadence}${$('photo-unlimited').checked ? ' until stopped' : `, up to ${$('photo-count').value || '—'} photos`}.${sampling}` : 'Enter a frequency to preview this run.';
     const shutters = $('test-shutters').value.split(',').filter(value => value.trim());
     const gains = $('test-gains').value.split(',').filter(value => value.trim());
     const samples = Number($('test-samples').value);
@@ -240,22 +246,25 @@ function updateModeSummary() {
 
 function settingsForMode(mode) {
     clearModeError();
-    if (mode === 'stills') {
-        const interval = numberValue('still-interval', 1, 86400);
-        const count = $('still-unlimited').checked ? 0 : numberValue('still-count', 1, 10000, true);
-        return {
-            interval,
+    if (mode === 'photos') {
+        const continuous = $('photo-method').value === 'burst';
+        const perSecond = $('photo-unit').value === 'rate';
+        const frequency = numberValue('photo-frequency', perSecond ? 1 / 86400 : continuous ? 1 / 30 : 1, perSecond ? continuous ? 30 : 1 : 86400);
+        const count = $('photo-unlimited').checked ? 0 : numberValue('photo-count', 1, continuous ? 100000 : 10000, true);
+        const controls = controlOverrides('photo-controls');
+        if (continuous) return {
+            rate: perSecond ? frequency : 1 / frequency,
             count,
-            controls: controlOverrides('still-controls')
+            quality: numberValue('photo-quality', 1, 100, true),
+            threads: numberValue('photo-threads', 1, 4, true),
+            controls
+        };
+        return {
+            interval: perSecond ? 1 / frequency : frequency,
+            count,
+            controls
         };
     }
-    if (mode === 'burst') return {
-        rate: numberValue('burst-rate', 0.1, 30),
-        count: $('burst-unlimited').checked ? 0 : numberValue('burst-count', 1, 100000, true),
-        quality: numberValue('burst-quality', 1, 100, true),
-        threads: numberValue('burst-threads', 1, 4, true),
-        controls: controlOverrides('burst-controls')
-    };
     if (mode === 'test') return {
         shutters: numberList('test-shutters', 'Shutter times'),
         gains: numberList('test-gains', 'Analogue gains'),
@@ -295,11 +304,10 @@ function updateButtons() {
     const running = !!state?.sequence?.active;
     const mode = $('capture-mode').value;
     $('capture-mode').disabled = busy || running || !!state?.recording;
-    $('stills-settings').hidden = mode !== 'stills';
-    $('burst-settings').hidden = mode !== 'burst';
+    $('photos-settings').hidden = mode !== 'photos';
     $('test-settings').hidden = mode !== 'test';
     $('road-settings').hidden = mode !== 'road';
-    for (const input of document.querySelectorAll('#stills-settings input, #stills-settings select, #stills-settings textarea, #stills-settings button, #burst-settings input, #burst-settings textarea, #test-settings input, #test-settings select, #road-settings input, #road-settings select, #road-settings button, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
+    for (const input of document.querySelectorAll('#photos-settings input, #photos-settings select, #photos-settings textarea, #test-settings input, #test-settings select, #road-settings input, #road-settings select, #road-settings button, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
     $('capture').disabled = busy || !connected || !state?.ready || running;
     $('record').disabled = busy || !connected || !state?.ready || roiDrawing;
     $('global-stop').disabled = busy || !connected;
@@ -307,11 +315,10 @@ function updateButtons() {
     $('shutdown-pi').disabled = busy || !!state?.recording || running;
     $('reboot-pi').disabled = busy || !!state?.recording || running;
     $('capture-title').textContent = busy ? 'Working…' : running ? 'Sequence running' : state?.recording ? 'Recording' : 'Ready';
-    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'stills' ? 'Start periodic stills' : mode === 'burst' ? 'Start burst' : mode === 'test' ? 'Start stationary sweep' : mode === 'road' ? 'Start road experiment' : 'Start recording';
+    $('record-label').textContent = running ? 'Stop sequence' : state?.recording ? 'Stop recording' : mode === 'photos' ? 'Start photos' : mode === 'test' ? 'Start stationary sweep' : mode === 'road' ? 'Start road experiment' : 'Start recording';
     $('global-stop').hidden = !state?.recording && !running;
     if (running) $('global-timer').textContent = `${state.sequence.completed} ${state.sequence.mode === 'road' ? 'slots' : 'photos'}`;
-    $('still-count-wrap').hidden = $('still-unlimited').checked;
-    $('burst-count-wrap').hidden = $('burst-unlimited').checked;
+    $('photo-count-wrap').hidden = $('photo-unlimited').checked;
     updateModeSummary();
     updateSelection();
 }
@@ -371,6 +378,20 @@ async function loadExperiments() {
     }
 }
 
+function loadPhotoSettings(method, settings) {
+    $('photo-method').value = method;
+    const perSecond = $('photo-unit').value === 'rate';
+    const rate = method === 'burst' ? settings.rate : 1 / settings.interval;
+    $('photo-frequency').value = perSecond ? rate : 1 / rate;
+    $('photo-unlimited').checked = settings.count === 0;
+    if (settings.count) $('photo-count').value = settings.count;
+    $('photo-controls').value = JSON.stringify(settings.controls);
+    if (method === 'burst') {
+        $('photo-quality').value = settings.quality;
+        $('photo-threads').value = settings.threads;
+    }
+}
+
 async function poll() {
     if (document.hidden || $('login').open || polling || shuttingDown) return;
     polling = true;
@@ -380,20 +401,10 @@ async function poll() {
         // Fill the forms once; a later reconnect must not revert edits or an unconfirmed road area.
         if (!sequenceFormLoaded && state.sequence_settings) {
             sequenceFormLoaded = true;
-            const s = state.sequence_settings.stills,
-                b = state.sequence_settings.burst,
+            const b = state.sequence_settings.burst,
                 t = state.sequence_settings.test,
                 r = state.sequence_settings.road;
-            $('still-interval').value = s.interval;
-            $('still-unlimited').checked = s.count === 0;
-            if (s.count) $('still-count').value = s.count;
-            $('still-controls').value = JSON.stringify(s.controls);
-            $('burst-rate').value = b.rate;
-            $('burst-unlimited').checked = b.count === 0;
-            if (b.count) $('burst-count').value = b.count;
-            $('burst-quality').value = b.quality;
-            $('burst-threads').value = b.threads;
-            $('burst-controls').value = JSON.stringify(b.controls);
+            loadPhotoSettings('burst', b);
             $('test-shutters').value = t.shutters.join(', ');
             $('test-gains').value = t.gains.join(', ');
             $('test-settle').value = t.settle;
@@ -405,14 +416,17 @@ async function poll() {
             setRoi(r.roi, false);
         }
         const run = state.sequence;
-        if (run?.active) $('capture-mode').value = run.mode;
-        else if (state.recording) $('capture-mode').value = 'video';
+        if (run?.active) {
+            const photos = ['stills', 'burst'].includes(run.mode);
+            $('capture-mode').value = photos ? 'photos' : run.mode;
+            if (photos && run.id !== previousSequence?.id) loadPhotoSettings(run.mode, run.settings);
+        } else if (state.recording) $('capture-mode').value = 'video';
         if (run?.active && run.mode === 'road' && run.settings?.roi) setRoi(run.settings.roi, false);
         const runName = {
             test: 'Still sweep',
             road: 'Road experiment',
-            burst: 'Full-resolution burst'
-        } [run?.mode] || 'Periodic stills';
+            burst: 'Photos · continuous capture'
+        } [run?.mode] || 'Photos · separate captures';
         const runUnit = run?.mode === 'road' ? ' slots' : ' photos';
         const burstDetail = run?.mode !== 'burst' ? '' : `${run.rate ? ` · ${run.rate} photos/s achieved` : ''}${run.skipped ? ` · ${run.skipped} frames skipped while encoders were busy` : ''}`;
         $('sequence-status').textContent = run ? `${runName} · ${run.active ? 'Running' : 'Stopped / complete'} · ${run.completed}${run.total ? ' / ' + run.total : ''}${runUnit}${burstDetail}${run.error ? ' · ' + run.error : ''}` : '';
@@ -841,7 +855,7 @@ function stopMessage(mode) {
     return 'Stop requested. Waiting for the current photo and camera restoration.';
 }
 $('mode-help').onclick = () => {
-    const section = $('capture-mode').value === 'road' ? 'help-road' : $('capture-mode').value === 'video' ? 'help-captures' : ['stills', 'burst'].includes($('capture-mode').value) ? 'help-captures' : 'help-modes';
+    const section = $('capture-mode').value === 'road' ? 'help-road' : ['video', 'photos'].includes($('capture-mode').value) ? 'help-captures' : 'help-modes';
     showPage('help');
     $(section).scrollIntoView();
 };
@@ -863,7 +877,7 @@ $('record').onclick = () => action(async () => {
         const settings = settingsForMode(mode);
         try {
             await api('/api/sequence/start', {
-                mode,
+                mode: mode === 'photos' ? $('photo-method').value : mode,
                 settings
             });
         } catch (error) {
@@ -895,10 +909,19 @@ $('capture-mode').onchange = () => {
     if (roiDrawing) finishRoiDrawing(true);
     updateButtons();
 };
-for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter', 'road-blocks', 'still-interval', 'still-count', 'burst-rate', 'burst-count', 'test-shutters', 'test-gains', 'test-settle', 'test-samples'])
+for (const id of ['road-reference-shutter', 'road-reference-gain', 'road-comparison-shutter', 'road-blocks', 'photo-frequency', 'photo-count', 'test-shutters', 'test-gains', 'test-settle', 'test-samples'])
     $(id).oninput = updateModeSummary;
-$('still-unlimited').onchange = updateButtons;
-$('burst-unlimited').onchange = updateButtons;
+$('photo-unlimited').onchange = updateButtons;
+$('photo-method').onchange = () => {
+    clearModeError();
+    updateModeSummary();
+};
+$('photo-unit').onchange = () => {
+    const frequency = Number($('photo-frequency').value);
+    if (Number.isFinite(frequency) && frequency > 0) $('photo-frequency').value = 1 / frequency;
+    clearModeError();
+    updateModeSummary();
+};
 for (const name of ['x', 'y', 'width', 'height'])
     $(`road-roi-${name}`).oninput = () => {
         $('road-roi-confirm').checked = false;

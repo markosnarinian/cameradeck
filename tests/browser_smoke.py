@@ -16,6 +16,55 @@ OUT = Path("test-results")
 OUT.mkdir(exist_ok=True)
 
 
+def check_photo_settings(page):
+    """Check the form's request contract without starting a camera run."""
+    page.locator("#capture-mode").select_option("photos")
+    page.locator("#photos-settings summary").click()
+    page.locator("#photo-unlimited").uncheck()
+    page.locator("#photo-count").fill("7")
+    page.locator("#photo-controls").fill('{"ExposureTime": 1300}')
+    page.locator("#photo-quality").fill("90")
+    page.locator("#photo-threads").fill("3")
+    page.route("**/api/sequence/start", lambda route: route.fulfill(json={"ok": True}))
+    try:
+        for method in ("burst", "stills"):
+            page.locator("#photo-method").select_option(method)
+            for unit in ("rate", "interval"):
+                page.locator("#photo-unit").select_option(unit)
+                page.locator("#photo-frequency").fill("0.25" if unit == "rate" else "4")
+                with page.expect_request("**/api/sequence/start") as request:
+                    page.locator("#record").click()
+                payload = request.value.post_data_json
+                assert payload["mode"] == method
+                expected = {"count": 7, "controls": {"ExposureTime": 1300}}
+                if method == "burst":
+                    expected.update(rate=0.25, quality=90, threads=3)
+                else:
+                    expected.update(interval=4)
+                assert payload["settings"] == expected
+                expect(page.locator("#record")).to_be_enabled()
+            page.locator("#photo-unit").select_option("rate")
+            expect(page.locator("#photo-frequency")).to_have_value("0.25")
+            page.locator("#photo-unit").select_option("interval")
+            expect(page.locator("#photo-frequency")).to_have_value("4")
+        # Changing method must not silently slow a frequency it cannot support.
+        page.locator("#photo-frequency").fill("0.25")
+        page.locator("#record").click()
+        expect(page.locator("#mode-error")).to_be_visible()
+        expect(page.locator("#photo-frequency")).to_have_attribute(
+            "aria-invalid", "true"
+        )
+        expect(page.locator("#record")).to_be_enabled()
+    finally:
+        page.unroute("**/api/sequence/start")
+        page.locator("#photo-method").select_option("burst")
+        page.locator("#photo-unit").select_option("rate")
+        page.locator("#photo-frequency").fill("4")
+        page.locator("#photo-unlimited").check()
+        page.locator("#photo-controls").fill("{}")
+        page.locator("#photos-settings summary").click()
+
+
 def run():
     created = []
     errors = []
@@ -53,7 +102,8 @@ def run():
             return item
 
         try:
-            for mode in ("video", "stills", "burst", "test", "road"):
+            check_photo_settings(page)
+            for mode in ("video", "photos", "test", "road"):
                 page.locator("#capture-mode").select_option(mode)
                 expect(page.locator("#rotation")).to_be_visible()
                 for rotation in (180, 0):

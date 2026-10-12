@@ -436,7 +436,7 @@ class CameraDeck:
                 plan = [validate_controls(values, self.schema) if values else {}]
                 total = settings["count"]
             elif mode == "burst":
-                number("rate", 0.1, 30)
+                number("rate", 1 / 86400, 30)
                 number("count", 0, 100000, True)
                 number("quality", 1, 100, True)
                 number("threads", 1, 4, True)

@@ -510,8 +510,11 @@ def sequence_deck(deck):
         assert not deck.sequence_worker.is_alive()
 
 
-def test_periodic_stills_publish_limit_and_restore(sequence_deck):
+@pytest.mark.parametrize("rotation", [0, 180])
+def test_periodic_stills_publish_limit_and_restore(sequence_deck, rotation):
     deck = sequence_deck
+    deck.rotation = rotation
+    deck.camera.camera_configuration.return_value = {"transform": rotation}
     deck.applied = {"ExposureTime": 7000, "AeEnable": False}
     deck.start_sequence(
         "stills", {"interval": 1, "count": 2, "controls": {"ExposureTime": 1300}}
@@ -525,8 +528,12 @@ def test_periodic_stills_publish_limit_and_restore(sequence_deck):
     assert {i["sequence"]["number"] for i in items} == {1, 2}
     assert all(i["metadata"]["ExposureTime"] == 1300 for i in items)
     assert all(i["capture_mode"] == "full sensor" for i in items)
+    assert all(i["rotation"] == rotation for i in items)
+    assert (
+        deck.camera.create_still_configuration.call_args.kwargs["transform"] == rotation
+    )
     assert deck.applied == {"ExposureTime": 7000, "AeEnable": False}
-    deck.open.assert_called_once_with(0, "1080p", 30, 0)
+    deck.open.assert_called_once_with(0, "1080p", 30, rotation)
     assert deck.sequence_settings["test"]["samples"] == 3
 
 
@@ -803,6 +810,7 @@ def test_sequence_stop_interrupts_settle_and_blocks_conflicts(sequence_deck):
         ("test", {"settle": 0}),
         ("test", {"gains": [True]}),
         ("burst", {"rate": 0}),
+        ("burst", {"rate": 1 / 86401}),
         ("burst", {"rate": 31}),
         ("burst", {"count": -1}),
         ("burst", {"quality": 0}),
@@ -1130,8 +1138,11 @@ def feed_frames(deck, requests):
         index += 1
 
 
-def test_burst_streams_full_resolution_photos_and_restores(burst_deck):
+@pytest.mark.parametrize("rotation", [0, 180])
+def test_burst_streams_full_resolution_photos_and_restores(burst_deck, rotation):
     deck = burst_deck
+    deck.rotation = rotation
+    deck.camera.camera_configuration.return_value = {"transform": rotation}
     deck.applied = {"ExposureTime": 1000, "AeEnable": False}
     deck.start_sequence(
         "burst",
@@ -1157,6 +1168,7 @@ def test_burst_streams_full_resolution_photos_and_restores(burst_deck):
     assert config["main"] == {"size": (80, 60), "format": "YUV420"}
     assert config["colour_space"] == "sycc"
     assert config["controls"] == {"FrameRate": 15.75}
+    assert config["transform"] == rotation
     assert deck.encoded == [((60, 80), (30, 40), (30, 40), 70)] * 3
 
     items = sorted(
@@ -1169,6 +1181,7 @@ def test_burst_streams_full_resolution_photos_and_restores(burst_deck):
     ]
     for item in items:
         assert item["capture_mode"] == "burst"
+        assert item["rotation"] == rotation
         assert (item["width"], item["height"], item["fps"]) == (80, 60, 15.75)
         assert item["settings"]["AnalogueGain"] == 4
         assert len(item["focus"]) == 9
@@ -1181,7 +1194,20 @@ def test_burst_streams_full_resolution_photos_and_restores(burst_deck):
         assert (deck.root / (item["id"] + ".preview.jpg")).exists()
 
     assert deck.applied == {"ExposureTime": 1000, "AeEnable": False}
-    deck.open.assert_called_once_with(0, "1080p", 30, 0)
+    deck.open.assert_called_once_with(0, "1080p", 30, rotation)
+
+
+def test_continuous_photos_accept_daily_interval(burst_deck):
+    deck = burst_deck
+    deck.start_sequence("burst", {"rate": 1 / 86400, "count": 1})
+    requests = []
+    feed_frames(deck, requests)
+    deck.sequence_worker.join(5)
+    assert deck.sequence["error"] is None and not deck.sequence["active"]
+    assert deck.sequence["completed"] == 1
+    items = [json.loads(p.read_text()) for p in deck.root.glob("*.json")]
+    assert len(items) == 1
+    assert items[0]["sequence"]["settings"]["rate"] == 1 / 86400
 
 
 def test_burst_failure_stops_releases_frames_and_restores(burst_deck):

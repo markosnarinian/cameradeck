@@ -75,6 +75,10 @@ def create_app(
     attempts = {}
     attempts_lock = threading.Lock()
     viewers = threading.BoundedSemaphore(4)
+    library_lock = threading.Lock()
+    library_cache = {}
+    library_files = set()
+    library_mtime = None
     power_manager = power_manager or PowerManager()
     configured_endpoint = normalize_endpoint(s3_endpoint)
 
@@ -312,6 +316,33 @@ def create_app(
             raise ValueError(f"{name} must be a positive integer.")
         return min(value, maximum) if maximum else value
 
+    def library_items():
+        nonlocal library_files, library_mtime
+        current_mtime = deck.root.stat().st_mtime_ns
+        with library_lock:
+            if current_mtime != library_mtime:
+                paths = {
+                    path.name: path
+                    for path in deck.root.glob("*.json")
+                    if ID.fullmatch(path.stem)
+                }
+                for name in library_files - paths.keys():
+                    library_cache.pop(name, None)
+                for name in paths.keys() - library_files:
+                    try:
+                        entry = json.loads(paths[name].read_text())
+                        if entry.get("id") != paths[name].stem:
+                            continue
+                        library_cache[name] = entry
+                    except (OSError, ValueError, AttributeError):
+                        continue
+                library_files = set(paths)
+                # If a capture completed during the scan, retain the earlier value so
+                # the next request scans again instead of overlooking its sidecar.
+                after_scan = deck.root.stat().st_mtime_ns
+                library_mtime = current_mtime if after_scan == current_mtime else None
+            return [library_cache[name] for name in sorted(library_cache, reverse=True)]
+
     @app.get("/api/media")
     def library():
         kind = request.args.get("kind", "all")
@@ -319,16 +350,11 @@ def create_app(
             raise ValueError("kind must be all, still, or video.")
         page = positive_integer("page", 1)
         per_page = positive_integer("per_page", 40, 100)
-        items = []
-        for path in sorted(deck.root.glob("*.json"), reverse=True):
-            if not ID.fullmatch(path.stem):
-                continue
-            try:
-                entry = json.loads(path.read_text())
-                if kind == "all" or entry["kind"] == kind:
-                    items.append(entry)
-            except (OSError, ValueError, KeyError):
-                continue
+        items = [
+            entry
+            for entry in library_items()
+            if kind == "all" or entry.get("kind") == kind
+        ]
         total = len(items)
         pages = math.ceil(total / per_page)
         if pages:

@@ -117,6 +117,31 @@ def test_corrupt_sidecar_does_not_break_library(deck, client):
     assert client.get("/api/media").json["items"] == []
 
 
+def test_library_caches_existing_sidecars_and_reads_only_new_files(deck, monkeypatch):
+    first = make_media(deck, ident="20260907_100000_12345678")
+    second = make_media(deck, ident="20260907_100001_12345678")
+    reads = []
+    original = type(deck.root).read_text
+
+    def counted(path, *args, **kwargs):
+        if path.suffix == ".json":
+            reads.append(path.name)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(deck.root), "read_text", counted)
+    cached_client = create_app(deck).test_client()
+
+    assert cached_client.get("/api/media").json["total"] == 2
+    assert cached_client.get("/api/media?kind=still").json["total"] == 2
+    assert sorted(reads) == sorted([first["id"] + ".json", second["id"] + ".json"])
+
+    third = make_media(deck, ident="20260907_100002_12345678")
+    assert cached_client.get("/api/media").json["total"] == 3
+    assert reads.count(third["id"] + ".json") == 1
+    assert reads.count(first["id"] + ".json") == 1
+    assert reads.count(second["id"] + ".json") == 1
+
+
 def test_road_experiment_list_download_and_delete(deck, client):
     ident = "a" * 32
     directory = deck.root / "experiments" / ident

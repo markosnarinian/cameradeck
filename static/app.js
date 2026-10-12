@@ -299,7 +299,6 @@ function updateButtons() {
     $('burst-settings').hidden = mode !== 'burst';
     $('test-settings').hidden = mode !== 'test';
     $('road-settings').hidden = mode !== 'road';
-    $('configure-form').hidden = !['video', 'road'].includes(mode);
     for (const input of document.querySelectorAll('#stills-settings input, #stills-settings select, #stills-settings textarea, #stills-settings button, #burst-settings input, #burst-settings textarea, #test-settings input, #test-settings select, #road-settings input, #road-settings select, #road-settings button, .control-group input, .control-group select, .control-group button, .advanced button')) input.disabled = busy || running;
     $('capture').disabled = busy || !connected || !state?.ready || running;
     $('record').disabled = busy || !connected || !state?.ready || roiDrawing;

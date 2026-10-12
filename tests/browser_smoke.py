@@ -53,6 +53,21 @@ def run():
             return item
 
         try:
+            for mode in ("video", "stills", "burst", "test", "road"):
+                page.locator("#capture-mode").select_option(mode)
+                expect(page.locator("#rotation")).to_be_visible()
+                for rotation in (180, 0):
+                    page.locator("#rotation").select_option(str(rotation))
+                    with page.expect_response(
+                        lambda r: r.url.endswith("/api/configure")
+                        and r.request.method == "POST",
+                        timeout=45000,
+                    ) as response:
+                        page.locator("#apply-config").click()
+                    assert response.value.ok, response.value.text()
+                    assert response.value.json()["rotation"] == rotation
+                    expect(page.locator("#apply-config")).to_be_enabled(timeout=15000)
+            page.locator("#capture-mode").select_option("video")
             page.locator("#profile").select_option("1080p")
             page.locator("#fps").fill("30")
             page.locator("#rotation").select_option("180")

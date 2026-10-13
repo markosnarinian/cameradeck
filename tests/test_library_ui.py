@@ -433,6 +433,120 @@ def test_transfer_rsync_and_optional_upload(library_page):
     screenshot(page, "library-without-upload-mobile", full_page=False)
 
 
+@pytest.mark.parametrize("modern", [True, False])
+def test_independent_exposure_modes(library_page, modern):
+    page = library_page
+    base = page.url.split("/library")[0]
+    status = page.request.get(base + "/api/status").json()
+    status.update(
+        ready=True,
+        metadata_age=0,
+        metadata={"ExposureTime": 2300, "AnalogueGain": 2.5},
+        applied={"AeEnable": True},
+        controls={
+            "AeEnable": dict(type="Bool", min=False, max=True, default=True),
+            "ExposureTime": dict(type="Integer32", min=100, max=10000, default=1000),
+            "AnalogueGain": dict(type="Float", min=1, max=8, default=1),
+        },
+    )
+    if modern:
+        for mode in ("ExposureTimeMode", "AnalogueGainMode"):
+            status["controls"][mode] = dict(
+                type="Integer32",
+                min=0,
+                max=1,
+                default=0,
+                options={"Auto": 0, "Manual": 1},
+            )
+            status["applied"][mode] = 0
+    payloads = []
+    reject = False
+
+    def controls(route):
+        payload = route.request.post_data_json
+        payloads.append(payload)
+        if reject:
+            route.fulfill(status=400, json={"error": "Control rejected"})
+            return
+        status["applied"].update(payload)
+        if modern:
+            for name in ("ExposureTime", "AnalogueGain"):
+                if status["applied"][name + "Mode"] == 0:
+                    status["applied"].pop(name, None)
+        else:
+            status["applied"].pop("AeEnable", None)
+        route.fulfill(json={"ok": True})
+
+    page.route("**/api/status", lambda route: route.fulfill(json=status))
+    page.route("**/api/controls", controls)
+    page.goto(base + "/")
+    page.get_by_role("button", name="Settings", exact=True).click()
+    exposure = page.get_by_label("Exposure time mode", exact=True)
+    gain = page.get_by_label("Gain mode", exact=True)
+    time_value = page.get_by_label("Requested exposure · µs")
+    gain_value = page.get_by_label("Requested gain · ×")
+    expect(time_value).to_be_disabled()
+    expect(gain_value).to_be_disabled()
+    screenshot(page, "exposure-auto" if modern else "exposure-legacy-auto")
+
+    exposure.select_option("manual")
+    expect(time_value).to_be_enabled()
+    expect(time_value).to_have_value("2300")
+    expect(gain_value).to_be_disabled()
+    assert payloads[-1] == (
+        {"ExposureTimeMode": 1, "ExposureTime": 2300}
+        if modern
+        else {"ExposureTime": 2300, "AnalogueGain": 0}
+    )
+    time_value.fill("4100")
+    time_value.press("Tab")
+    expect(exposure).to_be_enabled()
+    assert payloads[-1] == {"ExposureTime": 4100}
+    screenshot(page, "exposure-shutter-priority") if modern else None
+
+    gain.select_option("manual")
+    expect(gain_value).to_be_enabled()
+    expect(gain_value).to_have_value("2.5")
+    expect(time_value).to_have_value("4100")
+    screenshot(page, "exposure-manual") if modern else None
+    exposure.select_option("auto")
+    expect(time_value).to_be_disabled()
+    expect(gain_value).to_be_enabled()
+    expect(gain_value).to_have_value("2.5")
+    assert payloads[-1] == (
+        {"ExposureTimeMode": 0} if modern else {"ExposureTime": 0, "AnalogueGain": 2.5}
+    )
+    screenshot(page, "exposure-gain-priority") if modern else None
+    page.keyboard.press("Escape")
+    page.get_by_role("button", name="Settings", exact=True).click()
+    expect(exposure).to_have_value("auto")
+    expect(gain).to_have_value("manual")
+    expect(gain_value).to_have_value("2.5")
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    screenshot(page, "exposure-gain-priority-narrow") if modern else None
+
+    reject = True
+    exposure.select_option("manual")
+    expect(page.get_by_role("status", include_hidden=True)).to_contain_text(
+        "Control rejected"
+    )
+    expect(exposure).to_have_value("auto")
+    expect(time_value).to_be_disabled()
+    reject = False
+    status["metadata_age"] = 10
+    expect(page.locator(".measured")).to_contain_text("Unavailable / stale")
+    exposure.select_option("manual")
+    expect(time_value).to_have_value("1000")
+    expect(gain_value).to_have_value("2.5")
+    gain.select_option("auto")
+    expect(gain_value).to_be_disabled()
+    expect(time_value).to_be_enabled()
+    exposure.select_option("auto")
+    expect(time_value).to_be_disabled()
+    expect(gain_value).to_be_disabled()
+
+
 def test_camera_preview_and_requested_vs_measured(library_page):
     page = library_page
     base = page.url.split("/library")[0]

@@ -332,6 +332,16 @@ class CameraDeck:
             self.applied.update(
                 plain({k: v for k, v in checked.items() if k != "AfTrigger"})
             )
+            # Legacy RPi numeric controls independently override AeEnable.
+            # Retain zero (auto) so reopening and burst restoration preserve it.
+            if "AeEnable" not in checked and any(
+                field in checked and mode not in self.schema
+                for mode, field in (
+                    ("ExposureTimeMode", "ExposureTime"),
+                    ("AnalogueGainMode", "AnalogueGain"),
+                )
+            ):
+                self.applied.pop("AeEnable", None)
             # Requested manual numbers are not the actual readings once auto is enabled.
             for mode, field in (
                 ("ExposureTimeMode", "ExposureTime"),
@@ -715,6 +725,16 @@ def validate_controls(values, schema):
                 raise ValueError(f"{name}: expected a finite number.")
             if kind.startswith("Integer") and type(v) is not int:
                 raise ValueError(f"{name}: expected an integer.")
+            # Older Raspberry Pi stacks use zero as the per-control auto sentinel,
+            # even though the advertised sensor range has a positive minimum.
+            if (
+                name in {"ExposureTime", "AnalogueGain"}
+                and name + "Mode" not in schema
+                and "AeEnable" in schema
+                and not size
+                and v == 0
+            ):
+                continue
             for bound, compare in [
                 ("min", lambda a, b: a < b),
                 ("max", lambda a, b: a > b),

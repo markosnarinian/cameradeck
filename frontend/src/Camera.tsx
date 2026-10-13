@@ -244,46 +244,60 @@ function Settings({
     ...status.applied,
   });
   const schema = status.controls;
-  const initialAuto =
-    schema.ExposureTimeMode && schema.AnalogueGainMode
-      ? status.applied.ExposureTimeMode !== 1 &&
-        status.applied.AnalogueGainMode !== 1
-      : status.applied.AeEnable !== false;
-  const [auto, setAuto] = useState(initialAuto);
   const fresh =
     connected && status.metadata_age != null && status.metadata_age <= 5;
-  const supportsExposure =
-    !!schema.AeEnable ||
-    (!!schema.ExposureTimeMode && !!schema.AnalogueGainMode);
+  const modernExposure =
+    !!schema.ExposureTimeMode && !!schema.AnalogueGainMode;
+  const isAuto = (name: string) => {
+    const mode = `${name}Mode`;
+    return modernExposure
+      ? (values[mode] ?? schema[mode].default ?? 0) ===
+          (schema[mode].options?.Auto ?? 0)
+      : values[name] != null
+        ? Number(values[name]) === 0
+        : values.AeEnable !== false;
+  };
   const apply = (name: string, value: number | boolean) => {
     setValues((old) => ({ ...old, [name]: value }));
     run(async () => {
       await request("/api/controls", { [name]: value });
     });
   };
-  const exposure = (next: boolean) => {
+  const exposure = (name: string, next: boolean) => {
     const controls: Record<string, number | boolean> = {};
-    if (schema.AeEnable) controls.AeEnable = next;
-    for (const name of ["ExposureTimeMode", "AnalogueGainMode"])
-      if (schema[name])
-        controls[name] =
-          schema[name].options?.[next ? "Auto" : "Manual"] ?? (next ? 0 : 1);
-    if (!next) {
-      for (const name of ["ExposureTime", "AnalogueGain"]) {
-        const spec = schema[name];
-        if (!spec) continue;
-        const value =
-          values[name] ??
-          (fresh ? status.metadata[name] : undefined) ??
+    const manualValue = (field: string) => {
+      const spec = schema[field];
+      const value = Number(
+        (!isAuto(field) ? values[field] : undefined) ??
+          (fresh ? status.metadata[field] : undefined) ??
           spec.default ??
-          spec.min;
-        controls[name] = Number(value);
-      }
+          spec.min,
+      );
+      const bounded = Math.max(spec.min, Math.min(spec.max, value));
+      return spec.type.startsWith("Integer") ? Math.round(bounded) : bounded;
+    };
+    if (modernExposure) {
+      const mode = `${name}Mode`;
+      controls[mode] =
+        schema[mode].options?.[next ? "Auto" : "Manual"] ?? (next ? 0 : 1);
+      if (!next) controls[name] = manualValue(name);
+    } else {
+      // Legacy Raspberry Pi controls use zero for auto. AeEnable would reset
+      // both controls, so explicitly preserve the other control instead.
+      for (const field of ["ExposureTime", "AnalogueGain"])
+        if (schema[field])
+          controls[field] = (field === name ? next : isAuto(field))
+            ? 0
+            : manualValue(field);
     }
     run(async () => {
       await request("/api/controls", controls);
-      setAuto(next);
-      setValues((old) => ({ ...old, ...controls }));
+      setValues((old) => {
+        const updated = { ...old, ...controls };
+        if (modernExposure && next) delete updated[name];
+        if (!modernExposure) delete updated.AeEnable;
+        return updated;
+      });
     });
   };
   const field = (name: string, label: string, blocked = false) => {
@@ -321,7 +335,16 @@ function Settings({
             min={spec.min}
             max={spec.max}
             step={spec.type === "Float" ? "any" : 1}
-            value={Number(value)}
+            value={
+              blocked && ["ExposureTime", "AnalogueGain"].includes(name)
+                ? ""
+                : Number(value)
+            }
+            placeholder={
+              blocked && ["ExposureTime", "AnalogueGain"].includes(name)
+                ? "Auto"
+                : undefined
+            }
             disabled={disabled || blocked}
             onChange={(e) =>
               setValues((old) => ({ ...old, [name]: Number(e.target.value) }))
@@ -337,21 +360,30 @@ function Settings({
   };
   return (
     <div className="settings-fields">
-      {supportsExposure && (
-        <label className="field">
-          Exposure
-          <select
-            value={auto ? "auto" : "manual"}
-            disabled={disabled}
-            onChange={(e) => exposure(e.target.value === "auto")}
-          >
-            <option value="auto">Auto</option>
-            <option value="manual">Manual</option>
-          </select>
-        </label>
+      {[
+        ["ExposureTime", "Exposure time", "Requested exposure · µs"],
+        ["AnalogueGain", "Gain", "Requested gain · ×"],
+      ].map(([name, label, requested]) =>
+        schema[name] ? (
+          <div key={name}>
+            {(modernExposure || schema.AeEnable) && (
+              <label className="field">
+                {label} mode
+                <select
+                  aria-label={`${label} mode`}
+                  value={isAuto(name) ? "auto" : "manual"}
+                  disabled={disabled}
+                  onChange={(e) => exposure(name, e.target.value === "auto")}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </label>
+            )}
+            {field(name, requested, isAuto(name))}
+          </div>
+        ) : null,
       )}
-      {field("ExposureTime", "Requested exposure · µs", auto)}
-      {field("AnalogueGain", "Requested gain · ×", auto)}
       <div className="measured">
         Measured exposure:{" "}
         {fresh && status.metadata.ExposureTime != null

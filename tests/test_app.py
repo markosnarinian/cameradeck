@@ -839,6 +839,52 @@ def feed_frames(deck):
     return requests
 
 
+@pytest.mark.parametrize("modern", [True, False])
+@pytest.mark.parametrize("manual", ["ExposureTime", "AnalogueGain"])
+def test_priority_controls_and_burst_restoration(burst_deck, client, modern, manual):
+    deck = burst_deck
+    if modern:
+        for mode in ("ExposureTimeMode", "AnalogueGainMode"):
+            deck.schema[mode] = {
+                **spec("Integer32", 0, 1, options={"Auto": 0, "Manual": 1}),
+                "default": 0,
+            }
+    automatic = "AnalogueGain" if manual == "ExposureTime" else "ExposureTime"
+    value = 3700 if manual == "ExposureTime" else 3.5
+    deck.set_controls(
+        {"ExposureTimeMode": 0, "AnalogueGainMode": 0} if modern else {"AeEnable": True}
+    )
+    controls = (
+        {manual + "Mode": 1, manual: value} if modern else {manual: value, automatic: 0}
+    )
+    assert client.post("/api/controls", json=controls).status_code == 200
+    applied = client.get("/api/status").json["applied"]
+    assert applied[manual] == value
+    if modern:
+        assert applied[manual + "Mode"] == 1
+        assert applied[automatic + "Mode"] == 0
+        assert automatic not in applied
+    else:
+        assert applied[automatic] == 0
+        assert "AeEnable" not in applied
+    # A temporary override must restore both the fixed and automatic halves.
+    override = {"ExposureTime": 1900, "AnalogueGain": 4.5}
+    if modern:
+        override.update(ExposureTimeMode=1, AnalogueGainMode=1)
+    deck.start_sequence("burst", {"count": 1, "controls": override})
+    feed_frames(deck)
+    assert deck.sequence["error"] is None
+    assert client.get("/api/status").json["applied"] == applied
+    for invalid in (-1, 0.5 if manual == "AnalogueGain" else 99):
+        assert client.post("/api/controls", json={manual: invalid}).status_code == 400
+    if modern:
+        assert client.post("/api/controls", json={manual: 0}).status_code == 400
+    auto = {manual + "Mode": 0} if modern else {manual: 0}
+    assert client.post("/api/controls", json=auto).status_code == 200
+    applied = client.get("/api/status").json["applied"]
+    assert manual not in applied if modern else applied[manual] == 0
+
+
 @pytest.mark.parametrize("rotation", [0, 180])
 def test_burst_streams_full_resolution_photos_and_restores(burst_deck, rotation):
     deck = burst_deck

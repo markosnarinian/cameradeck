@@ -43,6 +43,14 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   When changing frontend source, use Node 22+ on a build machine:
   `npm --prefix frontend ci && npm --prefix frontend run build`, and ship the
   source, lockfile and compiled files together. The service still runs Python only.
+- Exposure time and gain now have independent Auto/Manual selectors, including
+  shutter-priority (manual exposure, auto gain) and gain-priority (auto exposure,
+  manual gain). No camera-stack upgrade is required: newer libcamera uses the
+  separate mode controls; older Raspberry Pi stacks use zero for the automatic
+  numeric control. Scripts using `/api/controls` on older stacks can likewise
+  send `ExposureTime: 0` or `AnalogueGain: 0` to release just that control.
+  `AeEnable` still switches both together; do not send it with a priority-mode
+  request on an older stack. Verify both mixed modes after updating while idle.
 - Flask must serve `/`, `/library`, `/transfer`, `/assets/*`, `/api/*`, and `/media/*` on the
   same origin. If using a reverse proxy, forward the new routes too; avoid
   caching app HTML/API responses. Hashed assets can be cached. Direct `/library`

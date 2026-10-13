@@ -1,10 +1,14 @@
-"""Library browser contracts, using synthetic captures and no camera hardware."""
+"""Real compiled React UI against synthetic Flask media, never camera hardware."""
 
+import io
 import os
+import re
 import threading
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from PIL import Image, ImageDraw
 from playwright.sync_api import expect, sync_playwright
 from werkzeug.serving import make_server
 
@@ -12,11 +16,32 @@ from app import create_app
 from camera import CameraDeck
 
 
+def screenshot(page, name, *, full_page=True):
+    if directory := os.environ.get("CAMERADECK_SCREENSHOTS"):
+        out = Path(directory)
+        out.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(out / (name + ".png")), full_page=full_page)
+
+
 @pytest.fixture
 def library_page(tmp_path):
-    server = make_server(
-        "127.0.0.1", 0, create_app(CameraDeck(tmp_path)), threaded=True
-    )
+    deck = CameraDeck(tmp_path)
+    for index in range(121):
+        item = deck._new("still")
+        item["file"] = item["id"] + ".jpg"
+        image = Image.new("RGB", (160, 100), (30 + index % 100, 90, 110))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((15, 40, 145, 80), fill="#78955e")
+        draw.ellipse((100, 10, 120, 30), fill="#efc76a")
+        draw.text((20, 50), f"Synthetic {index + 1}", fill="white")
+        image.save(deck.root / item["file"])
+        deck._finish(item, image)
+    app = create_app(deck, "synthetic-password")
+    assert app.extensions["catalog"].finished.wait(10)
+    output = io.BytesIO()
+    image.save(output, "JPEG")
+    deck.frames.write(output.getvalue())
+    server = make_server("127.0.0.1", 0, app, threaded=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -26,144 +51,468 @@ def library_page(tmp_path):
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
             page = browser.new_page(viewport={"width": 1440, "height": 1100})
-
-            def media(route):
-                query = parse_qs(urlparse(route.request.url).query)
-                number = int(query.get("page", [1])[0])
-                route.fulfill(
-                    json={
-                        "page": number,
-                        "pages": 401,
-                        "per_page": 40,
-                        "total": 16040,
-                        "items": [
-                            {
-                                "id": f"capture-{number}-{index}",
-                                "kind": "still",
-                                "created": f"2026-10-12T12:00:{index:02}+00:00",
-                            }
-                            for index in range(40)
-                        ],
-                    }
-                )
-
-            page.route("**/api/media?*", media)
-            page.route("**/api/media", media)
-            page.route(
-                "**/media/*/thumb",
-                lambda route: route.fulfill(
-                    content_type="image/svg+xml",
-                    body='<svg xmlns="http://www.w3.org/2000/svg" width="480" '
-                    'height="320"><rect width="480" height="320" fill="#aab9ad"/></svg>',
-                ),
-            )
-            page.goto(f"http://127.0.0.1:{server.server_port}")
-            page.locator("#library-tab").click()
-            expect(page.locator("#page-status")).to_have_text("Page 1 of 401")
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.server_port}/library")
+            expect(page.get_by_role("heading", name="Locked")).to_be_visible()
+            page.get_by_label("Password").fill("synthetic-password")
+            page.get_by_role("button", name="Sign in").click()
+            expect(page.locator(".media-card")).to_have_count(40)
             yield page
+            assert not errors, errors
             browser.close()
     finally:
         server.shutdown()
-        thread.join()
+        thread.join(10)
         server.server_close()
+        app.extensions["catalog"].close()
 
 
-def test_library_page_jumps(library_page):
+def test_library_navigation_and_viewer(library_page):
     page = library_page
-    previous = page.locator("#previous-pages button")
-    following = page.locator("#next-pages button")
-    expect(previous).to_have_count(7)
-    expect(following).to_have_count(7)
-    for button in previous.all():
-        expect(button).to_be_disabled()
-
-    current = 1
-    for step in (1, 3, 5, 10, 20, 50, 200):
-        label = f"Next {step} {'page' if step == 1 else 'pages'}"
-        page.get_by_role("button", name=label, exact=True).click()
-        current += step
-        expect(page.locator("#page-status")).to_have_text(f"Page {current} of 401")
-    for step in (1, 3, 5, 10, 20, 50, 200):
-        label = f"Previous {step} {'page' if step == 1 else 'pages'}"
-        page.get_by_role("button", name=label, exact=True).click()
-        current -= step
-        expect(page.locator("#page-status")).to_have_text(f"Page {current} of 401")
-
-    page.get_by_role("button", name="Next 3 pages", exact=True).click()
-    page.get_by_role("button", name="Previous 200 pages", exact=True).click()
-    expect(page.locator("#page-status")).to_have_text("Page 1 of 401")
-    for _ in range(2):
-        page.get_by_role("button", name="Next 200 pages", exact=True).click()
-    for button in following.all():
-        expect(button).to_be_disabled()
-    page.get_by_role("button", name="Previous 5 pages", exact=True).click()
-    page.get_by_role("button", name="Next 200 pages", exact=True).click()
-    expect(page.locator("#page-status")).to_have_text("Page 401 of 401")
-
+    top = page.get_by_role("navigation", name="Top pagination")
+    bottom = page.get_by_role("navigation", name="Bottom pagination")
+    number = top.get_by_role("spinbutton", name="Page number")
+    expect(top.get_by_role("button", name="First", exact=True)).to_be_disabled()
+    top.get_by_role("button", name="Next", exact=True).click()
+    expect(number).to_have_value("2")
+    bottom.get_by_role("button", name="Previous", exact=True).click()
+    expect(number).to_have_value("1")
+    bottom.get_by_role("button", name="Last", exact=True).click()
+    expect(number).to_have_value("4")
+    expect(page.locator(".media-card")).to_have_count(1)
+    expect(top.get_by_role("button", name="Next", exact=True)).to_be_disabled()
+    number.fill("2")
+    top.get_by_role("button", name="Go", exact=True).click()
+    expect(page.locator(".media-card")).to_have_count(40)
+    top.get_by_role("button", name="First", exact=True).click()
+    expect(number).to_have_value("1")
+    page.get_by_role("combobox", name=re.compile("^Per page")).select_option("20")
+    expect(page.locator(".media-card")).to_have_count(20)
+    page.get_by_role("combobox", name=re.compile("^Thumbnails")).select_option("large")
+    expect(page.locator(".media-grid")).to_have_class("media-grid large")
+    screenshot(page, "photo-library-desktop")
+    page.locator(".thumbnail").first.click()
+    expect(page.get_by_role("dialog")).to_be_visible()
+    expect(page.get_by_role("dialog").locator("img")).to_be_visible()
+    page.get_by_role("button", name="Load original").click()
+    expect(page.get_by_role("button", name="Load original")).to_be_disabled()
+    page.keyboard.press("Escape")
     page.set_viewport_size({"width": 390, "height": 844})
-    page.locator("#pagination").scroll_into_view_if_needed()
+    expect(page.get_by_role("dialog")).not_to_be_visible()
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    screenshot(page, "photo-library-mobile")
 
 
-def test_library_selection_ranges(library_page):
+def test_library_mirrored_page_jumps(library_page):
     page = library_page
-    checks = page.locator("#library-grid input[type=checkbox]")
+    base = page.url.split("/library")[0]
+    data = page.request.get(base + "/api/media?per_page=40").json()
+
+    def library(route):
+        query = parse_qs(urlsplit(route.request.url).query)
+        target = min(1501, max(1, int(query.get("page", [1])[0])))
+        route.fulfill(
+            json={
+                **data,
+                "page": target,
+                "pages": 1501,
+                "total": 60040,
+                "indexed": 60040,
+            }
+        )
+
+    page.route("**/api/media?*", library)
+    page.get_by_role("button", name="Refresh").click()
+    top = page.get_by_role("navigation", name="Top pagination")
+    bottom = page.get_by_role("navigation", name="Bottom pagination")
+    expect(top.locator("form > span")).to_have_text("of 1501")
+    steps = [1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500]
+    for bar in (top, bottom):
+        assert bar.get_by_role("group", name="Previous pages").get_by_role(
+            "button"
+        ).all_text_contents() == [f"−{step}" for step in steps] + ["First"]
+        assert bar.get_by_role("group", name="Next pages").get_by_role(
+            "button"
+        ).all_text_contents() == [f"+{step}" for step in steps] + ["Last"]
+    grid = page.locator(".media-grid").bounding_box()
+    top_box, bottom_box = top.bounding_box(), bottom.bounding_box()
+    assert top_box["y"] + top_box["height"] <= grid["y"]
+    assert bottom_box["y"] >= grid["y"] + grid["height"]
+    if directory := os.environ.get("CAMERADECK_SCREENSHOTS"):
+        top.screenshot(path=str(Path(directory) / "pagination-first-desktop.png"))
+
+    def current(target):
+        expect(page).to_have_url(re.compile(rf"page={target}(?:&|$)"))
+        for bar in (top, bottom):
+            expect(bar.get_by_role("spinbutton", name="Page number")).to_have_value(
+                str(target)
+            )
+            expect(bar.get_by_role("button", name="Go", exact=True)).to_be_enabled()
+
+    def go(target):
+        top.get_by_role("spinbutton", name="Page number").fill(str(target))
+        top.get_by_role("button", name="Go", exact=True).click()
+        current(target)
+
+    for step in steps:
+        for bar, direction, sign in ((top, "Previous", -1), (bottom, "Next", 1)):
+            go(751)
+            name = direction if step == 1 else f"{direction} {step} pages"
+            bar.get_by_role("button", name=name, exact=True).click()
+            current(751 + sign * step)
+    go(3)
+    top.get_by_role("button", name="Previous 500 pages", exact=True).click()
+    current(1)
+    for bar in (top, bottom):
+        expect(
+            bar.get_by_role("group", name="Previous pages").locator("button:enabled")
+        ).to_have_count(0)
+    go(1499)
+    bottom.get_by_role("button", name="Next 500 pages", exact=True).click()
+    current(1501)
+    for bar in (top, bottom):
+        expect(
+            bar.get_by_role("group", name="Next pages").locator("button:enabled")
+        ).to_have_count(0)
+    go(751)
+    center = top.locator("form").bounding_box()
+    for direction in ("Previous", "Next"):
+        boxes = [
+            top.get_by_role(
+                "button",
+                name=direction if step == 1 else f"{direction} {step} pages",
+                exact=True,
+            ).bounding_box()
+            for step in steps
+        ]
+        assert all(box["y"] == boxes[0]["y"] for box in boxes)
+        xs = [box["x"] for box in boxes]
+        assert xs == sorted(xs, reverse=direction == "Previous")
+        assert (
+            max(box["x"] + box["width"] for box in boxes) <= center["x"]
+            if direction == "Previous"
+            else min(xs) >= center["x"] + center["width"]
+        )
+    if directory := os.environ.get("CAMERADECK_SCREENSHOTS"):
+        top.screenshot(path=str(Path(directory) / "pagination-middle-desktop.png"))
+        bottom.screenshot(path=str(Path(directory) / "pagination-bottom-desktop.png"))
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    for step in steps:
+        previous = top.get_by_role(
+            "button",
+            name="Previous" if step == 1 else f"Previous {step} pages",
+            exact=True,
+        ).bounding_box()
+        next_ = top.get_by_role(
+            "button", name="Next" if step == 1 else f"Next {step} pages", exact=True
+        ).bounding_box()
+        assert previous["y"] == next_["y"]
+        assert previous["x"] + previous["width"] < next_["x"]
+    if directory := os.environ.get("CAMERADECK_SCREENSHOTS"):
+        top.screenshot(path=str(Path(directory) / "pagination-mobile-outward.png"))
+
+
+def test_library_selection_ranges_and_limit(library_page):
+    page = library_page
+    checks = page.get_by_role("checkbox")
+    top = page.get_by_role("navigation", name="Top pagination")
 
     def selected(indices, total=None):
-        expect(page.locator("#selection-count")).to_have_text(
-            f"{len(indices) if total is None else total} selected"
-        )
+        # Check immediately: a later status render must not hide native checkbox drift.
         assert (
             checks.evaluate_all(
-                "inputs => inputs.flatMap((input, index) => input.checked ? [index] : [])"
+                "inputs => inputs.flatMap((input, i) => input.checked ? [i] : [])"
             )
             == indices
         )
-        expect(page.locator("#library-grid .selected")).to_have_count(len(indices))
-        expect(page.locator("#viewer")).not_to_be_visible()
+        expect(page.locator(".selection-bar > span")).to_contain_text(
+            f"{len(indices) if total is None else total} selected"
+        )
+        for index in indices:
+            expect(checks.nth(index)).to_be_checked()
+        expect(page.locator(".media-card input:checked")).to_have_count(len(indices))
+        expect(page.locator(".media-card.selected")).to_have_count(len(indices))
+        expect(page.get_by_role("dialog")).not_to_be_visible()
 
-    # With no anchor, modifiers affect only the clicked capture.
     checks.nth(2).click(modifiers=["Shift"])
     selected([2])
     checks.nth(7).click()
     checks.nth(4).click(modifiers=["Shift"])
     selected([2, 4, 5, 6, 7])
-    # Shift adds even if its endpoint was already selected.
-    checks.nth(6).click(modifiers=["Shift"])
-    selected([2, 4, 5, 6, 7])
+    # Refresh preserves the ID anchor; repeated Shift never moves it.
+    page.get_by_role("button", name="Refresh").click()
+    expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
+    checks.nth(9).click(modifiers=["Shift"])
+    selected([2, 4, 5, 6, 7, 8, 9])
     checks.nth(4).click(modifiers=["Control"])
-    selected([2, 7])
-    # Label padding must forward both modifiers to the checkbox as well.
-    page.locator("#library-grid .card-select").nth(9).click(
+    selected([2, 5, 6, 7, 8, 9])
+    page.locator(".select-label").nth(9).click(
         modifiers=["Control", "Shift"], position={"x": 3, "y": 3}
     )
     selected([2])
-    checks.nth(1).click(modifiers=["Control", "Shift"])
+    checks.nth(1).click(modifiers=["Meta", "Shift"])
     selected([])
-    checks.nth(7).click()
-    checks.nth(3).click(modifiers=["Shift"])
-    selected([3, 4, 5, 6, 7])
-    checks.nth(5).click(modifiers=["Control"])
-    selected([6, 7])
-    checks.nth(3).click(modifiers=["Control"])
-    selected([6, 7])
     checks.nth(0).focus()
     checks.nth(0).press("Space")
-    selected([0, 6, 7])
+    selected([0])
     checks.nth(0).press("Space")
-    selected([6, 7])
-
-    page.get_by_role("button", name="Next 1 page", exact=True).click()
-    expect(page.locator("#page-status")).to_have_text("Page 2 of 401")
-    checks.nth(3).click(modifiers=["Control"])
+    selected([])
+    checks.nth(6).click()
+    checks.nth(7).click()
+    top.get_by_role("button", name="Next", exact=True).click()
+    expect(top.get_by_role("spinbutton", name="Page number")).to_have_value("2")
+    expect(checks).to_have_count(40)
+    checks.nth(3).click(modifiers=["Control", "Shift"])
+    selected([], total=2)
+    checks.nth(3).click(modifiers=["Meta", "Shift"])
     selected([], total=2)
     checks.nth(3).click(modifiers=["Shift"])
     selected([3], total=3)
-    checks.nth(1).click(modifiers=["Shift"])
+    checks.nth(3).click(modifiers=["Shift"])
+    selected([3], total=3)
+    checks.nth(1).click()
+    checks.nth(3).click(modifiers=["Shift"])
     selected([1, 2, 3], total=5)
-    page.get_by_role("button", name="Previous 1 page", exact=True).click()
-    expect(page.locator("#page-status")).to_have_text("Page 1 of 401")
+    top.get_by_role("button", name="Previous", exact=True).click()
+    expect(top.get_by_role("spinbutton", name="Page number")).to_have_value("1")
+    expect(checks).to_have_count(40)
     selected([6, 7], total=5)
-    page.locator("#clear-selection").click()
+    screenshot(page, "photo-library-selection")
+    page.get_by_role("button", name="Clear", exact=True).click()
     selected([])
-    expect(page.locator("#download-selected")).to_be_disabled()
+    checks.nth(5).click(modifiers=["Control", "Shift"])
+    selected([])
+    checks.nth(5).click(modifiers=["Meta", "Shift"])
+    selected([])
+    checks.nth(5).click(modifiers=["Shift"])
+    selected([5])
+    checks.nth(5).click(modifiers=["Shift"])
+    selected([5])
+    checks.nth(5).click()
+    selected([])
+    checks.nth(5).click()
+    selected([5])
+    page.get_by_role("combobox", name="Kind", exact=True).select_option("still")
+    expect(page).to_have_url(re.compile("kind=still"))
+    expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
+    checks.nth(5).click(modifiers=["Shift"])
+    selected([5])
+    checks.nth(8).click(modifiers=["Control", "Shift"])
+    selected([5])
+    checks.nth(5).click(modifiers=["Meta", "Shift"])
+    selected([])
+    expect(page.get_by_role("button", name="ZIP", exact=True)).to_be_disabled()
+    page.get_by_role("combobox", name=re.compile("^Per page")).select_option("100")
+    expect(checks).to_have_count(100)
+    checks.first.click()
+    checks.last.click(modifiers=["Shift"])
+    selected(list(range(100)))
+    top.get_by_role("button", name="Next", exact=True).click()
+    expect(checks).to_have_count(21)
+    checks.first.click()
+    selected([], total=100)
+    expect(page.get_by_role("alert")).to_contain_text("Selection limit is 100")
+
+
+def test_library_session_reload_recovery_and_settings(library_page):
+    page = library_page
+    page.reload()
+    expect(page.locator(".media-card")).to_have_count(40)
+    expect(page.get_by_role("button", name="Upload", exact=True)).to_have_count(0)
+    # A failed real library request is recoverable without losing the session.
+    page.route(
+        "**/api/media?*",
+        lambda route: route.fulfill(
+            status=503, json={"error": "Synthetic index unavailable"}
+        ),
+    )
+    page.get_by_role("button", name="Refresh").click()
+    expect(page.get_by_role("alert")).to_contain_text("Synthetic index unavailable")
+    screenshot(page, "photo-library-error")
+    page.unroute("**/api/media?*")
+    page.get_by_role("button", name="Retry", exact=True).click()
+    expect(page.locator(".media-card")).to_have_count(40)
+    page.get_by_role("button", name="Lock", exact=True).click()
+    expect(page.get_by_role("heading", name="Locked")).to_be_visible()
+    page.get_by_label("Password").fill("wrong-password")
+    page.get_by_role("button", name="Sign in").click()
+    expect(page.get_by_role("alert")).to_have_text("Incorrect password.")
+    page.get_by_label("Password").fill("synthetic-password")
+    page.get_by_role("button", name="Sign in").click()
+    expect(page.locator(".media-card")).to_have_count(40)
+
+
+def test_transfer_rsync_and_optional_upload(library_page):
+    page = library_page
+    page.get_by_role("link", name="Transfer", exact=True).click()
+    expect(page.get_by_role("heading", name="Transfer", exact=True)).to_be_visible()
+    expect(page.get_by_role("checkbox")).to_have_count(0)
+    expect(page.get_by_role("button", name="Upload", exact=True)).to_have_count(0)
+    command = page.get_by_label("rsync command").inner_text()
+    assert "--ignore-existing" in command
+    for pattern in ("*.preview.jpg", "*.thumb.jpg", ".*", "*.tmp", "*.pending.*"):
+        assert f"--exclude='{pattern}'" in command
+    assert '"/Volumes/WD APFS/Faros-OTA/boxed/"' in command
+    assert "pi@192.168.1.14:/home/pi/cameradeck/media/" in command
+    assert "\\\n" in command and "\\n" not in command
+    page.reload()
+    expect(page.get_by_role("heading", name="Transfer", exact=True)).to_be_visible()
+    screenshot(page, "transfer-desktop")
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    screenshot(page, "transfer-mobile")
+    page.locator("summary").filter(has_text="S3 upload").click()
+    expect(page.locator(".media-card")).to_have_count(40)
+    expect(page.get_by_role("button", name="Delete", exact=True)).to_have_count(0)
+    checks = page.get_by_role("checkbox")
+    base = page.url.split("/transfer")[0]
+    ids = [
+        item["id"]
+        for item in page.request.get(base + "/api/media?per_page=40").json()["items"][
+            :3
+        ]
+    ]
+    payloads = []
+
+    def upload(route):
+        payloads.append(route.request.post_data_json)
+        route.fulfill(json={"results": [{"id": ids[0], "status": "uploaded"}]})
+
+    page.route("**/api/media/upload", upload)
+    checks.first.click()
+    checks.nth(2).click(modifiers=["Shift"])
+    expect(page.locator(".selection-bar > span")).to_contain_text("3 selected")
+    assert checks.evaluate_all(
+        "inputs => inputs.slice(0, 3).map(input => input.checked)"
+    ) == [True, True, True]
+    screenshot(page, "transfer-s3-mobile", full_page=False)
+    page.get_by_role("button", name="Upload", exact=True).click()
+    expect(page.get_by_label("S3 endpoint")).to_have_value("http://192.168.1.10:3900")
+    page.get_by_label("Bucket", exact=True).fill("test-bucket")
+    page.get_by_label("Prefix", exact=True).fill("photos/")
+    page.get_by_role("button", name="Confirm upload").click()
+    expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text("uploaded")
+    assert payloads == [
+        {
+            "ids": ids,
+            "endpoint": "http://192.168.1.10:3900",
+            "bucket": "test-bucket",
+            "prefix": "photos/",
+        }
+    ]
+    page.keyboard.press("Escape")
+    expect(page.locator(".selection-bar > span")).to_contain_text("2 selected")
+    page.get_by_role("link", name="Library", exact=True).click()
+    expect(page.get_by_role("button", name="Upload", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="ZIP", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Delete", exact=True)).to_be_visible()
+    screenshot(page, "library-without-upload-mobile", full_page=False)
+
+
+def test_camera_preview_and_requested_vs_measured(library_page):
+    page = library_page
+    base = page.url.split("/library")[0]
+    status = page.request.get(base + "/api/status").json()
+    status.update(
+        ready=True,
+        metadata_age=0,
+        metadata={"ExposureTime": 2300, "AnalogueGain": 2},
+        applied={"AeEnable": False, "ExposureTime": 1000, "AnalogueGain": 4},
+        controls={
+            "AeEnable": {
+                "type": "Bool",
+                "min": False,
+                "max": True,
+                "default": True,
+                "size": 0,
+                "options": {},
+            },
+            "ExposureTime": {
+                "type": "Integer32",
+                "min": 100,
+                "max": 10000,
+                "default": 1000,
+                "size": 0,
+                "options": {},
+            },
+            "AnalogueGain": {
+                "type": "Float",
+                "min": 1,
+                "max": 8,
+                "default": 1,
+                "size": 0,
+                "options": {},
+            },
+        },
+    )
+    item = page.request.get(base + "/api/media?per_page=1").json()["items"][0]
+    jpeg = page.request.get(base + f'/media/{item["id"]}/original').body()
+    page.route("**/api/status", lambda route: route.fulfill(json=status))
+    page.route(
+        "**/api/preview*",
+        lambda route: route.fulfill(content_type="image/jpeg", body=jpeg),
+    )
+    # Slow snapshot completion exposes overlapping pollers without a real camera.
+    page.add_init_script("""const originalFetch = window.fetch;
+      window.previewStats = {active: 0, max: 0, calls: 0};
+      window.fetch = async (...args) => {
+        if (!String(args[0]).startsWith('/api/preview')) return originalFetch(...args);
+        const stats = window.previewStats;
+        stats.calls++; stats.active++; stats.max = Math.max(stats.max, stats.active);
+        try { const result = await originalFetch(...args);
+          await new Promise(resolve => setTimeout(resolve, 400)); return result;
+        } finally { stats.active--; }
+      };""")
+    page.goto(base + "/")
+    expect(page.get_by_role("heading", name="Camera", exact=True)).to_have_count(1)
+    # Observe several snapshot intervals; evaluate avoids CSP-blocked predicate eval.
+    page.wait_for_timeout(2500)
+    assert page.evaluate("window.previewStats.calls") >= 3
+    assert page.evaluate("window.previewStats.max") == 1
+    screenshot(page, "photo-camera-desktop")
+    payloads = []
+
+    def start(route):
+        payloads.append(route.request.post_data_json)
+        status["sequence"] = {
+            "active": True,
+            "completed": 25,
+            "total": 0,
+            "rate": 4.9,
+            "skipped": 1,
+            "settings": {"rate": 5},
+        }
+        route.fulfill(json={"ok": True})
+
+    def stop(route):
+        status["sequence"] = None
+        route.fulfill(json={"ok": True})
+
+    page.route("**/api/sequence/start", start)
+    page.route("**/api/sequence/stop", stop)
+    expect(page.get_by_role("spinbutton", name="Photos per second")).to_have_value("5")
+    page.get_by_role("button", name="Start", exact=True).click()
+    expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible()
+    assert payloads == [{"mode": "burst", "settings": {"rate": 5, "count": 0}}]
+    expect(page.locator(".sequence")).to_contain_text("25 photos")
+    screenshot(page, "photo-camera-capturing")
+    page.get_by_role("link", name="Library", exact=True).click()
+    expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Stop", exact=True).click()
+    page.get_by_role("link", name="Camera", exact=True).click()
+    expect(page.get_by_role("button", name="Start", exact=True)).to_be_enabled()
+    page.get_by_role("button", name="Settings", exact=True).click()
+    expect(page.get_by_label("Requested exposure · µs")).to_have_value("1000")
+    expect(page.get_by_label("Requested gain · ×")).to_have_value("4")
+    expect(page.locator(".measured")).to_have_text(
+        "Measured exposure: 2300 µs · 2× gain"
+    )
+    screenshot(page, "photo-camera-settings")
+    status["metadata_age"] = 10
+    expect(page.locator(".measured")).to_contain_text("Unavailable / stale")
+    page.keyboard.press("Escape")
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    screenshot(page, "photo-camera-mobile")

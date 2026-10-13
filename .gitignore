@@ -6,3 +6,5 @@ media/
 *.log
 test-results/
 .amp/portals/*
+frontend/node_modules/
+frontend/*.tsbuildinfo

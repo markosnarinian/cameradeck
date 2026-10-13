@@ -4,11 +4,9 @@ import argparse
 import hmac
 import json
 import logging
-import math
 import os
 import re
 import secrets
-import shutil
 import signal
 import tempfile
 import threading
@@ -20,12 +18,20 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, abort, jsonify, request, send_file, session
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    request,
+    send_file,
+    send_from_directory,
+    session,
+)
 from camera import CameraDeck
+from catalog import ID, MediaCatalog
 from power import PowerManager
 
-ID = re.compile(r"^\d{8}_\d{6}_[a-f0-9]{8}$")
-EXPERIMENT_ID = re.compile(r"^[a-f0-9]{32}$")
 BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 MAX_BATCH = 100
 
@@ -65,22 +71,43 @@ def create_app(
     power_manager=None,
     s3_endpoint="http://192.168.1.10:3900",
 ):
-    app = Flask(__name__, static_folder="static", static_url_path="/static")
-    app.secret_key = secrets.token_hex(32)
+    app = Flask(__name__, static_folder=None)
+    frontend = Path(__file__).parent / "static" / "dist"
+    key_path = deck.root / ".session-key"
+    try:
+        with open(
+            key_path, "x", opener=lambda path, flags: os.open(path, flags, 0o600)
+        ) as key:
+            key.write(secrets.token_hex(32))
+    except FileExistsError:
+        pass
+    app.secret_key = key_path.read_text().strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", app.secret_key):
+        raise RuntimeError(
+            "Invalid .session-key. Remove it while the service is stopped to regenerate it."
+        )
+    authentication = hmac.new(
+        app.secret_key.encode(), password.encode(), "sha256"
+    ).hexdigest()
     app.config.update(
         MAX_CONTENT_LENGTH=16384,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
+        PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+        SESSION_REFRESH_EACH_REQUEST=False,
     )
     attempts = {}
     attempts_lock = threading.Lock()
     viewers = threading.BoundedSemaphore(4)
-    library_lock = threading.Lock()
-    library_cache = {}
-    library_files = set()
-    library_mtime = None
+    catalog = MediaCatalog(deck.root)
+    app.extensions["catalog"] = catalog
+    deck.media_published = catalog.publish
+    catalog.start()
     power_manager = power_manager or PowerManager()
     configured_endpoint = normalize_endpoint(s3_endpoint)
+
+    def authenticated():
+        return not password or session.get("authenticated") == authentication
 
     @app.before_request
     def protect():
@@ -102,10 +129,17 @@ def create_app(
             ):
                 raise ValueError("Supply a JSON object.")
         if (
-            password
-            and not session.get("authenticated")
+            not authenticated()
             and request.path
-            not in {"/", "/api/login", "/static/style.css", "/static/app.js"}
+            not in {
+                "/",
+                "/library",
+                "/transfer",
+                "/api/login",
+                "/api/session",
+                "/favicon.ico",
+            }
+            and not request.path.startswith("/assets/")
         ):
             return jsonify(error="Unlock CameraDeck to continue."), 401
 
@@ -115,7 +149,7 @@ def create_app(
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
+            "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'"
         )
         if request.path.startswith("/api"):
             response.headers["Cache-Control"] = "no-store"
@@ -135,8 +169,23 @@ def create_app(
         return jsonify(error=str(exc)), 500
 
     @app.get("/")
+    @app.get("/library")
+    @app.get("/transfer")
     def index():
-        return app.send_static_file("index.html")
+        return send_from_directory(frontend, "index.html", max_age=0)
+
+    @app.get("/assets/<path:name>")
+    def asset(name):
+        return send_from_directory(frontend / "assets", name, max_age=31536000)
+
+    @app.get("/api/session")
+    def session_status():
+        return jsonify(authenticated=authenticated(), required=bool(password))
+
+    @app.post("/api/logout")
+    def logout():
+        session.clear()
+        return jsonify(ok=True)
 
     @app.get("/favicon.ico")
     def favicon():
@@ -160,7 +209,9 @@ def create_app(
                 attempts.setdefault(address, []).append(now)
                 return jsonify(error="Incorrect password."), 401
             attempts.pop(address, None)
-        session["authenticated"] = True
+        session.clear()
+        session.permanent = True
+        session["authenticated"] = authentication
         return jsonify(ok=True)
 
     @app.get("/api/status")
@@ -208,25 +259,9 @@ def create_app(
         deck.set_controls(request.get_json())
         return jsonify(ok=True)
 
-    @app.post("/api/focus")
-    def focus():
-        enabled = request.get_json().get("enabled")
-        if type(enabled) is not bool:
-            raise ValueError("enabled must be true or false.")
-        deck.focus_enabled = enabled
-        return jsonify(ok=True)
-
     @app.post("/api/capture")
     def capture():
         return jsonify(deck.capture())
-
-    @app.post("/api/record/start")
-    def record_start():
-        return jsonify(deck.start_recording())
-
-    @app.post("/api/record/stop")
-    def record_stop():
-        return jsonify(deck.stop_recording())
 
     @app.post("/api/sequence/start")
     def sequence_start():
@@ -236,6 +271,21 @@ def create_app(
     @app.post("/api/sequence/stop")
     def sequence_stop():
         return jsonify(deck.stop_sequence())
+
+    @app.get("/api/preview")
+    def preview():
+        with deck.frames.condition:
+            frame, updated = deck.frames.frame, deck.frames.updated
+        if not frame or not updated or time.monotonic() - updated > 3:
+            return (
+                jsonify(
+                    error="No fresh preview frame. Check the camera and exposure settings."
+                ),
+                503,
+            )
+        return Response(
+            frame, mimetype="image/jpeg", headers={"Cache-Control": "no-store"}
+        )
 
     @app.get("/stream.mjpg")
     def stream():
@@ -257,8 +307,13 @@ def create_app(
                         timeout=10,
                     )
                     if not ready:
-                        continue
+                        return
                     sequence, frame = deck.frames.sequence, deck.frames.frame
+                    if (
+                        not deck.frames.updated
+                        or time.monotonic() - deck.frames.updated > 3
+                    ):
+                        return
                 if frame:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(
                         len(frame)
@@ -316,33 +371,6 @@ def create_app(
             raise ValueError(f"{name} must be a positive integer.")
         return min(value, maximum) if maximum else value
 
-    def library_items():
-        nonlocal library_files, library_mtime
-        current_mtime = deck.root.stat().st_mtime_ns
-        with library_lock:
-            if current_mtime != library_mtime:
-                paths = {
-                    path.name: path
-                    for path in deck.root.glob("*.json")
-                    if ID.fullmatch(path.stem)
-                }
-                for name in library_files - paths.keys():
-                    library_cache.pop(name, None)
-                for name in paths.keys() - library_files:
-                    try:
-                        entry = json.loads(paths[name].read_text())
-                        if entry.get("id") != paths[name].stem:
-                            continue
-                        library_cache[name] = entry
-                    except (OSError, ValueError, AttributeError):
-                        continue
-                library_files = set(paths)
-                # If a capture completed during the scan, retain the earlier value so
-                # the next request scans again instead of overlooking its sidecar.
-                after_scan = deck.root.stat().st_mtime_ns
-                library_mtime = current_mtime if after_scan == current_mtime else None
-            return [library_cache[name] for name in sorted(library_cache, reverse=True)]
-
     @app.get("/api/media")
     def library():
         kind = request.args.get("kind", "all")
@@ -350,23 +378,7 @@ def create_app(
             raise ValueError("kind must be all, still, or video.")
         page = positive_integer("page", 1)
         per_page = positive_integer("per_page", 40, 100)
-        items = [
-            entry
-            for entry in library_items()
-            if kind == "all" or entry.get("kind") == kind
-        ]
-        total = len(items)
-        pages = math.ceil(total / per_page)
-        if pages:
-            page = min(page, pages)
-        start = (page - 1) * per_page
-        return jsonify(
-            items=items[start : start + per_page],
-            page=page,
-            per_page=per_page,
-            pages=pages,
-            total=total,
-        )
+        return jsonify(catalog.page(kind, page, per_page))
 
     @app.get("/api/media/<ident>")
     def detail(ident):
@@ -399,7 +411,7 @@ def create_app(
 
     @app.delete("/api/media/<ident>")
     def delete(ident):
-        with deck.lock:
+        with deck.lock, catalog.lock:
             entry = item(ident)
             media_path(entry)
             for name in [
@@ -409,6 +421,7 @@ def create_app(
                 ident + ".json",
             ]:
                 (deck.root / name).unlink(missing_ok=True)
+            catalog.remove(ident)
         return jsonify(ok=True)
 
     @app.post("/api/media/delete")
@@ -426,7 +439,7 @@ def create_app(
                     missing.append(ident)
                 else:
                     raise
-        with deck.lock:
+        with deck.lock, catalog.lock:
             for ident, entry, original in entries:
                 for name in [
                     original.name,
@@ -435,6 +448,7 @@ def create_app(
                     ident + ".json",
                 ]:
                     (deck.root / name).unlink(missing_ok=True)
+                catalog.remove(ident)
         return jsonify(deleted=[ident for ident, _, _ in entries], missing=missing)
 
     @app.post("/api/media/download")
@@ -445,7 +459,7 @@ def create_app(
         temporary.close()
         try:
             with zipfile.ZipFile(
-                temporary.name, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
+                temporary.name, "w", compression=zipfile.ZIP_STORED, allowZip64=True
             ) as archive:
                 for ident, entry in entries:
                     original = media_path(entry)
@@ -463,95 +477,6 @@ def create_app(
         except Exception:
             Path(temporary.name).unlink(missing_ok=True)
             raise
-
-    def experiment(ident):
-        if not EXPERIMENT_ID.fullmatch(ident):
-            abort(404)
-        directory = (deck.root / "experiments" / ident).resolve()
-        experiments = (deck.root / "experiments").resolve()
-        manifest_path = directory / "manifest.json"
-        if directory.parent != experiments or not manifest_path.is_file():
-            abort(404)
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, ValueError):
-            abort(404)
-        if manifest.get("id") != ident:
-            abort(404)
-        return directory, manifest
-
-    @app.get("/api/experiments")
-    def experiments():
-        items = []
-        root = deck.root / "experiments"
-        for path in sorted(root.glob("*/manifest.json"), reverse=True):
-            try:
-                manifest = json.loads(path.read_text())
-                ident = manifest["id"]
-                if path.parent.name != ident or not EXPERIMENT_ID.fullmatch(ident):
-                    continue
-                size = sum(
-                    p.stat().st_size for p in path.parent.rglob("*") if p.is_file()
-                )
-                items.append(
-                    {
-                        key: manifest.get(key)
-                        for key in ("id", "created", "finished", "state", "settings")
-                    }
-                    | {
-                        "blocks": len(manifest.get("blocks", [])),
-                        "completed_slots": manifest.get("completed_slots", 0),
-                        "bytes": size,
-                    }
-                )
-            except (OSError, ValueError, KeyError):
-                continue
-        # Directory names are random, so order newest first by creation time.
-        items.sort(key=lambda entry: str(entry["created"] or ""), reverse=True)
-        return jsonify(items=items)
-
-    @app.get("/api/experiments/<ident>/manifest")
-    def experiment_manifest(ident):
-        return jsonify(experiment(ident)[1])
-
-    @app.get("/api/experiments/<ident>/download")
-    def download_experiment(ident):
-        directory, manifest = experiment(ident)
-        if manifest.get("state") == "active":
-            raise ValueError("Stop the experiment before downloading it.")
-        temporary = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
-        temporary.close()
-        try:
-            with zipfile.ZipFile(
-                temporary.name, "w", compression=zipfile.ZIP_STORED, allowZip64=True
-            ) as archive:
-                for path in directory.rglob("*"):
-                    if path.is_file():
-                        archive.write(path, f"{ident}/{path.relative_to(directory)}")
-            response = send_file(
-                temporary.name,
-                mimetype="application/zip",
-                as_attachment=True,
-                download_name=f"cameradeck-road-{ident}.zip",
-                max_age=0,
-            )
-            response.call_on_close(lambda: Path(temporary.name).unlink(missing_ok=True))
-            return response
-        except Exception:
-            Path(temporary.name).unlink(missing_ok=True)
-            raise
-
-    @app.delete("/api/experiments/<ident>")
-    def delete_experiment(ident):
-        directory, manifest = experiment(ident)
-        if manifest.get("state") == "active" or (
-            deck.sequence
-            and deck.sequence.get("active")
-            and deck.sequence.get("experiment_id") == ident
-        ):
-            raise ValueError("Stop the experiment before deleting it.")
-        shutil.rmtree(directory)
-        return jsonify(ok=True)
 
     @app.get("/api/settings")
     def settings():
@@ -603,11 +528,9 @@ def create_app(
         confirmation = data.get("confirm")
         if not isinstance(confirmation, str) or confirmation.casefold() != action:
             raise ValueError(f"Type {action.upper()} to confirm.")
-        if deck.recording or (deck.sequence and deck.sequence["active"]):
+        if deck.sequence and deck.sequence["active"]:
             return (
-                jsonify(
-                    error="Stop recording or the capture sequence before changing Pi power."
-                ),
+                jsonify(error="Stop the capture sequence before changing Pi power."),
                 409,
             )
         try:
@@ -632,6 +555,13 @@ def main():
         parser.error("Network access requires CAMERADECK_PASSWORD to be set.")
     logging.basicConfig(level=logging.INFO)
     deck = CameraDeck(args.media)
+    app = create_app(
+        deck,
+        password,
+        s3_endpoint=os.environ.get(
+            "CAMERADECK_S3_ENDPOINT", "http://192.168.1.10:3900"
+        ),
+    )
     deck.start()
 
     def stop(*_):
@@ -641,39 +571,18 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    # Monitor independently of clients: stop before exhausting storage, even if a phone disconnects.
-    def watchdog():
-        while not deck.shutdown.wait(2):
-            low_space = deck.status()["free_bytes"] < 256 * 1024 * 1024
-            if deck.recording and (low_space or deck.output_error):
-                try:
-                    deck.stop_recording()
-                    deck.error = "Recording stopped: " + (
-                        "storage is nearly full."
-                        if low_space
-                        else str(deck.output_error)
-                    )
-                except Exception:
-                    logging.exception("Could not finalize recording")
-
-    threading.Thread(target=watchdog, daemon=True).start()
     from waitress import serve
 
     try:
         serve(
-            create_app(
-                deck,
-                password,
-                s3_endpoint=os.environ.get(
-                    "CAMERADECK_S3_ENDPOINT", "http://192.168.1.10:3900"
-                ),
-            ),
+            app,
             host=args.host,
             port=args.port,
             threads=12,
         )
     finally:
         deck.close()
+        app.extensions["catalog"].close()
 
 
 if __name__ == "__main__":

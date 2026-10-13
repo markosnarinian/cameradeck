@@ -1,10 +1,9 @@
-"""Single-owner Picamera2 service. Camera operations are serialized, frames are shared."""
+"""Single-owner, continuous full-sensor photo pipeline with a shared JPEG preview."""
 
 import io
 import json
 import math
 import queue
-import random
 import shutil
 import threading
 import time
@@ -12,7 +11,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-import numpy as np
 from PIL import Image
 
 
@@ -26,19 +24,6 @@ def plain(value):
     return str(value)
 
 
-def focus_grid(image):
-    """3x3 variance-of-Laplacian on a normalized 480px luminance image."""
-    image = image.convert("L")
-    image.thumbnail((480, 360))
-    a = np.asarray(image, dtype=np.float32)
-    lap = a[1:-1, :-2] + a[1:-1, 2:] + a[:-2, 1:-1] + a[2:, 1:-1] - 4 * a[1:-1, 1:-1]
-    return [
-        round(float(cell.var()), 1)
-        for row in np.array_split(lap, 3)
-        for cell in np.array_split(row, 3, axis=1)
-    ]
-
-
 class Frames(io.BufferedIOBase):
     def __init__(self):
         super().__init__()
@@ -46,6 +31,12 @@ class Frames(io.BufferedIOBase):
         self.frame = None
         self.sequence = 0
         self.updated = 0
+
+    def reset(self):
+        with self.condition:
+            self.frame = None
+            self.updated = 0
+            self.condition.notify_all()
 
     def write(self, data):
         with self.condition:
@@ -57,9 +48,8 @@ class Frames(io.BufferedIOBase):
 
 
 def yuv420_planes(array, width, height):
-    """Split Picamera2's YUV420 array (height × 1.5 rows of stride bytes) into Y, U, V views."""
+    """Split stride-padded Picamera2 YUV420 into Y, U and V views."""
     y = array[:height, :width]
-    # Chroma rows are half a stride wide, so view the buffer as rows of half the stride.
     halves = array.reshape(array.shape[0] * 2, array.shape[1] // 2)
     u = halves[2 * height : 2 * height + height // 2, : width // 2]
     v = halves[2 * height + height // 2 : 3 * height, : width // 2]
@@ -67,20 +57,15 @@ def yuv420_planes(array, width, height):
 
 
 def fitted(size, box):
-    """Size of an image scaled to fit inside box, as Image.thumbnail would produce."""
     scale = min(box[0] / size[0], box[1] / size[1], 1)
     return max(1, round(size[0] * scale)), max(1, round(size[1] * scale))
 
 
 class BurstSampler:
-    """Selects frames at a target rate inside the camera callback without ever blocking it.
-
-    A selected request waits in a one-slot mailbox. If the encoders have not emptied it by
-    the next due frame, that frame is skipped and counted rather than stalling the camera.
-    """
+    """Nonblocking rate selection; one queued request, with explicit skipped frames."""
 
     def __init__(self, rate, count=0):
-        self.period = 1e9 / rate  # SensorTimestamp is in nanoseconds.
+        self.period = 1e9 / rate
         self.remaining = count or None
         self.mailbox = queue.Queue(maxsize=1)
         self.lock = threading.Lock()
@@ -104,7 +89,7 @@ class BurstSampler:
             captured = datetime.now(timezone.utc)
             try:
                 self.mailbox.put_nowait(
-                    (request, metadata, self.selected + 1, captured)
+                    (request, plain(metadata), self.selected + 1, captured)
                 )
             except queue.Full:
                 request.release()
@@ -113,8 +98,6 @@ class BurstSampler:
             self.selected += 1
             if self.remaining:
                 self.remaining -= 1
-            # Stay on the rate grid after a short delay so the average rate holds; after a
-            # longer stall, restart the grid instead of catching up with back-to-back frames.
             late = self.due is None or timestamp - self.due >= self.period
             self.due = (timestamp if late else self.due) + self.period
 
@@ -123,7 +106,6 @@ class BurstSampler:
             self.closed = True
 
     def drain(self):
-        """Release requests nobody will encode, so the camera gets its buffers back."""
         while True:
             try:
                 request = self.mailbox.get_nowait()[0]
@@ -133,77 +115,52 @@ class BurstSampler:
 
 
 class CameraDeck:
-    def __init__(self, root):
+    def __init__(self, root, media_published=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.media_published = media_published
         self.lock = threading.RLock()
         self.frames = Frames()
         self.camera = None
-        self.recording = None
         self.metadata = {}
-        self.focus = []
-        self.focus_enabled = False
+        self.metadata_updated = 0
         self.error = None
         self.applied = {}
         self.shutdown = threading.Event()
         self.preview = None
         self.cameras = []
         self.index = 0
-        self.profile = "1080p"
+        self.profile = "full sensor"
         self.fps = 30
         self._rotation_path = self.root / ".rotation"
-        self.rotation = self._load_rotation()
+        try:
+            self.rotation = int(self._rotation_path.read_text().strip())
+        except (OSError, ValueError):
+            self.rotation = 0
+        if self.rotation not in {0, 180}:
+            self.rotation = 0
         self.schema = {}
         self.modes = []
         self.properties = {}
-        self.output_error = None
         self.sequence = None
         self.sequence_stop = threading.Event()
         self.sequence_worker = None
+        self.recovery_worker = None
         self.sequence_settings = {
-            "stills": {"interval": 1, "count": 0, "controls": {}},
             "burst": {
-                "rate": 4,
+                "rate": 5,
                 "count": 0,
                 "quality": 90,
                 "threads": 3,
                 "controls": {},
-            },
-            "test": {
-                "shutters": [1000, 2000, 4000, 8000],
-                "gains": [2, 4, 8],
-                "settle": 2,
-                "samples": 3,
-            },
-            "road": {
-                "reference_shutter_us": 4000,
-                "reference_gain": 2,
-                "comparison_shutter_us": 2000,
-                "blocks": 8,
-                "roi": [0.15, 0.45, 0.7, 0.45],
-                "seed": None,
-            },
+            }
         }
-        self.road_condition = threading.Condition()
-        self.road_armed = False
-        self.road_request = None
-        self.road_drops = 0
         self.burst = None
         self._offset_path = self.root / ".time_offset"
-        self.time_offset = self._load_offset()
-
-    def _load_rotation(self):
         try:
-            rotation = int(self._rotation_path.read_text().strip())
-            return rotation if rotation in {0, 180} else 0
+            self.time_offset = float(self._offset_path.read_text().strip())
         except (OSError, ValueError):
-            return 0
-
-    def _load_offset(self):
-        try:
-            return float(self._offset_path.read_text().strip())
-        except (OSError, ValueError):
-            return 0.0
+            self.time_offset = 0.0
 
     def save_offset(self, seconds):
         self.time_offset = float(seconds)
@@ -221,55 +178,63 @@ class CameraDeck:
             self.open(self.cameras[0]["Num"], self.profile, self.fps)
         except Exception as exc:
             self.error = str(exc)
-        self.recover_recordings()
-        self.recover_experiments()
-        self.worker = threading.Thread(target=self._analyze, daemon=True)
-        self.worker.start()
+        if self.recovery_worker is None:
+            self.recovery_worker = threading.Thread(
+                target=self.recover_recordings, daemon=True
+            )
+            self.recovery_worker.start()
+
+    def _burst_fps(self):
+        if not self.modes:
+            return None
+        area = max(m["size"][0] * m["size"][1] for m in self.modes)
+        return max(m["fps"] for m in self.modes if m["size"][0] * m["size"][1] == area)
 
     def open(self, index, profile, fps, rotation=None):
         with self.lock:
             self._sequence_guard()
-            if self.recording:
-                raise ValueError(
-                    "Stop recording before changing camera or video settings."
-                )
-            if rotation is None:
-                rotation = self.rotation
-            from libcamera import Transform, controls
+            from libcamera import ColorSpace, Transform, controls
             from picamera2 import Picamera2
             from picamera2.encoders import JpegEncoder
             from picamera2.outputs import FileOutput
 
-            if profile not in {"720p", "1080p"} or not 1 <= fps <= 30:
-                raise ValueError("Choose 720p or 1080p and 1–30 fps.")
+            # Legacy preview labels remain accepted, but never crop the photo stream.
+            if profile not in {"full sensor", "720p", "1080p"}:
+                raise ValueError("Choose full sensor.")
+            if (
+                type(fps) not in (int, float)
+                or not math.isfinite(fps)
+                or not 1 <= fps <= 30
+            ):
+                raise ValueError("Choose 1–30 fps.")
+            rotation = self.rotation if rotation is None else rotation
             if rotation not in {0, 180}:
                 raise ValueError("Supported mounting rotations are 0° and 180°.")
             self.cameras = plain(Picamera2.global_camera_info())
             if not any(c["Num"] == index for c in self.cameras):
                 raise ValueError("Camera is not available.")
+            previous_controls = dict(self.applied) if index == self.index else {}
             if self.camera:
                 self.camera.stop_encoder()
                 self.camera.stop()
                 self.camera.close()
                 self.camera = None
+            self.frames.reset()
+            self.metadata, self.metadata_updated = {}, 0
             self.schema = {}
             try:
                 p = self.camera = Picamera2(index)
                 self.modes = plain(p.sensor_modes)
                 self.properties = plain(p.camera_properties)
-                width, height = (1280, 720) if profile == "720p" else (1920, 1080)
-                capable = [
-                    m
-                    for m in self.modes
-                    if m["size"][0] >= width and m["size"][1] >= height
-                ]
-                maximum = max(m["fps"] for m in (capable or self.modes))
-                fps = min(fps, maximum)
+                maximum = self._burst_fps()
+                if maximum is not None:
+                    fps = min(fps, maximum)
                 config = p.create_video_configuration(
-                    main={"size": (width, height), "format": "YUV420"},
+                    main={"size": p.sensor_resolution, "format": "YUV420"},
                     lores={"size": (640, 360), "format": "YUV420"},
                     controls={"FrameRate": fps},
                     transform=Transform(hflip=rotation == 180, vflip=rotation == 180),
+                    colour_space=ColorSpace.Sycc(),
                     buffer_count=6,
                 )
                 p.configure(config)
@@ -296,33 +261,38 @@ class CameraDeck:
                 self.applied = {}
                 self._apply_motion_defaults()
                 if "AfMode" in self.schema:
-                    p.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-                    self.applied["AfMode"] = int(controls.AfModeEnum.Continuous)
+                    self.set_controls({"AfMode": int(controls.AfModeEnum.Continuous)})
+                if previous_controls:
+                    self.set_controls(previous_controls)
+                self.index, self.profile, self.fps, self.rotation = (
+                    index,
+                    "full sensor",
+                    fps,
+                    rotation,
+                )
                 p.post_callback = self._metadata
                 p.start()
                 p.start_encoder(self.preview, name="lores")
-                # Replace atomically so an interrupted write leaves the last saved orientation.
                 temporary = self._rotation_path.with_suffix(".tmp")
                 temporary.write_text(str(rotation))
                 temporary.replace(self._rotation_path)
-                self.index, self.profile, self.fps = index, profile, fps
-                self.rotation = rotation
                 self.error = None
             except Exception as exc:
                 self.error = str(exc)
                 if self.camera:
                     self.camera.close()
                     self.camera = None
+                self.frames.reset()
+                self.metadata, self.metadata_updated = {}, 0
                 raise
 
     def _apply_motion_defaults(self):
-        """Prefer short AE exposures without fixing brightness as daylight changes."""
         values = {
             name: True for name in ("AeEnable", "AwbEnable") if name in self.schema
         }
         for name in ("ExposureTimeMode", "AnalogueGainMode"):
             if name in self.schema:
-                values[name] = 0  # libcamera Auto; do not pin either shutter or gain.
+                values[name] = self.schema[name]["options"].get("Auto", 0)
         spec = self.schema.get("AeExposureMode")
         if spec:
             for label in ("Short", "ExposureShort"):
@@ -334,47 +304,16 @@ class CameraDeck:
             self.set_controls(values)
 
     def _metadata(self, request):
-        self.metadata = plain(request.get_metadata())
+        metadata = plain(request.get_metadata())
+        self.metadata = metadata
+        self.metadata_updated = time.monotonic()
         burst = self.burst
         if burst is not None:
-            burst.offer(request, self.metadata)
-        with self.road_condition:
-            if not self.road_armed:
-                return
-            request.acquire()
-            previous = self.road_request
-            self.road_request = request
-            if previous is not None:
-                self.road_drops += 1
-            self.road_condition.notify_all()
-        if previous is not None:
-            previous.release()
-
-    def _analyze(self):
-        while not self.shutdown.wait(0.5):
-            if not self.focus_enabled or not self.frames.frame:
-                continue
-            try:
-                with Image.open(io.BytesIO(self.frames.frame)) as image:
-                    scores = focus_grid(image)
-                self.focus = scores
-            except (ValueError, OSError):
-                continue
+            burst.offer(request, metadata)
 
     def require_camera(self):
-        if self.camera is None:
+        if self.camera is None or self.shutdown.is_set():
             raise ValueError(self.error or "Camera is not ready.")
-
-    def set_controls(self, values):
-        with self.lock:
-            self._sequence_guard()
-            self.require_camera()
-            checked = validate_controls(values, self.schema)
-            self.camera.set_controls(checked)
-            # AfTrigger is a one-shot action; re-sending it would restart AF on every capture.
-            self.applied.update(
-                plain({k: v for k, v in checked.items() if k != "AfTrigger"})
-            )
 
     def _sequence_guard(self):
         if (
@@ -384,38 +323,44 @@ class CameraDeck:
         ):
             raise ValueError("Stop the capture sequence before changing the camera.")
 
-    def _manual_exposure(self, shutter, gain):
-        values = {"ExposureTime": shutter, "AnalogueGain": gain}
-        for name in ("ExposureTimeMode", "AnalogueGainMode"):
-            if name in self.schema:
-                values[name] = self.schema[name]["options"].get("Manual", 1)
-            elif "AeEnable" in self.schema:
-                values["AeEnable"] = False
-            else:
-                raise ValueError(
-                    "This camera does not advertise manual exposure control."
-                )
-        return validate_controls(values, self.schema)
+    def set_controls(self, values):
+        with self.lock:
+            self._sequence_guard()
+            self.require_camera()
+            checked = validate_controls(values, self.schema)
+            self.camera.set_controls(checked)
+            self.applied.update(
+                plain({k: v for k, v in checked.items() if k != "AfTrigger"})
+            )
+            # Requested manual numbers are not the actual readings once auto is enabled.
+            for mode, field in (
+                ("ExposureTimeMode", "ExposureTime"),
+                ("AnalogueGainMode", "AnalogueGain"),
+            ):
+                auto = self.schema.get(mode, {}).get("options", {}).get("Auto", 0)
+                if self.applied.get(mode) == auto or (
+                    mode not in self.schema and self.applied.get("AeEnable") is True
+                ):
+                    self.applied.pop(field, None)
+            if self.applied.get("AwbEnable") is True:
+                self.applied.pop("ColourGains", None)
 
     def start_sequence(self, mode, settings):
         with self.lock:
             self._sequence_guard()
             self.require_camera()
-            if self.recording:
-                raise ValueError("Stop recording before starting a capture sequence.")
-            if (
-                not isinstance(mode, str)
-                or mode not in self.sequence_settings
-                or not isinstance(settings, dict)
-            ):
-                raise ValueError(
-                    "Choose stills, burst, test, or road with a settings object."
-                )
-            if set(settings) - set(self.sequence_settings[mode]):
+            if mode != "burst" or not isinstance(settings, dict):
+                raise ValueError("Choose burst with a settings object.")
+            if set(settings) - set(self.sequence_settings["burst"]):
                 raise ValueError("Unknown sequence setting.")
-            settings = {**self.sequence_settings[mode], **settings}
-
-            def number(name, low, high, integer=False):
+            settings = {**self.sequence_settings["burst"], **settings}
+            ceiling = min(30, self.fps, self._burst_fps() or 30)
+            for name, low, high, integer in (
+                ("rate", 1 / 86400, ceiling, False),
+                ("count", 0, 100000, True),
+                ("quality", 1, 100, True),
+                ("threads", 1, 4, True),
+            ):
                 value = settings[name]
                 if (
                     type(value) not in (int, float)
@@ -426,517 +371,94 @@ class CameraDeck:
                     raise ValueError(
                         f"{name} must be {'an integer' if integer else 'a number'} between {low} and {high}."
                     )
-
-            if mode == "stills":
-                number("interval", 1, 86400)
-                number("count", 0, 10000, True)
-                values = settings["controls"]
-                if not isinstance(values, dict):
-                    raise ValueError("Still controls must be a JSON object.")
-                plan = [validate_controls(values, self.schema) if values else {}]
-                total = settings["count"]
-            elif mode == "burst":
-                number("rate", 1 / 86400, 30)
-                number("count", 0, 100000, True)
-                number("quality", 1, 100, True)
-                number("threads", 1, 4, True)
-                values = settings["controls"]
-                if not isinstance(values, dict):
-                    raise ValueError("Burst controls must be a JSON object.")
-                plan = {
-                    "controls": validate_controls(values, self.schema) if values else {}
-                }
-                total = settings["count"]
-            elif mode == "test":
-                number("settle", 0.5, 30)
-                number("samples", 1, 5, True)
-                for name in ("shutters", "gains"):
-                    values = settings[name]
-                    if (
-                        not isinstance(values, list)
-                        or not 1 <= len(values) <= 8
-                        or any(
-                            type(v) not in (int, float)
-                            or not math.isfinite(v)
-                            or v <= 0
-                            for v in values
-                        )
-                    ):
-                        raise ValueError(f"{name}: supply 1–8 positive numbers.")
-                plan = [
-                    self._manual_exposure(s, g)
-                    for s in settings["shutters"]
-                    for g in settings["gains"]
-                ]
-                total = len(plan) * settings["samples"]
-            else:
-                if self.fps < 10:
-                    raise ValueError(
-                        "Road experiments require a video rate of at least 10 fps."
-                    )
-                for name in (
-                    "reference_shutter_us",
-                    "reference_gain",
-                    "comparison_shutter_us",
+            values = settings["controls"]
+            if not isinstance(values, dict):
+                raise ValueError("Burst controls must be a JSON object.")
+            checked = validate_controls(values, self.schema) if values else {}
+            # Changing cadence behind the sampler would make its requested rate misleading.
+            if set(checked) & {"FrameRate", "FrameDurationLimits"}:
+                raise ValueError("Set stream fps before starting a burst.")
+            saved = dict(self.applied)
+            # Resolve restoration before applying any temporary overrides.
+            restore = {
+                k: saved.get(k, self.schema[k]["default"])
+                for k in checked
+                if k != "AfTrigger"
+            }
+            restore.update(saved)
+            for auto_mode, field in (
+                ("ExposureTimeMode", "ExposureTime"),
+                ("AnalogueGainMode", "AnalogueGain"),
+            ):
+                auto = self.schema.get(auto_mode, {}).get("options", {}).get("Auto", 0)
+                if saved.get(auto_mode) == auto or (
+                    auto_mode not in self.schema and saved.get("AeEnable") is True
                 ):
-                    number(name, 0.01, 1_000_000)
-                number("blocks", 4, 12, True)
-                if settings["blocks"] % 2:
-                    raise ValueError("blocks must be an even number between 4 and 12.")
-                roi = settings["roi"]
-                if (
-                    not isinstance(roi, list)
-                    or len(roi) != 4
-                    or any(
-                        type(v) not in (int, float) or not math.isfinite(v) for v in roi
-                    )
-                    or roi[0] < 0
-                    or roi[1] < 0
-                    or roi[2] <= 0
-                    or roi[3] <= 0
-                    # Same rounding tolerance as the browser and quality._roi_box.
-                    or roi[0] + roi[2] > 1.000001
-                    or roi[1] + roi[3] > 1.000001
-                ):
-                    raise ValueError("roi must be normalized [x, y, width, height].")
-                seed = settings["seed"]
-                if seed is None:
-                    seed = int.from_bytes(uuid4().bytes[:4], "big")
-                if type(seed) is not int or not 0 <= seed <= 0xFFFFFFFF:
-                    raise ValueError("seed must be an integer from 0 to 4294967295.")
-                settings["seed"] = seed
-                product = settings["reference_shutter_us"] * settings["reference_gain"]
-                comparison_gain = product / settings["comparison_shutter_us"]
-                if (
-                    comparison_gain == settings["reference_gain"]
-                    and settings["comparison_shutter_us"]
-                    == settings["reference_shutter_us"]
-                ):
-                    raise ValueError(
-                        "Road experiment arms must use different settings."
-                    )
-                frame_budget = 1_000_000 / self.fps
-                if (
-                    max(
-                        settings["reference_shutter_us"],
-                        settings["comparison_shutter_us"],
-                    )
-                    > frame_budget
-                ):
-                    raise ValueError(
-                        f"Shutter must not exceed the {frame_budget:.0f} µs frame period."
-                    )
-                arms = {
-                    "A": self._manual_exposure(
-                        settings["reference_shutter_us"], settings["reference_gain"]
-                    ),
-                    "B": self._manual_exposure(
-                        settings["comparison_shutter_us"], comparison_gain
-                    ),
-                }
-                orders = ["ABBA"] * (settings["blocks"] // 2) + ["BAAB"] * (
-                    settings["blocks"] // 2
-                )
-                random.Random(seed).shuffle(orders)
-                plan = {"arms": arms, "orders": orders}
-                total = settings["blocks"] * 4
+                    restore.pop(field, None)
+            if saved.get("AwbEnable") is True:
+                restore.pop("ColourGains", None)
+            if restore:
+                try:
+                    validate_controls(restore, self.schema)
+                except ValueError as exc:
+                    raise ValueError(f"Cannot restore burst controls: {exc}") from exc
             self._space()
-            self.sequence_settings[mode] = plain(settings)
-            if mode == "road":
-                # Draw a fresh seed next time; this run keeps its own in run settings.
-                self.sequence_settings[mode]["seed"] = None
+            self.sequence_settings["burst"] = plain(settings)
             self.sequence_stop.clear()
             self.sequence = dict(
                 id=uuid4().hex,
-                mode=mode,
+                mode="burst",
                 active=True,
                 completed=0,
-                total=total,
-                current={},
+                total=settings["count"],
+                current=plain(checked),
                 results=[],
                 error=None,
                 settings=plain(settings),
-                # Created up front: status() serializes this dict while workers update it.
-                **(dict(rate=None, skipped=0) if mode == "burst" else {}),
-            )
-            saved = (
-                self.index,
-                self.profile,
-                self.fps,
-                self.rotation,
-                dict(self.applied),
+                rate=None,
+                skipped=0,
+                selected=0,
+                publish_rate=None,
             )
             self.sequence_worker = threading.Thread(
-                target=self._run_sequence, args=(plan, saved), daemon=True
+                target=self._run_sequence, args=(checked, saved, restore), daemon=True
             )
             self.sequence_worker.start()
-            return dict(self.sequence)
+            return plain(self.sequence)
 
     def stop_sequence(self):
-        # Do not wait for the camera lock: a full-resolution capture may be in progress.
         self.sequence_stop.set()
-        with self.road_condition:
-            self.road_condition.notify_all()
         return {"ok": True}
 
-    def _run_sequence(self, plan, saved):
+    def _run_sequence(self, values, saved, restore):
         run = self.sequence
-        settings = run["settings"]
         try:
-            if run["mode"] == "road":
-                self._run_road(plan)
-            elif run["mode"] == "burst":
-                self._run_burst(plan)
-            else:
-                while not self.sequence_stop.is_set() and not self.shutdown.is_set():
-                    started = time.monotonic()
-                    index = run["completed"]
-                    values = (
-                        plan[index // settings["samples"]]
-                        if run["mode"] == "test"
-                        else plan[0]
-                    )
-                    with self.lock:
-                        run["current"] = plain(values)
-                        if values:
-                            self.set_controls(values)
-                    if run["mode"] == "test" and self.sequence_stop.wait(
-                        settings["settle"]
-                    ):
-                        break
-                    if self.sequence_stop.is_set() or self.shutdown.is_set():
-                        break
-                    item = self.capture()
-                    with self.lock:
-                        run["completed"] += 1
-                        result = {
-                            k: item[k] for k in ("id", "metadata", "focus", "settings")
-                        }
-                        run["results"] = (
-                            (run["results"] + [result])
-                            if run["mode"] == "test"
-                            else [result]
-                        )
-                    if run["total"] and run["completed"] >= run["total"]:
-                        break
-                    if run["mode"] == "stills":
-                        if self.sequence_stop.wait(
-                            max(0, settings["interval"] - (time.monotonic() - started))
-                        ):
-                            break
+            if values:
+                self.set_controls(values)
+            self._run_burst()
         except Exception as exc:
             run["error"] = str(exc)
         finally:
-            self._road_disarm()
             with self.lock:
                 try:
-                    # Reconfigure to restore automatic defaults as well as explicitly set controls.
-                    self.open(*saved[:4])
-                    if saved[4]:
-                        self.set_controls(saved[4])
+                    if not self.shutdown.is_set():
+                        if restore:
+                            self.set_controls(restore)
+                        self.applied = saved
                 except Exception as exc:
                     run["error"] = (
                         run["error"] or ""
                     ) + f" Could not restore camera: {exc}"
                 run["active"] = False
 
-    def _road_disarm(self):
-        with self.road_condition:
-            self.road_armed = False
-            request = self.road_request
-            self.road_request = None
-            self.road_condition.notify_all()
-        if request is not None:
-            request.release()
-
-    def _road_next(self, last_timestamp, timeout):
-        deadline = time.monotonic() + timeout
-        while not self.sequence_stop.is_set() and not self.shutdown.is_set():
-            with self.road_condition:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        "Camera produced no fresh road-experiment frame."
-                    )
-                self.road_condition.wait_for(
-                    lambda: self.road_request is not None
-                    or self.sequence_stop.is_set()
-                    or self.shutdown.is_set(),
-                    timeout=remaining,
-                )
-                request = self.road_request
-                self.road_request = None
-            if request is None:
-                continue
-            try:
-                metadata = plain(request.get_metadata())
-                timestamp = metadata.get("SensorTimestamp")
-                if type(timestamp) not in (int, float) or timestamp <= last_timestamp:
-                    continue
-                width, height = self.camera.stream_configuration("main")["size"]
-                array = np.asarray(request.make_array("main"))[:height, :width].copy()
-                return timestamp, metadata, array
-            finally:
-                request.release()
-        raise InterruptedError
-
-    @staticmethod
-    def _road_matches(metadata, controls):
-        exposure = metadata.get("ExposureTime")
-        gain = metadata.get("AnalogueGain")
-        target_exposure = controls["ExposureTime"]
-        target_gain = controls["AnalogueGain"]
-        return (
-            type(exposure) in (int, float)
-            and type(gain) in (int, float)
-            and abs(exposure - target_exposure) <= max(50, target_exposure * 0.03)
-            and abs(gain - target_gain) <= max(0.05, target_gain * 0.05)
-        )
-
-    def _road_slot(self, arm, controls, changed, last_timestamp):
-        started = time.monotonic()
-        stable_since = None
-        consecutive = 0
-        discarded = 0
-        frames = []
-        while len(frames) < 3:
-            if time.monotonic() - started > 3:
-                raise TimeoutError(
-                    f"Arm {arm} controls did not settle within 3 seconds."
-                )
-            timestamp, metadata, array = self._road_next(last_timestamp, 1)
-            last_timestamp = timestamp
-            if not self._road_matches(metadata, controls):
-                stable_since = None
-                consecutive = 0
-                discarded += 1
-                continue
-            consecutive += 1
-            stable_since = stable_since or timestamp
-            settled = not changed or (
-                consecutive >= 3 and timestamp - stable_since >= 200_000_000
-            )
-            if not settled:
-                discarded += 1
-                continue
-            frames.append((array, metadata))
-        return (
-            frames,
-            last_timestamp,
-            {
-                "duration_seconds": round(time.monotonic() - started, 3),
-                "discarded": discarded,
-                "matching_frames": consecutive,
-            },
-        )
-
-    def _write_manifest(self, path, manifest):
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(plain(manifest)))
-        temporary.replace(path)
-
-    def _run_road(self, plan):
+    def _run_burst(self):
         run = self.sequence
         settings = run["settings"]
-        experiment_id = uuid4().hex
-        directory = self.root / "experiments" / experiment_id
-        frames_dir = directory / "frames"
-        frames_dir.mkdir(parents=True)
-        width, height = self.camera.stream_configuration("main")["size"]
-        configured = self.camera.camera_configuration()
-        colour_space = configured.get("colour_space")
-        negotiated_range = getattr(colour_space, "range", None)
-        range_name = str(negotiated_range).lower()
-        y_range = "full" if "full" in range_name else "limited"
-        estimated_block = width * height * 12
-        if shutil.disk_usage(self.root).free < 256 * 1024 * 1024 + estimated_block:
-            raise ValueError("Not enough free space for one road-experiment block.")
-        manifest = {
-            "id": experiment_id,
-            "schema_version": 1,
-            "state": "active",
-            "created": datetime.now(timezone.utc).isoformat(),
-            "settings": settings,
-            "schedule": plan["orders"],
-            "pipeline": {
-                "camera": self.properties.get("Model"),
-                "profile": self.profile,
-                "fps": self.fps,
-                "rotation": self.rotation,
-                "width": width,
-                "height": height,
-                "format": "YUV420",
-                "colour_space": plain(colour_space),
-                "y_range": y_range,
-                "y_range_source": (
-                    "negotiated colour space"
-                    if negotiated_range is not None
-                    else "Picamera2 YUV420 video default"
-                ),
-                "applied_controls": dict(self.applied),
-            },
-            "arms": {
-                arm: {
-                    "ExposureTime": values["ExposureTime"],
-                    "AnalogueGain": values["AnalogueGain"],
-                }
-                for arm, values in plan["arms"].items()
-            },
-            "blocks": [],
-            "drops": 0,
-        }
-        run["experiment_id"] = experiment_id
-        run["schedule"] = plan["orders"]
-        self._write_manifest(directory / "manifest.json", manifest)
-        self.road_drops = 0
-        last_timestamp = -1
-        previous_arm = None
-        frame_number = 0
-        try:
-            # Lock colour and electronic focus where the camera exposes reliable values.
-            locks = {}
-            if "AwbEnable" in self.schema:
-                if (
-                    "ColourGains" not in self.schema
-                    or "ColourGains" not in self.metadata
-                ):
-                    raise ValueError(
-                        "Road experiment cannot lock automatic white balance."
-                    )
-                locks.update(AwbEnable=False, ColourGains=self.metadata["ColourGains"])
-            if "AfMode" in self.schema:
-                manual = self.schema["AfMode"]["options"].get("Manual")
-                if manual is None or "LensPosition" not in self.metadata:
-                    raise ValueError("Road experiment cannot lock automatic focus.")
-                locks.update(AfMode=manual, LensPosition=self.metadata["LensPosition"])
-            if locks:
-                with self.lock:
-                    self.set_controls(locks)
-
-            with self.road_condition:
-                self.road_armed = True
-            for block_index, order in enumerate(plan["orders"]):
-                if self.sequence_stop.is_set() or self.shutdown.is_set():
-                    break
-                if (
-                    shutil.disk_usage(self.root).free
-                    < 256 * 1024 * 1024 + estimated_block
-                ):
-                    raise ValueError(
-                        "Not enough free space for another road-experiment block."
-                    )
-                block = {"index": block_index, "order": order, "slots": []}
-                buffered = []
-                for slot_index, arm in enumerate(order):
-                    controls = plan["arms"][arm]
-                    changed = arm != previous_arm
-                    if changed:
-                        with self.lock:
-                            run["current"] = {
-                                "arm": arm,
-                                "ExposureTime": controls["ExposureTime"],
-                                "AnalogueGain": controls["AnalogueGain"],
-                            }
-                            self.set_controls(controls)
-                    frames, last_timestamp, settling = self._road_slot(
-                        arm, controls, changed, last_timestamp
-                    )
-                    slot = {
-                        "index": slot_index,
-                        "arm": arm,
-                        "requested_controls": {
-                            "ExposureTime": controls["ExposureTime"],
-                            "AnalogueGain": controls["AnalogueGain"],
-                        },
-                        "settling": settling,
-                        "frames": [],
-                    }
-                    for array, metadata in frames:
-                        name = f"{frame_number:06d}.pgm"
-                        frame_number += 1
-                        buffered.append((name, array))
-                        slot["frames"].append(
-                            {
-                                "file": "frames/" + name,
-                                "width": width,
-                                "height": height,
-                                "metadata": metadata,
-                            }
-                        )
-                    block["slots"].append(slot)
-                    previous_arm = arm
-                    run["completed"] += 1
-                for name, array in buffered:
-                    (frames_dir / name).write_bytes(
-                        f"P5\n{width} {height}\n255\n".encode() + array.tobytes()
-                    )
-                manifest["blocks"].append(block)
-                manifest["drops"] = self.road_drops
-                self._write_manifest(directory / "manifest.json", manifest)
-            manifest["state"] = (
-                "cancelled"
-                if self.sequence_stop.is_set() or self.shutdown.is_set()
-                else "complete"
-            )
-        except InterruptedError:
-            manifest["state"] = "cancelled"
-        except Exception:
-            manifest["state"] = "failed"
-            raise
-        finally:
-            manifest["drops"] = self.road_drops
-            manifest["completed_slots"] = run["completed"]
-            manifest["finished"] = datetime.now(timezone.utc).isoformat()
-            self._write_manifest(directory / "manifest.json", manifest)
-
-    def _burst_fps(self):
-        """Rate of the largest advertised sensor mode, which a full-resolution burst uses."""
-        if not self.modes:
-            return None
-        area = max(m["size"][0] * m["size"][1] for m in self.modes)
-        return max(m["fps"] for m in self.modes if m["size"][0] * m["size"][1] == area)
-
-    def _configure_burst(self, controls):
-        """Stream the full sensor continuously, so no photo waits for a mode switch."""
-        from libcamera import ColorSpace
-
-        p = self.camera
-        p.stop_encoder(self.preview)
-        transform = p.camera_configuration()["transform"]
-        p.stop()
-        fps = self._burst_fps() or self.fps
-        config = p.create_video_configuration(
-            main={"size": p.sensor_resolution, "format": "YUV420"},
-            lores={"size": (640, 360), "format": "YUV420"},
-            controls={"FrameRate": fps},
-            transform=transform,
-            # JPEG stores full-range BT.601 YCbCr (sYCC), so the planes need no conversion.
-            colour_space=ColorSpace.Sycc(),
-            buffer_count=4,
-        )
-        p.configure(config)
-        p.set_controls(self.applied)
-        if controls:
-            self.set_controls(controls)
-        self.preview.frame_skip_count = max(1, round(fps / 10))
-        p.start()
-        p.start_encoder(self.preview, name="lores")
-        return tuple(p.stream_configuration("main")["size"]), fps
-
-    def _run_burst(self, plan):
-        # simplejpeg ships with Picamera2 and encodes YUV planes without an RGB conversion.
-        from simplejpeg import encode_jpeg_yuv_planes
-
-        run = self.sequence
-        settings = run["settings"]
-        with self.lock:
-            size, fps = self._configure_burst(plan["controls"])
-        width, height = size
-        preview = fitted(size, (1600, 1200))
+        size = tuple(self.camera.stream_configuration("main")["size"])
         sampler = BurstSampler(settings["rate"], settings["count"])
         progress = threading.Lock()
-        span = []
-        failures = []
+        span, failures = [], []
+        started = time.monotonic()
 
         def encode():
             while True:
@@ -945,58 +467,42 @@ class CameraDeck:
                         timeout=0.1
                     )
                 except queue.Empty:
-                    # Nothing is queued after close, so an empty mailbox stays empty.
                     if sampler.closed and sampler.mailbox.empty():
                         return
                     continue
                 try:
                     try:
-                        # make_array copies, so the camera gets its buffer back before encoding.
-                        array = request.make_array("main")
+                        array = request.make_array("main").copy()
                     finally:
                         request.release()
-                    jpeg = encode_jpeg_yuv_planes(
-                        *yuv420_planes(array, width, height),
-                        quality=settings["quality"],
-                    )
                     item = self._new("still", captured)
-                    item.update(
-                        file=item["id"] + ".jpg",
-                        capture_mode="burst",
-                        width=width,
-                        height=height,
-                        fps=fps,
-                        metadata=metadata,
-                        sequence={
-                            "id": run["id"],
-                            "mode": "burst",
-                            "number": number,
-                            "settings": settings,
-                        },
+                    item["sequence"] = dict(
+                        id=run["id"], mode="burst", number=number, settings=settings
                     )
-                    (self.root / item["file"]).write_bytes(jpeg)
-                    with Image.open(io.BytesIO(jpeg)) as image:
-                        # Decode at reduced scale; the derivatives never need full resolution.
-                        image.draft("RGB", preview)
-                        item = self._finish(item, image)
+                    item = self._encode_photo(
+                        item, array, size, metadata, settings["quality"]
+                    )
+                    timestamp = metadata["SensorTimestamp"]
+                    with progress:
+                        run["completed"] += 1
+                        run["results"] = [
+                            {k: item[k] for k in ("id", "metadata", "settings")}
+                        ]
+                        span[:] = (
+                            [min(span[0], timestamp), max(span[1], timestamp)]
+                            if span
+                            else [timestamp, timestamp]
+                        )
+                        if span[1] > span[0]:
+                            run["rate"] = round(
+                                (run["completed"] - 1) * 1e9 / (span[1] - span[0]), 2
+                            )
+                        run["publish_rate"] = round(
+                            run["completed"] / (time.monotonic() - started), 2
+                        )
                 except Exception as exc:
                     failures.append(exc)
-                    return
-                timestamp = metadata["SensorTimestamp"]
-                with progress:
-                    run["completed"] += 1
-                    run["results"] = [
-                        {k: item[k] for k in ("id", "metadata", "focus", "settings")}
-                    ]
-                    span[:] = (
-                        [min(span[0], timestamp), max(span[1], timestamp)]
-                        if span
-                        else [timestamp, timestamp]
-                    )
-                    if span[1] > span[0]:
-                        run["rate"] = round(
-                            (run["completed"] - 1) * 1e9 / (span[1] - span[0]), 2
-                        )
+                    # Keep draining selected requests, but expose every failure.
 
         workers = [
             threading.Thread(target=encode, daemon=True)
@@ -1012,18 +518,19 @@ class CameraDeck:
                 or self.sequence_stop.is_set()
                 or self.shutdown.is_set()
             ):
-                self.sequence_stop.wait(0.2)
-                run["skipped"] = sampler.skipped
+                self.sequence_stop.wait(0.1)
+                run["skipped"], run["selected"] = sampler.skipped, sampler.selected
         finally:
-            self.burst = None
             sampler.close()
-            # Photos already selected are still encoded and published.
+            self.burst = None
             for worker in workers:
                 worker.join()
             sampler.drain()
-            run["skipped"] = sampler.skipped
+            run["skipped"], run["selected"] = sampler.skipped, sampler.selected
         if failures:
-            raise failures[0]
+            raise RuntimeError(
+                f"{len(failures)} selected photo(s) failed: {failures[0]}"
+            )
 
     def _space(self):
         if shutil.disk_usage(self.root).free < 256 * 1024 * 1024:
@@ -1036,7 +543,6 @@ class CameraDeck:
         stamp = (captured or datetime.now(timezone.utc)) + timedelta(
             seconds=self.time_offset
         )
-        # Milliseconds lead the suffix so several captures per second list in order.
         ident = (
             stamp.strftime("%Y%m%d_%H%M%S_")
             + f"{stamp.microsecond // 1000:03d}"
@@ -1054,8 +560,6 @@ class CameraDeck:
         )
 
     def _finish(self, item, image):
-        item["focus"] = focus_grid(image)
-        # Burst stills pass a reduced-scale decode and record their full size beforehand.
         if item["kind"] == "still" and "width" not in item:
             item["width"], item["height"] = image.size
         for suffix, size in [("thumb", (480, 320)), ("preview", (1600, 1200))]:
@@ -1064,118 +568,57 @@ class CameraDeck:
             copy.convert("RGB").save(
                 self.root / f"{item['id']}.{suffix}.jpg", quality=85
             )
-        path = self.root / item["file"]
-        item["bytes"] = path.stat().st_size
+        item["bytes"] = (self.root / item["file"]).stat().st_size
         temp = self.root / (item["id"] + ".json.tmp")
         temp.write_text(json.dumps(item))
         temp.replace(self.root / (item["id"] + ".json"))
+        if self.media_published is not None:
+            self.media_published(item)
         return item
+
+    def _encode_photo(self, item, array, size, metadata, quality):
+        from simplejpeg import encode_jpeg_yuv_planes
+
+        width, height = size
+        jpeg = encode_jpeg_yuv_planes(
+            *yuv420_planes(array, width, height), quality=quality
+        )
+        item.update(
+            file=item["id"] + ".jpg",
+            capture_mode="full sensor",
+            width=width,
+            height=height,
+            metadata=metadata,
+        )
+        (self.root / item["file"]).write_bytes(jpeg)
+        with Image.open(io.BytesIO(jpeg)) as image:
+            image.draft("RGB", fitted(size, (1600, 1200)))
+            return self._finish(item, image)
 
     def capture(self):
         with self.lock:
             self._sequence_guard()
             self.require_camera()
-            item = self._new("still")
-            if self.sequence and self.sequence["active"]:
-                item["sequence"] = {
-                    "id": self.sequence["id"],
-                    "mode": self.sequence["mode"],
-                    "number": self.sequence["completed"] + 1,
-                    "settings": self.sequence["settings"],
-                }
-            item["file"] = item["id"] + ".jpg"
-            path = self.root / item["file"]
-            if self.recording:
-                item["metadata"] = plain(self.camera.capture_file(str(path)))
-                item["capture_mode"] = "video snapshot"
-            else:
-                self.camera.stop_encoder(self.preview)
-                previous = self.camera.camera_configuration()
-                try:
-                    config = self.camera.create_still_configuration(
-                        main={"size": self.camera.sensor_resolution},
-                        buffer_count=2,
-                        controls=self.applied,
-                        transform=previous["transform"],
-                    )
-                    item["metadata"] = plain(
-                        self.camera.switch_mode_and_capture_file(
-                            config, str(path), delay=2
-                        )
-                    )
-                    item["capture_mode"] = "full sensor"
-                finally:
-                    # Also restore preview after a failed file write or mode switch.
-                    self.camera.stop()
-                    self.camera.configure(previous)
-                    self.camera.set_controls(self.applied)
-                    self.camera.start()
-                    self.camera.start_encoder(self.preview, name="lores")
-            with Image.open(path) as image:
-                return self._finish(item, image)
-
-    def start_recording(self):
-        with self.lock:
-            self._sequence_guard()
-            self.require_camera()
-            if self.recording:
-                raise ValueError("A recording is already running.")
-            from picamera2.encoders import H264Encoder
-            from picamera2.outputs import PyavOutput
-
-            item = self._new("video")
-            item["file"] = item["id"] + ".mp4"
-            item["width"], item["height"] = self.camera.stream_configuration("main")[
-                "size"
-            ]
-            encoder = H264Encoder(
-                bitrate=10_000_000, repeat=True, iperiod=max(1, round(self.fps))
+            self._space()
+            request = self.camera.capture_request()
+            captured = datetime.now(timezone.utc)
+            try:
+                metadata = plain(request.get_metadata())
+                array = request.make_array("main").copy()
+                size = tuple(self.camera.stream_configuration("main")["size"])
+            finally:
+                request.release()
+            return self._encode_photo(
+                self._new("still", captured), array, size, metadata, 90
             )
-            output = PyavOutput(
-                str(self.root / item["file"]),
-                format="mp4",
-                options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
-            )
-            self.output_error = None
-            output.error_callback = self._output_failed
-            (self.root / (item["id"] + ".pending.json")).write_text(json.dumps(item))
-            self.camera.start_encoder(encoder, output, name="main")
-            self.recording = dict(
-                item=item,
-                encoder=encoder,
-                started=time.monotonic(),
-                poster=self.frames.frame,
-            )
-            return item
-
-    def stop_recording(self):
-        with self.lock:
-            if not self.recording:
-                raise ValueError("No recording is running.")
-            rec = self.recording
-            self.camera.stop_encoder(rec["encoder"])
-            self.recording = None
-            item = rec["item"]
-            item["duration"] = round(time.monotonic() - rec["started"], 2)
-            item["metadata"] = self.metadata
-            import av
-
-            with av.open(str(self.root / item["file"])) as container:
-                if container.duration:
-                    item["duration"] = round(container.duration / av.time_base, 2)
-            with Image.open(io.BytesIO(rec["poster"] or self.frames.frame)) as image:
-                item = self._finish(item, image)
-            (self.root / (item["id"] + ".pending.json")).unlink(missing_ok=True)
-            return item
-
-    def _output_failed(self, exc):
-        self.output_error = str(exc)
 
     def recover_recordings(self):
-        """Publish surviving fragments from interrupted recordings; never discard originals."""
+        """Background file-only recovery; pending files and originals survive failures."""
         import av
 
         for path in self.root.glob("*.pending.json"):
+            if self.shutdown.is_set():
+                return
             try:
                 item = json.loads(path.read_text())
                 with av.open(str(self.root / item["file"])) as container:
@@ -1183,50 +626,37 @@ class CameraDeck:
                     item["duration"] = round(
                         (container.duration or 0) / av.time_base, 2
                     )
+                if self.shutdown.is_set():
+                    return
                 item["recovered"] = True
                 self._finish(item, image)
                 path.unlink()
             except Exception as exc:
                 self.error = f"An interrupted clip could not be recovered: {path.name}. Original preserved. {exc}"
 
-    def recover_experiments(self):
-        """No sequence runs at startup, so an "active" manifest was cut off by a crash."""
-        for path in (self.root / "experiments").glob("*/manifest.json"):
-            try:
-                manifest = json.loads(path.read_text())
-                if manifest.get("state") == "active":
-                    manifest["state"] = "interrupted"
-                    self._write_manifest(path, manifest)
-            except (OSError, ValueError, AttributeError):
-                continue
-
     def status(self):
-        rec = self.recording
+        now = time.monotonic()
         return dict(
-            ready=self.camera is not None,
+            ready=self.camera is not None and not self.shutdown.is_set(),
             error=self.error,
             cameras=self.cameras,
             index=self.index,
             profile=self.profile,
             fps=self.fps,
             rotation=self.rotation,
-            frame_age=(
-                round(time.monotonic() - self.frames.updated, 1)
-                if self.frames.updated
-                else None
+            properties=plain(self.properties),
+            controls=plain(self.schema.copy()),
+            applied=plain(self.applied.copy()),
+            metadata=plain(self.metadata),
+            metadata_age=(
+                round(now - self.metadata_updated, 2) if self.metadata_updated else None
             ),
-            properties=self.properties,
-            modes=self.modes,
-            controls=self.schema,
-            applied=self.applied,
-            metadata=self.metadata,
-            focus=self.focus if self.focus_enabled else [],
-            focus_enabled=self.focus_enabled,
-            recording=rec["item"]["id"] if rec else None,
-            sequence=self.sequence,
-            sequence_settings=self.sequence_settings,
+            frame_age=(
+                round(now - self.frames.updated, 2) if self.frames.updated else None
+            ),
+            sequence=plain(self.sequence),
+            sequence_settings=plain(self.sequence_settings),
             burst_fps=self._burst_fps(),
-            elapsed=round(time.monotonic() - rec["started"], 1) if rec else 0,
             free_bytes=shutil.disk_usage(self.root).free,
         )
 
@@ -1235,14 +665,17 @@ class CameraDeck:
         self.sequence_stop.set()
         if self.sequence_worker:
             self.sequence_worker.join()
+        if self.recovery_worker:
+            # Decode may be stuck in a third-party demuxer: do not block server teardown.
+            self.recovery_worker.join(timeout=2)
         with self.lock:
-            if self.recording:
-                self.stop_recording()
             if self.camera:
                 self.camera.stop_encoder()
                 self.camera.stop()
                 self.camera.close()
                 self.camera = None
+            self.frames.reset()
+            self.metadata, self.metadata_updated = {}, 0
 
 
 def validate_controls(values, schema):

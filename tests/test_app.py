@@ -1,10 +1,12 @@
-import json
+"""Photo-only HTTP contracts and surviving media/storage compatibility."""
+
 import io
+import json
+import re
 import subprocess
 import sys
 import threading
 import time
-import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,16 +14,10 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 from botocore.exceptions import ClientError
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from app import ID, create_app
-from camera import (
-    BurstSampler,
-    CameraDeck,
-    focus_grid,
-    validate_controls,
-    yuv420_planes,
-)
+from camera import BurstSampler, CameraDeck, validate_controls, yuv420_planes
 from storage import S3Uploader
 
 
@@ -30,9 +26,25 @@ def deck(tmp_path):
     return CameraDeck(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def app_factory():
+    """Wait for startup imports, and close every catalog including restarted apps."""
+    apps = []
+
+    def factory(*args, **kwargs):
+        app = create_app(*args, **kwargs)
+        apps.append(app)
+        assert app.extensions["catalog"].finished.wait(10)
+        return app
+
+    yield factory
+    for app in apps:
+        app.extensions["catalog"].close()
+
+
 @pytest.fixture
-def client(deck):
-    return create_app(deck).test_client()
+def client(deck, app_factory):
+    return app_factory(deck).test_client()
 
 
 def make_media(deck, content=b"photo", ident=None):
@@ -44,45 +56,140 @@ def make_media(deck, content=b"photo", ident=None):
     (deck.root / (item["id"] + ".thumb.jpg")).write_bytes(b"thumb")
     (deck.root / (item["id"] + ".preview.jpg")).write_bytes(b"preview")
     (deck.root / (item["id"] + ".json")).write_text(json.dumps(item))
+    if deck.media_published:
+        deck.media_published(item)
     return item
 
 
 def test_no_camera_status_and_capture(client):
     assert client.get("/api/status").json["ready"] is False
     assert client.post("/api/capture", json={}).status_code == 400
-    assert client.get("/").status_code == 200
+    for route in ("/", "/library", "/transfer"):
+        response = client.get(route)
+        assert response.status_code == 200
+        assert b"/assets/" in response.data
 
 
-def test_authentication_and_origin(deck):
-    client = create_app(deck, "test-password").test_client()
+def test_network_startup_preserves_existing_password(tmp_path, monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(
+        sys, "argv", ["app.py", "--host", "0.0.0.0", "--media", str(tmp_path)]
+    )
+    monkeypatch.setenv("CAMERADECK_PASSWORD", "short")
+    monkeypatch.setattr(CameraDeck, "start", lambda self: None)
+    monkeypatch.setattr("signal.signal", lambda *args: None)
+    responses = []
+
+    def serve(app, **kwargs):
+        client = app.test_client()
+        responses.append(
+            client.post("/api/login", json={"password": "short"}).status_code
+        )
+        responses.append(client.get("/api/status").status_code)
+
+    monkeypatch.setattr("waitress.serve", serve)
+    main()
+    assert responses == [200, 200]
+    monkeypatch.delenv("CAMERADECK_PASSWORD")
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+
+
+def test_authentication_and_origin(deck, app_factory):
+    client = app_factory(deck, "test-password").test_client()
+    assert client.get("/api/session").json == {"authenticated": False, "required": True}
     for route in ["/api/status", "/api/media", "/stream.mjpg", "/media/test/original"]:
         assert client.get(route).status_code == 401
+    for route in ("/", "/library", "/transfer"):
+        assert client.get(route).status_code == 200
     assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
     assert (
         client.post("/api/login", json={"password": "test-password"}).status_code == 200
     )
-    assert client.get("/api/status").status_code == 200
+    assert client.get("/api/session").json == {"authenticated": True, "required": True}
+    cookie = client.get_cookie("session")
+    restarted = app_factory(CameraDeck(deck.root), "test-password").test_client()
+    restarted.set_cookie("session", cookie.value)
+    assert restarted.get("/api/status").status_code == 200
+    changed = app_factory(CameraDeck(deck.root), "changed-password").test_client()
+    changed.set_cookie("session", cookie.value)
+    assert changed.get("/api/status").status_code == 401
     assert (
         client.post(
-            "/api/focus",
-            json={"enabled": True},
-            headers={"Origin": "https://evil.example"},
+            "/api/controls", json={}, headers={"Origin": "https://evil.example"}
         ).status_code
         == 403
     )
+    # Same-origin requests reach validation rather than the origin guard.
     assert (
         client.post(
-            "/api/focus", json={"enabled": True}, headers={"Origin": "http://localhost"}
+            "/api/controls", json={}, headers={"Origin": "http://localhost"}
         ).status_code
-        == 200
+        == 400
     )
+    assert restarted.post("/api/logout", json={}).status_code == 200
+    assert restarted.get("/api/session").json["authenticated"] is False
 
 
-def test_login_rate_limit(deck):
-    client = create_app(deck, "password").test_client()
+def test_login_rate_limit(deck, app_factory):
+    client = app_factory(deck, "password").test_client()
     for _ in range(10):
         assert client.post("/api/login", json={"password": "bad"}).status_code == 401
     assert client.post("/api/login", json={"password": "password"}).status_code == 429
+
+
+def test_removed_routes_and_public_assets(client):
+    for route in (
+        "/api/focus",
+        "/api/record/start",
+        "/api/record/stop",
+        "/api/experiments",
+        "/missing",
+    ):
+        assert client.get(route).status_code == 404
+        assert client.post(route, json={}).status_code == 404
+    html = client.get("/")
+    assert html.status_code == 200
+    assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', html.get_data(as_text=True))
+    assert assets
+    for asset in assets:
+        assert client.get(asset).status_code == 200
+
+
+def test_request_validation_and_host(client):
+    assert (
+        client.get("/api/status", headers={"Host": "evil.example"}).status_code == 403
+    )
+    assert client.post("/api/configure", json=[]).status_code == 400
+    assert client.post("/api/controls", data="Brightness=1").status_code == 400
+    assert client.get("/api/session").json == {"authenticated": True, "required": False}
+
+
+def test_preview_requires_fresh_frame(deck, client, monkeypatch):
+    assert client.get("/api/preview").status_code == 503
+    deck.frames.write(b"test-jpeg")
+    response = client.get("/api/preview")
+    assert response.status_code == 200
+    assert response.mimetype == "image/jpeg" and response.data == b"test-jpeg"
+    monkeypatch.setattr("app.time.monotonic", lambda: float("inf"))
+    assert client.get("/api/preview").status_code == 503
+
+
+def test_stream_limit_releases_slots(deck, client):
+    deck.frames.write(b"test-jpeg")
+    streams = [client.get("/stream.mjpg", buffered=False) for _ in range(4)]
+    try:
+        assert all(r.status_code == 200 for r in streams)
+        assert client.get("/stream.mjpg").status_code == 503
+        streams.pop().close()
+        replacement = client.get("/stream.mjpg", buffered=False)
+        assert replacement.status_code == 200
+        replacement.close()
+    finally:
+        for response in streams:
+            response.close()
 
 
 def test_library_derivatives_ranges_and_delete(deck, client):
@@ -97,76 +204,123 @@ def test_library_derivatives_ranges_and_delete(deck, client):
     ident = item["id"]
     assert Image.open(deck.root / (ident + ".thumb.jpg")).width == 480
     assert Image.open(deck.root / (ident + ".preview.jpg")).width == 1600
-    r = client.get(f"/media/{ident}/original", headers={"Range": "bytes=0-9"})
-    assert r.status_code == 206 and len(r.data) == 10
-    assert (
-        "attachment"
-        in client.get(f"/media/{ident}/original?download=1").headers[
-            "Content-Disposition"
-        ]
-    )
+    response = client.get(f"/media/{ident}/original", headers={"Range": "bytes=0-9"})
+    assert response.status_code == 206 and len(response.data) == 10
+    for variant in ("original", "metadata"):
+        assert (
+            "attachment"
+            in client.get(f"/media/{ident}/{variant}?download=1").headers[
+                "Content-Disposition"
+            ]
+        )
     assert client.get("/api/media/../../etc/passwd").status_code == 404
     assert client.get(f"/media/{ident}/invalid").status_code == 404
     assert client.delete(f"/api/media/{ident}").status_code == 200
-    assert not list(deck.root.iterdir())
+    assert not list(deck.root.glob(ident + ".*"))
+    assert client.get("/api/media").json["total"] == 0
     assert client.get(f"/media/{ident}/original").status_code == 404
 
 
-def test_corrupt_sidecar_does_not_break_library(deck, client):
-    (deck.root / "20260907_100000_12345678.json").write_text("{")
-    assert client.get("/api/media").json["items"] == []
-
-
-def test_library_caches_existing_sidecars_and_reads_only_new_files(deck, monkeypatch):
+def test_catalog_startup_and_publication_do_not_read_sidecars_on_requests(
+    deck, app_factory, monkeypatch
+):
     first = make_media(deck, ident="20260907_100000_12345678")
-    second = make_media(deck, ident="20260907_100001_12345678")
-    reads = []
-    original = type(deck.root).read_text
-
-    def counted(path, *args, **kwargs):
-        if path.suffix == ".json":
-            reads.append(path.name)
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(type(deck.root), "read_text", counted)
-    cached_client = create_app(deck).test_client()
-
-    assert cached_client.get("/api/media").json["total"] == 2
-    assert cached_client.get("/api/media?kind=still").json["total"] == 2
-    assert sorted(reads) == sorted([first["id"] + ".json", second["id"] + ".json"])
-
+    make_media(deck, ident="20260907_100001_12345678")
+    client = app_factory(deck).test_client()
     third = make_media(deck, ident="20260907_100002_12345678")
-    assert cached_client.get("/api/media").json["total"] == 3
-    assert reads.count(third["id"] + ".json") == 1
-    assert reads.count(first["id"] + ".json") == 1
-    assert reads.count(second["id"] + ".json") == 1
+    assert client.get(f'/api/media/{first["id"]}').status_code == 200
+    assert client.get(f'/api/media/{third["id"]}').status_code == 200
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Library requests must query the catalog, not scan/read sidecars")
+
+    monkeypatch.setattr(type(deck.root), "glob", forbidden)
+    monkeypatch.setattr(type(deck.root), "read_text", forbidden)
+    for query in ("", "?kind=still", "?page=2&per_page=1"):
+        response = client.get("/api/media" + query)
+        assert response.json["total"] == 3
+        assert response.json["indexing"] is False
+        assert response.json["index_error"] is None
 
 
-def test_road_experiment_list_download_and_delete(deck, client):
-    ident = "a" * 32
-    directory = deck.root / "experiments" / ident
-    (directory / "frames").mkdir(parents=True)
-    manifest = {
-        "id": ident,
-        "schema_version": 1,
-        "state": "complete",
-        "created": "2026-09-21T12:00:00+00:00",
-        "settings": {},
-        "blocks": [{"index": 0}],
-        "completed_slots": 4,
-    }
-    (directory / "manifest.json").write_text(json.dumps(manifest))
-    (directory / "frames" / "000000.pgm").write_bytes(b"P5\n1 1\n255\n\x80")
-    listed = client.get("/api/experiments").json["items"]
-    assert listed[0]["id"] == ident and listed[0]["blocks"] == 1
-    assert client.get(f"/api/experiments/{ident}/manifest").json["state"] == "complete"
-    downloaded = client.get(f"/api/experiments/{ident}/download")
-    assert downloaded.status_code == 200
-    with zipfile.ZipFile(io.BytesIO(downloaded.data)) as archive:
-        assert f"{ident}/manifest.json" in archive.namelist()
-        assert f"{ident}/frames/000000.pgm" in archive.namelist()
-    assert client.delete(f"/api/experiments/{ident}").status_code == 200
-    assert not directory.exists()
+def test_library_remains_available_during_background_import(deck, monkeypatch):
+    import builtins
+
+    make_media(deck)
+    make_media(deck)
+    entered, release, responded = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    original_open = builtins.open
+    reads = []
+
+    def slow_sidecar(path, *args, **kwargs):
+        if str(path).endswith(".json"):
+            reads.append(path)
+            if len(reads) == 2:
+                entered.set()
+                release.wait(5)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", slow_sidecar)
+    app = create_app(deck)
+    result = []
+
+    def request_page():
+        result.append(app.test_client().get("/api/media").json)
+        responded.set()
+
+    request_thread = threading.Thread(target=request_page)
+    try:
+        assert entered.wait(2)
+        request_thread.start()
+        assert responded.wait(
+            1
+        ), "A background file read must not block library requests"
+        assert result[0]["indexing"] is True
+        assert result[0]["total"] == 0
+        deleted = type(deck.root)(reads[0]).stem
+        assert app.test_client().delete("/api/media/" + deleted).status_code == 200
+        release.set()
+        assert app.extensions["catalog"].finished.wait(2)
+        remaining = app.test_client().get("/api/media").json
+        assert remaining["total"] == 1
+        assert remaining["items"][0]["id"] != deleted
+    finally:
+        release.set()
+        if request_thread.ident is not None:
+            request_thread.join(5)
+        app.extensions["catalog"].close()
+
+
+@pytest.mark.parametrize("corruption", ["{", [], {}])
+def test_catalog_reconciles_changed_and_corrupt_sidecars_on_restart(
+    deck, app_factory, corruption
+):
+    item = make_media(deck)
+    first = app_factory(deck)
+    assert first.test_client().get("/api/media").json["total"] == 1
+    first.extensions["catalog"].close()
+    item["width"] = 42
+    sidecar = deck.root / (item["id"] + ".json")
+    sidecar.write_text(json.dumps(item))
+    second = app_factory(CameraDeck(deck.root))
+    assert second.test_client().get(f'/api/media/{item["id"]}').json["width"] == 42
+    second.extensions["catalog"].close()
+    sidecar.write_text(
+        corruption
+        if isinstance(corruption, str)
+        else json.dumps({**item, "kind": corruption})
+    )
+    restarted = CameraDeck(deck.root)
+    valid = make_media(restarted)
+    third = app_factory(restarted)
+    listing = third.test_client().get("/api/media").json
+    assert listing["indexing"] is False and listing["index_error"] is None
+    assert listing["total"] == 1 and listing["items"] == [valid]
+    assert sidecar.exists() and (deck.root / item["file"]).read_bytes() == b"photo"
 
 
 def test_pending_recording_is_not_published(deck, client):
@@ -191,6 +345,7 @@ def test_interrupted_clip_recovery(deck, client):
     pending.update(file=pending["id"] + ".mp4", width=320, height=240)
     path = deck.root / (pending["id"] + ".pending.json")
     path.write_text(json.dumps(pending))
+    video = deck.root / pending["file"]
     subprocess.run(
         [
             "ffmpeg",
@@ -210,12 +365,10 @@ def test_interrupted_clip_recovery(deck, client):
             "15",
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof",
-            str(deck.root / pending["file"]),
+            str(video),
         ],
         check=True,
     )
-    # Simulate losing the last fragment and final index, not a graceful close.
-    video = deck.root / pending["file"]
     data = video.read_bytes()
     last_fragment = data.rfind(b"moof") - 4
     assert last_fragment > data.find(b"moof")
@@ -225,39 +378,6 @@ def test_interrupted_clip_recovery(deck, client):
     item = client.get("/api/media").json["items"][0]
     assert item["recovered"] and 0.9 <= item["duration"] < 2
     assert (item["width"], item["height"]) == (320, 240)
-
-
-def test_still_failure_restores_preview(deck):
-    deck.camera = Mock()
-    deck.camera.camera_configuration.return_value = {"transform": "normal"}
-    deck.camera.switch_mode_and_capture_file.side_effect = OSError("disk write failed")
-    deck.preview = Mock()
-    with pytest.raises(OSError, match="disk write failed"):
-        deck.capture()
-    deck.camera.start.assert_called_once()
-    deck.camera.start_encoder.assert_called_once_with(deck.preview, name="lores")
-
-
-def test_request_validation_and_host(client):
-    assert (
-        client.get("/api/status", headers={"Host": "evil.example"}).status_code == 403
-    )
-    assert client.post("/api/focus", json={"enabled": "false"}).status_code == 400
-    assert client.post("/api/configure", json=[]).status_code == 400
-    assert client.post("/api/controls", data="Brightness=1").status_code == 400
-
-
-def test_stream_limit_releases_slots(deck, client):
-    deck.frames.write(b"test-jpeg")
-    streams = [client.get("/stream.mjpg", buffered=False) for _ in range(4)]
-    assert all(r.status_code == 200 for r in streams)
-    assert client.get("/stream.mjpg").status_code == 503
-    streams.pop().close()
-    replacement = client.get("/stream.mjpg", buffered=False)
-    assert replacement.status_code == 200
-    replacement.close()
-    for r in streams:
-        r.close()
 
 
 def spec(kind="Float", low=0, high=10, size=0, options=None):
@@ -299,30 +419,10 @@ def test_controls_types_arrays_enums_and_crop():
             validate_controls(values, schema)
 
 
-def test_focus_grid_distinguishes_blur():
-    rng = np.random.default_rng(10)
-    image = Image.fromarray(rng.integers(0, 256, (270, 480), dtype=np.uint8))
-    sharp = focus_grid(image)
-    blurred = focus_grid(image.filter(ImageFilter.GaussianBlur(3)))
-    assert len(sharp) == 9
-    assert min(sharp) > max(blurred)
-    assert focus_grid(Image.new("RGB", (480, 270), "gray")) == [0.0] * 9
-
-
-def test_recording_blocks_reconfigure(deck):
-    deck.recording = {"item": {"id": "ongoing"}}
-    with pytest.raises(ValueError, match="Stop recording"):
-        deck.open(0, "1080p", 15)
-
-
 def test_storage_guard(deck, monkeypatch):
     monkeypatch.setattr("camera.shutil.disk_usage", lambda _: Mock(free=1024))
     with pytest.raises(ValueError, match="256 MB"):
         deck._new("still")
-
-
-def test_stop_without_recording(client):
-    assert client.post("/api/record/stop", json={}).status_code == 400
 
 
 def test_page_pagination_validation_and_clamping(deck, client):
@@ -338,8 +438,9 @@ def test_page_pagination_validation_and_clamping(deck, client):
 
 
 def test_bulk_download_and_delete(deck, client):
-    first = make_media(deck, b"first")
-    second = make_media(deck, b"second")
+    import zipfile
+
+    first, second = make_media(deck, b"first"), make_media(deck, b"second")
     response = client.post(
         "/api/media/download", json={"ids": [first["id"], second["id"]]}
     )
@@ -351,13 +452,20 @@ def test_bulk_download_and_delete(deck, client):
         "/api/media/delete", json={"ids": [first["id"], second["id"], first["id"]]}
     ).json
     assert deleted["deleted"] == [first["id"], second["id"]]
-    assert not list(deck.root.glob("*.json"))
+    for item in (first, second):
+        assert not list(deck.root.glob(item["id"] + ".*"))
     assert (
         client.post("/api/media/delete", json={"ids": ["../../etc"]}).status_code == 400
     )
+    assert (
+        client.post(
+            "/api/media/delete", json={"ids": ["20260907_100000_12345678"] * 101}
+        ).status_code
+        == 400
+    )
 
 
-def test_upload_route_settings_and_validation(deck):
+def test_upload_route_settings_and_validation(deck, app_factory):
     media = make_media(deck)
     uploader = Mock()
     uploader.upload.return_value = {
@@ -365,7 +473,7 @@ def test_upload_route_settings_and_validation(deck):
         "key": "sha256/ab/hash.jpg",
         "error": None,
     }
-    client = create_app(
+    client = app_factory(
         deck, uploader=uploader, s3_endpoint="http://192.168.1.10:3900"
     ).test_client()
     assert client.get("/api/settings").json == {
@@ -395,21 +503,23 @@ def test_upload_route_settings_and_validation(deck):
     )
 
 
-def test_power_actions_are_fixed_confirmed_and_block_recording(deck):
+def test_power_actions_are_fixed_confirmed_and_block_sequence(deck, app_factory):
     manager = Mock()
-    client = create_app(deck, power_manager=manager).test_client()
+    client = app_factory(deck, power_manager=manager).test_client()
     assert (
         client.post(
             "/api/system/power", json={"action": "shutdown", "confirm": "wrong"}
         ).status_code
         == 400
     )
-    response = client.post(
-        "/api/system/power", json={"action": "reboot", "confirm": "ReBoOt"}
+    assert (
+        client.post(
+            "/api/system/power", json={"action": "reboot", "confirm": "ReBoOt"}
+        ).status_code
+        == 202
     )
-    assert response.status_code == 202
     manager.schedule.assert_called_once_with("reboot")
-    deck.recording = {"item": {"id": "ongoing"}}
+    deck.sequence = {"active": True}
     assert (
         client.post(
             "/api/system/power", json={"action": "shutdown", "confirm": "shutdown"}
@@ -439,56 +549,46 @@ class FakeS3:
 
 
 def test_s3_uploader_deduplicates_copies_and_persists(deck):
-    first = make_media(deck, b"identical")
-    second = make_media(deck, b"identical")
+    first, second = make_media(deck, b"identical"), make_media(deck, b"identical")
     s3 = FakeS3()
     uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
-    first_result = uploader.upload(
-        deck.root / first["file"],
-        first["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
-    second_result = uploader.upload(
-        deck.root / second["file"],
-        second["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
+    results = [
+        uploader.upload(
+            deck.root / item["file"],
+            item["id"],
+            endpoint_url="https://example.org",
+            bucket="archive",
+        )
+        for item in (first, second)
+    ]
     restarted = S3Uploader(deck.root, client_factory=lambda _: s3).upload(
         deck.root / second["file"],
         second["id"],
         endpoint_url="https://example.org",
         bucket="archive",
     )
-    assert first_result.status == "uploaded"
-    assert second_result.status == restarted.status == "deduplicated"
+    assert results[0].status == "uploaded"
+    assert results[1].status == restarted.status == "deduplicated"
     assert s3.puts == 1
 
 
 def test_s3_ambiguous_attempt_is_never_sent_twice(deck):
-    media = make_media(deck, b"ambiguous")
-    s3 = FakeS3(fail_put=True)
-    uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
-    first = uploader.upload(
-        deck.root / media["file"],
-        media["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
-    second = S3Uploader(deck.root, client_factory=lambda _: s3).upload(
-        deck.root / media["file"],
-        media["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
-    assert first.status == second.status == "uncertain"
+    media, s3 = make_media(deck, b"ambiguous"), FakeS3(fail_put=True)
+    results = [
+        S3Uploader(deck.root, client_factory=lambda _: s3).upload(
+            deck.root / media["file"],
+            media["id"],
+            endpoint_url="https://example.org",
+            bucket="archive",
+        )
+        for _ in range(2)
+    ]
+    assert all(result.status == "uncertain" for result in results)
     assert s3.puts == 1
 
 
 def test_s3_overwritten_file_gets_a_new_content_key(deck):
-    media = make_media(deck, b"first version")
-    s3 = FakeS3()
+    media, s3 = make_media(deck, b"first version"), FakeS3()
     uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
     first = uploader.upload(
         deck.root / media["file"],
@@ -504,408 +604,24 @@ def test_s3_overwritten_file_gets_a_new_content_key(deck):
         bucket="archive",
     )
     assert first.status == second.status == "uploaded"
-    assert first.key != second.key
-    assert s3.puts == 2
+    assert first.key != second.key and s3.puts == 2
 
 
-@pytest.fixture
-def sequence_deck(deck):
-    deck.schema = {
-        "ExposureTime": spec("Integer32", 100, 10000),
-        "AnalogueGain": spec("Float", 1, 8),
-        "AeEnable": spec("Bool"),
-    }
-    deck.camera = Mock()
-    deck.camera.camera_configuration.return_value = {"transform": None}
-    deck.camera.sensor_resolution = (80, 60)
-
-    def photo(config, path, delay):
-        Image.new("RGB", (80, 60), "gray").save(path)
-        return {
-            "ExposureTime": deck.applied.get("ExposureTime", 6000),
-            "AnalogueGain": deck.applied.get("AnalogueGain", 1),
-        }
-
-    deck.camera.switch_mode_and_capture_file.side_effect = photo
-    deck.open = Mock(side_effect=lambda *args: deck.applied.clear())
-    yield deck
-    deck.stop_sequence()
-    if deck.sequence_worker:
-        deck.sequence_worker.join(5)
-        assert not deck.sequence_worker.is_alive()
+@pytest.mark.parametrize("saved", [None, "", "bad", "90", "180", "0"])
+def test_saved_orientation_defaults_and_validation(tmp_path, saved):
+    if saved is not None:
+        (tmp_path / ".rotation").write_text(saved)
+    assert CameraDeck(tmp_path).status()["rotation"] == (180 if saved == "180" else 0)
 
 
-@pytest.mark.parametrize("rotation", [0, 180])
-def test_periodic_stills_publish_limit_and_restore(sequence_deck, rotation):
-    deck = sequence_deck
-    deck.rotation = rotation
-    deck.camera.camera_configuration.return_value = {"transform": rotation}
-    deck.applied = {"ExposureTime": 7000, "AeEnable": False}
-    deck.start_sequence(
-        "stills", {"interval": 1, "count": 2, "controls": {"ExposureTime": 1300}}
-    )
-    deck.sequence_worker.join(4)
-    assert not deck.sequence["active"]
-    assert deck.sequence["completed"] == 2
-    assert deck.sequence["error"] is None
-    items = [json.loads(p.read_text()) for p in deck.root.glob("*.json")]
-    assert len(items) == 2
-    assert {i["sequence"]["number"] for i in items} == {1, 2}
-    assert all(i["metadata"]["ExposureTime"] == 1300 for i in items)
-    assert all(i["capture_mode"] == "full sensor" for i in items)
-    assert all(i["rotation"] == rotation for i in items)
-    assert (
-        deck.camera.create_still_configuration.call_args.kwargs["transform"] == rotation
-    )
-    assert deck.applied == {"ExposureTime": 7000, "AeEnable": False}
-    deck.open.assert_called_once_with(0, "1080p", 30, rotation)
-    assert deck.sequence_settings["test"]["samples"] == 3
-
-
-@pytest.mark.parametrize("modern", [False, True])
-def test_test_sweep_all_pairs_metadata_and_restore(sequence_deck, modern):
-    deck = sequence_deck
-    if modern:
-        del deck.schema["AeEnable"]
-        for name in ("ExposureTimeMode", "AnalogueGainMode"):
-            deck.schema[name] = spec(
-                "Integer32", 0, 1, options={"Auto": 0, "Manual": 1}
-            )
-    deck.start_sequence(
-        "test",
-        {"shutters": [700, 2300], "gains": [1.5, 3], "settle": 0.5, "samples": 2},
-    )
-    deck.sequence_worker.join(7)
-    assert deck.sequence["error"] is None
-    assert not deck.sequence["active"]
-    results = deck.sequence["results"]
-    assert [
-        (r["metadata"]["ExposureTime"], r["metadata"]["AnalogueGain"]) for r in results
-    ] == [
-        (700, 1.5),
-        (700, 1.5),
-        (700, 3),
-        (700, 3),
-        (2300, 1.5),
-        (2300, 1.5),
-        (2300, 3),
-        (2300, 3),
+def test_capture_ids_list_in_capture_order_within_a_second(deck):
+    start = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
+    ids = [
+        deck._new("still", start + timedelta(milliseconds=ms))["id"]
+        for ms in (999, 250, 5)
     ]
-    if modern:
-        assert all(
-            r["settings"]["ExposureTimeMode"] == r["settings"]["AnalogueGainMode"] == 1
-            for r in results
-        )
-    else:
-        assert all(r["settings"]["AeEnable"] is False for r in results)
-    assert deck.applied == {}
-
-
-def test_road_plan_is_seeded_balanced_and_equal_exposure(sequence_deck):
-    deck = sequence_deck
-    deck._run_road = Mock()
-    deck.start_sequence(
-        "road",
-        {
-            "reference_shutter_us": 4000,
-            "reference_gain": 2,
-            "comparison_shutter_us": 2000,
-            "blocks": 4,
-            "seed": 17,
-        },
-    )
-    deck.sequence_worker.join(2)
-    plan = deck._run_road.call_args.args[0]
-    assert sorted(plan["orders"]) == ["ABBA", "ABBA", "BAAB", "BAAB"]
-    assert plan["arms"]["A"]["ExposureTime"] == 4000
-    assert plan["arms"]["A"]["AnalogueGain"] == 2
-    assert plan["arms"]["B"]["ExposureTime"] == 2000
-    assert plan["arms"]["B"]["AnalogueGain"] == 4
-    assert (
-        plan["arms"]["A"]["ExposureTime"] * plan["arms"]["A"]["AnalogueGain"]
-        == plan["arms"]["B"]["ExposureTime"] * plan["arms"]["B"]["AnalogueGain"]
-    )
-    assert deck.camera.switch_mode_and_capture_file.call_count == 0
-
-
-@pytest.mark.parametrize(
-    "settings,message",
-    [
-        ({"blocks": 5}, "even"),
-        ({"roi": [0, 0.5, 1, 0.6]}, "roi"),
-        (
-            {
-                "reference_shutter_us": 4000,
-                "reference_gain": 4,
-                "comparison_shutter_us": 1000,
-            },
-            "AnalogueGain",
-        ),
-        ({"reference_shutter_us": 40000}, "frame period"),
-    ],
-)
-def test_road_plan_rejects_invalid_before_controls(sequence_deck, settings, message):
-    deck = sequence_deck
-    with pytest.raises(ValueError, match=message):
-        deck.start_sequence("road", settings)
-    deck.camera.set_controls.assert_not_called()
-
-
-def test_road_plan_requires_motion_capable_frame_rate(sequence_deck):
-    deck = sequence_deck
-    deck.fps = 5
-    with pytest.raises(ValueError, match="at least 10 fps"):
-        deck.start_sequence("road", {})
-    deck.camera.set_controls.assert_not_called()
-
-
-class RoadRequest:
-    def __init__(self, metadata, array):
-        self.metadata = metadata
-        self.array = array
-        self.references = 0
-
-    def get_metadata(self):
-        return self.metadata
-
-    def make_array(self, stream):
-        assert stream == "main"
-        return self.array
-
-    def acquire(self):
-        self.references += 1
-
-    def release(self):
-        self.references -= 1
-
-
-def test_road_slot_waits_for_measured_controls_and_releases_requests(deck):
-    deck.schema = {
-        "ExposureTime": spec("Integer32", 100, 10000),
-        "AnalogueGain": spec("Float", 1, 8),
-        "AeEnable": spec("Bool"),
-    }
-    deck.camera = Mock()
-    deck.camera.stream_configuration.return_value = {"size": (16, 12)}
-    deck.sequence_stop.clear()
-    with deck.road_condition:
-        deck.road_armed = True
-    requests = []
-
-    def feed():
-        values = [(6000, 1)] + [(2000, 4)] * 5
-        for index, (exposure, gain) in enumerate(values):
-            request = RoadRequest(
-                {
-                    "ExposureTime": exposure,
-                    "AnalogueGain": gain,
-                    "DigitalGain": 1.0,
-                    "SensorTimestamp": (index + 1) * 100_000_000,
-                    "FrameDuration": 100_000,
-                },
-                np.full((18, 16), index, dtype=np.uint8),
-            )
-            requests.append(request)
-            deck._metadata(request)
-            time.sleep(0.01)
-
-    producer = threading.Thread(target=feed)
-    producer.start()
-    frames, timestamp, settling = deck._road_slot(
-        "B", {"ExposureTime": 2000, "AnalogueGain": 4}, True, -1
-    )
-    producer.join(1)
-    deck._road_disarm()
-    assert len(frames) == 3 and timestamp == 600_000_000
-    assert all(md["ExposureTime"] == 2000 for _, md in frames)
-    assert settling["discarded"] == 3
-    assert all(request.references == 0 for request in requests)
-
-
-def test_road_mailbox_is_bounded_and_reports_drop(deck):
-    deck.road_armed = True
-    first = RoadRequest({"SensorTimestamp": 1}, np.zeros((2, 2), dtype=np.uint8))
-    second = RoadRequest({"SensorTimestamp": 2}, np.zeros((2, 2), dtype=np.uint8))
-    deck._metadata(first)
-    deck._metadata(second)
-    assert deck.road_request is second and deck.road_drops == 1
-    assert first.references == 0 and second.references == 1
-    deck._road_disarm()
-    assert second.references == 0
-
-
-@pytest.mark.parametrize(
-    "failure,expected_state",
-    [("lock", "failed"), ("cancel", "cancelled")],
-)
-def test_road_manifest_is_finalized_during_preparation_failure_or_cancel(
-    deck, failure, expected_state
-):
-    from types import SimpleNamespace
-
-    deck.camera = Mock()
-    deck.camera.stream_configuration.return_value = {"size": (16, 12)}
-    deck.camera.camera_configuration.return_value = {
-        "colour_space": SimpleNamespace(range="Range.Limited")
-    }
-    deck.schema = {
-        "ExposureTime": spec("Integer32", 100, 10000),
-        "AnalogueGain": spec("Float", 1, 8),
-        "AeEnable": spec("Bool"),
-    }
-    if failure == "lock":
-        deck.schema["AwbEnable"] = spec("Bool")
-    else:
-        deck._road_slot = Mock(side_effect=InterruptedError)
-    deck.sequence = {
-        "settings": {"roi": [0, 0, 1, 1]},
-        "completed": 0,
-        "current": {},
-        "active": True,
-    }
-    deck.sequence_worker = threading.current_thread()
-    plan = {
-        "arms": {
-            "A": {"ExposureTime": 4000, "AnalogueGain": 2, "AeEnable": False},
-            "B": {"ExposureTime": 2000, "AnalogueGain": 4, "AeEnable": False},
-        },
-        "orders": ["ABBA"],
-    }
-    if failure == "lock":
-        with pytest.raises(ValueError, match="white balance"):
-            deck._run_road(plan)
-    else:
-        deck._run_road(plan)
-    manifest_path = next((deck.root / "experiments").glob("*/manifest.json"))
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["state"] == expected_state
-    assert "finished" in manifest
-    assert manifest["pipeline"]["y_range"] == "limited"
-    assert manifest["pipeline"]["y_range_source"] == "negotiated colour space"
-
-
-def test_sequence_stop_interrupts_settle_and_blocks_conflicts(sequence_deck):
-    deck = sequence_deck
-    client = create_app(deck, power_manager=Mock()).test_client()
-    assert (
-        client.post(
-            "/api/sequence/start", json={"mode": "test", "settings": {"settle": 30}}
-        ).status_code
-        == 200
-    )
-    for path, data in [
-        ("/api/sequence/start", {"mode": "stills"}),
-        ("/api/capture", {}),
-        ("/api/record/start", {}),
-        ("/api/controls", {"ExposureTime": 1500}),
-    ]:
-        assert client.post(path, json=data).status_code == 400
-    # Use the real guard; open itself is mocked only to avoid importing Pi hardware.
-    with pytest.raises(ValueError, match="Stop the capture sequence"):
-        CameraDeck.open(deck, 0, "720p", 15)
-    assert (
-        client.post(
-            "/api/system/power", json={"action": "reboot", "confirm": "reboot"}
-        ).status_code
-        == 409
-    )
-    assert client.post("/api/sequence/stop", json={}).status_code == 200
-    deck.sequence_worker.join(2)
-    assert not deck.sequence["active"]
-    assert deck.sequence["completed"] == 0
-    assert deck.sequence["error"] is None
-
-
-@pytest.mark.parametrize(
-    "mode,settings",
-    [
-        ([], {}),
-        ("invalid", {}),
-        ("stills", {"interval": 0}),
-        ("stills", {"count": True}),
-        ("stills", {"count": 1.5}),
-        ("stills", {"interval": float("nan")}),
-        ("stills", {"controls": []}),
-        ("stills", {"controls": {"Unknown": 1}}),
-        ("test", {"shutters": [99]}),
-        ("test", {"gains": [9]}),
-        ("test", {"shutters": [500.5]}),
-        ("test", {"gains": []}),
-        ("test", {"samples": 6}),
-        ("test", {"settle": 0}),
-        ("test", {"gains": [True]}),
-        ("burst", {"rate": 0}),
-        ("burst", {"rate": 1 / 86401}),
-        ("burst", {"rate": 31}),
-        ("burst", {"count": -1}),
-        ("burst", {"quality": 0}),
-        ("burst", {"quality": 90.5}),
-        ("burst", {"threads": 5}),
-        ("burst", {"controls": []}),
-        ("burst", {"controls": {"Unknown": 1}}),
-    ],
-)
-def test_sequence_rejects_invalid_before_camera_changes(sequence_deck, mode, settings):
-    deck = sequence_deck
-    response = (
-        create_app(deck)
-        .test_client()
-        .post("/api/sequence/start", json={"mode": mode, "settings": settings})
-    )
-    assert response.status_code == 400
-    assert deck.sequence is None
-    deck.camera.set_controls.assert_not_called()
-
-
-@pytest.mark.parametrize("failure", ["capture", "storage"])
-def test_sequence_failure_stops_and_restores(sequence_deck, failure):
-    deck = sequence_deck
-    deck.applied = {"AeEnable": True}
-    if failure == "capture":
-        deck.camera.switch_mode_and_capture_file.side_effect = OSError("write failed")
-    else:
-        deck._space = Mock(side_effect=[None, ValueError("256 MB")])
-    deck.start_sequence("stills", {"count": 3})
-    deck.sequence_worker.join(2)
-    assert not deck.sequence["active"]
-    assert deck.sequence["completed"] == 0
-    assert ("write failed" if failure == "capture" else "256 MB") in deck.sequence[
-        "error"
-    ]
-    assert deck.applied == {"AeEnable": True}
-    assert not list(deck.root.glob("*.json"))
-
-
-@pytest.mark.parametrize("capture_time,delay", [(0.25, 1.75), (3.5, 0)])
-def test_periodic_cadence_and_stop_during_interval(
-    sequence_deck, monkeypatch, capture_time, delay
-):
-    deck = sequence_deck
-    monkeypatch.setattr(
-        "camera.time.monotonic", Mock(side_effect=[10, 10 + capture_time])
-    )
-    # End an unlimited run at its first interval, without sleeping in the test.
-    deck.sequence_stop.wait = Mock(return_value=True)
-    deck.start_sequence("stills", {"interval": 2, "count": 0})
-    deck.sequence_worker.join(2)
-    assert deck.sequence["error"] is None
-    assert deck.sequence["completed"] == 1
-    deck.sequence_stop.wait.assert_called_once_with(delay)
-    assert not deck.sequence["active"]
-
-
-def test_recording_blocks_sequence_and_close_stops_worker(sequence_deck):
-    deck = sequence_deck
-    deck.recording = {"item": {"id": "ongoing"}}
-    with pytest.raises(ValueError, match="Stop recording"):
-        deck.start_sequence("stills", {})
-    deck.recording = None
-    deck.start_sequence("test", {"settle": 30})
-    deck.close()
-    assert not deck.sequence_worker.is_alive()
-    assert not deck.sequence["active"]
-    assert deck.sequence["completed"] == 0
-    assert deck.camera is None
+    assert all(ID.fullmatch(ident) for ident in ids)
+    assert sorted(ids) == ids[::-1]
 
 
 @pytest.fixture
@@ -914,6 +630,7 @@ def camera_stack(monkeypatch):
 
     exposure = enum.IntEnum("AeExposureModeEnum", {"Normal": 0, "Short": 1, "Long": 2})
     camera = Mock()
+    camera.sensor_resolution = (1920, 1080)
     camera.sensor_modes = [{"size": (1920, 1080), "fps": 60}]
     camera.camera_properties = {"Model": "test sensor"}
     camera.camera_controls = {
@@ -936,6 +653,7 @@ def camera_stack(monkeypatch):
         "libcamera",
         SimpleNamespace(
             Transform=lambda **kwargs: SimpleNamespace(**kwargs),
+            ColorSpace=SimpleNamespace(Sycc=lambda: "sycc"),
             controls=SimpleNamespace(AeExposureModeEnum=exposure),
         ),
     )
@@ -949,75 +667,53 @@ def camera_stack(monkeypatch):
     return camera
 
 
-@pytest.mark.parametrize("ceiling,expected", [(15.75, 15.75), (60, 30)])
-def test_truck_defaults_applied_on_camera_open(deck, camera_stack, ceiling, expected):
-    camera = camera_stack
-    camera.sensor_modes[0]["fps"] = ceiling
+def test_truck_defaults_applied_on_camera_open(deck, camera_stack):
     deck.open(deck.index, deck.profile, deck.fps)
-    config = camera.create_video_configuration.call_args.kwargs
-    assert config["main"]["size"] == (1920, 1080)
-    assert config["controls"] == {"FrameRate": expected}
-    assert deck.fps == expected
-    camera.set_controls.assert_called_once_with(
+    config = camera_stack.create_video_configuration.call_args.kwargs
+    assert config["main"] == {"size": (1920, 1080), "format": "YUV420"}
+    assert config["controls"] == {"FrameRate": deck.fps}
+    camera_stack.set_controls.assert_called_once_with(
         {"AeEnable": True, "AwbEnable": True, "AeExposureMode": 1}
     )
     assert deck.applied == {"AeEnable": True, "AwbEnable": True, "AeExposureMode": 1}
-    assert deck.sequence_settings["stills"] == {
-        "interval": 1,
-        "count": 0,
-        "controls": {},
-    }
-    assert deck.sequence_settings["test"] == {
-        "shutters": [1000, 2000, 4000, 8000],
-        "gains": [2, 4, 8],
-        "settle": 2,
-        "samples": 3,
-    }
+    assert deck.sequence_settings["burst"]["rate"] == 5
 
 
-def test_orientation_persists_across_sessions_and_restart(deck, client, camera_stack):
+def test_orientation_persists_across_sessions_and_restart(
+    deck, client, camera_stack, app_factory
+):
     assert client.post("/api/configure", json={"rotation": 180}).json["rotation"] == 180
-    fresh_client = create_app(deck).test_client()
+    fresh_client = app_factory(deck).test_client()
     assert fresh_client.get("/api/status").json["rotation"] == 180
+    assert (
+        fresh_client.post("/api/controls", json={"AeEnable": False}).status_code == 200
+    )
     assert (
         fresh_client.post("/api/configure", json={"profile": "720p"}).json["rotation"]
         == 180
     )
-
+    assert fresh_client.get("/api/status").json["applied"]["AeEnable"] is False
     restarted = CameraDeck(deck.root)
-    restarted.start()
+    restarted.open(0, "full sensor", 5)
     try:
-        assert restarted.status()["ready"] is True
         assert restarted.status()["rotation"] == 180
         transform = camera_stack.create_video_configuration.call_args.kwargs[
             "transform"
         ]
-        assert transform.hflip is True and transform.vflip is True
-        restarted.open(0, "1080p", 15)
-        assert restarted.status()["rotation"] == 180
-
-        # A failed change must not overwrite the last successfully applied orientation.
+        assert transform.hflip and transform.vflip
         camera_stack.start.side_effect = RuntimeError("Camera failed to start")
         with pytest.raises(RuntimeError, match="Camera failed to start"):
-            restarted.open(0, "1080p", 15, 0)
+            restarted.open(0, "full sensor", 5, 0)
         assert CameraDeck(deck.root).status()["rotation"] == 180
         camera_stack.start.side_effect = None
-        restarted.open(0, "1080p", 15, 0)
+        restarted.open(0, "full sensor", 5, 0)
         assert CameraDeck(deck.root).status()["rotation"] == 0
         transform = camera_stack.create_video_configuration.call_args.kwargs[
             "transform"
         ]
-        assert transform.hflip is False and transform.vflip is False
+        assert not transform.hflip and not transform.vflip
     finally:
         restarted.close()
-        restarted.worker.join(2)
-
-
-@pytest.mark.parametrize("saved", [None, "", "bad", "90", "180", "0"])
-def test_saved_orientation_defaults_and_validation(tmp_path, saved):
-    if saved is not None:
-        (tmp_path / ".rotation").write_text(saved)
-    assert CameraDeck(tmp_path).status()["rotation"] == (180 if saved == "180" else 0)
 
 
 @pytest.mark.parametrize(
@@ -1041,35 +737,37 @@ def test_motion_defaults_modern_modes_and_unsupported_short(deck, short_name, ma
     assert "ExposureTime" not in deck.applied and "AnalogueGain" not in deck.applied
 
 
-def yuv420(width, height, stride, y, u, v):
-    """A Picamera2-shaped YUV420 buffer: full-stride Y rows, then half-stride U and V rows."""
-    planes = []
-    for rows, pitch, columns, value in [
-        (height, stride, width, y),
-        (height // 2, stride // 2, width // 2, u),
-        (height // 2, stride // 2, width // 2, v),
-    ]:
-        plane = np.full((rows, pitch), 7, dtype=np.uint8)  # 7 marks stride padding
-        plane[:, :columns] = value
-        planes.append(plane.ravel())
-    return np.concatenate(planes).reshape(height * 3 // 2, stride)
-
-
 def test_yuv420_planes_skip_stride_padding():
-    y = np.arange(6 * 8, dtype=np.uint8).reshape(6, 8)
+    y = np.arange(48, dtype=np.uint8).reshape(6, 8)
     u = np.arange(100, 112, dtype=np.uint8).reshape(3, 4)
     v = np.arange(200, 212, dtype=np.uint8).reshape(3, 4)
-    planes = yuv420_planes(yuv420(8, 6, 16, y, u, v), 8, 6)
-    for actual, expected in zip(planes, (y, u, v)):
-        assert np.array_equal(actual, expected)
+    padded = []
+    for plane in (y, u, v):
+        buffer = np.full((plane.shape[0], plane.shape[1] * 2), 7, dtype=np.uint8)
+        buffer[:, : plane.shape[1]] = plane
+        padded.append(buffer.ravel())
+    actual = yuv420_planes(np.concatenate(padded).reshape(9, 16), 8, 6)
+    for result, expected in zip(actual, (y, u, v)):
+        assert np.array_equal(result, expected)
+
+
+class SyntheticRequest:
+    def __init__(self):
+        self.references = 0
+
+    def acquire(self):
+        self.references += 1
+
+    def release(self):
+        self.references -= 1
 
 
 def test_burst_sampler_keeps_average_rate_then_skips_and_counts():
     period = 1e9 / 15.75
     sampler = BurstSampler(4)
     taken = []
-    for index in range(158):  # ten seconds of frames at the B0569's 15.75 fps
-        sampler.offer(RoadRequest({}, None), {"SensorTimestamp": round(index * period)})
+    for index in range(158):
+        sampler.offer(SyntheticRequest(), {"SensorTimestamp": round(index * period)})
         if not sampler.mailbox.empty():
             request, _, number, _ = sampler.mailbox.get_nowait()
             request.release()
@@ -1077,14 +775,13 @@ def test_burst_sampler_keeps_average_rate_then_skips_and_counts():
             assert number == len(taken)
     assert len(taken) == 40
     assert {b - a for a, b in zip(taken, taken[1:])} <= {3, 4}
-
     busy = BurstSampler(30, count=2)
-    first, second, third, late = (RoadRequest({}, None) for _ in range(4))
+    first, second, third, late = (SyntheticRequest() for _ in range(4))
     busy.offer(first, {"SensorTimestamp": 0})
     busy.offer(second, {"SensorTimestamp": 10**9})
     assert busy.skipped == 1 and first.references == 1 and second.references == 0
     busy.mailbox.get_nowait()[0].release()
-    busy.offer(RoadRequest({}, None), {"SensorTimestamp": "invalid"})
+    busy.offer(SyntheticRequest(), {"SensorTimestamp": "invalid"})
     busy.offer(third, {"SensorTimestamp": 2 * 10**9})
     assert busy.done and busy.selected == 2
     busy.offer(late, {"SensorTimestamp": 3 * 10**9})
@@ -1094,51 +791,27 @@ def test_burst_sampler_keeps_average_rate_then_skips_and_counts():
     assert third.references == 0
 
 
-def test_capture_ids_list_in_capture_order_within_a_second(deck):
-    start = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
-    ids = [
-        deck._new("still", start + timedelta(milliseconds=ms))["id"]
-        for ms in (999, 250, 5)
-    ]
-    assert all(ID.fullmatch(ident) for ident in ids)
-    assert sorted(ids) == ids[::-1]
-
-
-def fake_simplejpeg(calls):
-    def encode_jpeg_yuv_planes(y, u, v, quality):
-        calls.append((y.shape, u.shape, v.shape, quality))
-        size = (y.shape[1], y.shape[0])
-        planes = [
-            Image.fromarray(np.ascontiguousarray(plane)).resize(size)
-            for plane in (y, u, v)
-        ]
-        output = io.BytesIO()
-        Image.merge("YCbCr", planes).save(output, "JPEG", quality=quality)
-        return output.getvalue()
-
-    return SimpleNamespace(encode_jpeg_yuv_planes=encode_jpeg_yuv_planes)
-
-
 @pytest.fixture
-def burst_deck(sequence_deck, monkeypatch):
-    deck = sequence_deck
-    deck.encoded = []
-    monkeypatch.setitem(sys.modules, "simplejpeg", fake_simplejpeg(deck.encoded))
-    monkeypatch.setitem(
-        sys.modules,
-        "libcamera",
-        SimpleNamespace(ColorSpace=SimpleNamespace(Sycc=lambda: "sycc")),
-    )
-    # A faster binned mode must not be mistaken for the full-resolution rate.
-    deck.modes = [{"size": [40, 30], "fps": 60}, {"size": [80, 60], "fps": 15.75}]
-    deck.preview = Mock()
+def burst_deck(deck):
+    deck.camera = Mock()
+    deck.camera.sensor_resolution = (80, 60)
     deck.camera.stream_configuration.return_value = {"size": (80, 60)}
-    return deck
+    deck.modes = [{"size": [40, 30], "fps": 60}, {"size": [80, 60], "fps": 15.75}]
+    deck.fps = 15.75
+    deck.schema = {
+        "AeEnable": {**spec("Bool"), "default": True},
+        "ExposureTime": {**spec("Integer32", 100, 10000), "default": 1000},
+        "AnalogueGain": {**spec("Float", 1, 8), "default": 1},
+    }
+    yield deck
+    deck.stop_sequence()
+    if deck.sequence_worker:
+        deck.sequence_worker.join(5)
+        assert not deck.sequence_worker.is_alive()
 
 
-def feed_frames(deck, requests):
-    """Stream 15.75 fps frames once the burst is armed, one at a time so none is skipped."""
-    period = 1e9 / 15.75
+def feed_frames(deck):
+    requests = []
     deadline = time.monotonic() + 5
     while deck.burst is None and deck.sequence["active"]:
         assert time.monotonic() < deadline
@@ -1147,27 +820,29 @@ def feed_frames(deck, requests):
     while deck.sequence["active"]:
         assert time.monotonic() < deadline
         burst = deck.burst
-        if burst is not None and not burst.mailbox.empty():
+        if burst is None or not burst.mailbox.empty():
             time.sleep(0.001)
             continue
-        request = RoadRequest(
-            {
-                "SensorTimestamp": round(index * period),
-                "ExposureTime": 1000,
-                "AnalogueGain": 4.0,
-            },
-            yuv420(80, 60, 96, 200, 128, 128),
-        )
+        request = SyntheticRequest()
+        request.get_metadata = lambda i=index: {
+            "SensorTimestamp": round(i * 1e9 / 15.75),
+            "ExposureTime": 1000,
+            "AnalogueGain": 4.0,
+        }
+        request.make_array = lambda name: np.full((90, 96), 128, dtype=np.uint8)
         requests.append(request)
         deck._metadata(request)
         index += 1
+    deck.sequence_worker.join(5)
+    assert not deck.sequence_worker.is_alive()
+    assert all(request.references == 0 for request in requests)
+    return requests
 
 
 @pytest.mark.parametrize("rotation", [0, 180])
 def test_burst_streams_full_resolution_photos_and_restores(burst_deck, rotation):
     deck = burst_deck
     deck.rotation = rotation
-    deck.camera.camera_configuration.return_value = {"transform": rotation}
     deck.applied = {"ExposureTime": 1000, "AeEnable": False}
     deck.start_sequence(
         "burst",
@@ -1179,58 +854,37 @@ def test_burst_streams_full_resolution_photos_and_restores(burst_deck, rotation)
             "controls": {"AnalogueGain": 4},
         },
     )
-    requests = []
-    feed_frames(deck, requests)
-    deck.sequence_worker.join(5)
+    feed_frames(deck)
     run = deck.sequence
     assert run["error"] is None and not run["active"]
     assert run["completed"] == 3 and run["skipped"] == 0
-    period = 1e9 / 15.75
-    assert run["rate"] == round(2e9 / (round(8 * period)), 2)
-    assert all(request.references == 0 for request in requests)
-
-    config = deck.camera.create_video_configuration.call_args.kwargs
-    assert config["main"] == {"size": (80, 60), "format": "YUV420"}
-    assert config["colour_space"] == "sycc"
-    assert config["controls"] == {"FrameRate": 15.75}
-    assert config["transform"] == rotation
-    assert deck.encoded == [((60, 80), (30, 40), (30, 40), 70)] * 3
-
+    assert run["rate"] == round(2e9 / round(8 * 1e9 / 15.75), 2)
     items = sorted(
-        (json.loads(p.read_text()) for p in deck.root.glob("*.json")),
+        (json.loads(path.read_text()) for path in deck.root.glob("*.json")),
         key=lambda item: item["sequence"]["number"],
     )
-    assert [i["sequence"]["number"] for i in items] == [1, 2, 3]
-    assert [i["metadata"]["SensorTimestamp"] for i in items] == [
-        round(n * period) for n in (0, 4, 8)
+    assert [item["sequence"]["number"] for item in items] == [1, 2, 3]
+    assert [item["metadata"]["SensorTimestamp"] for item in items] == [
+        round(n * 1e9 / 15.75) for n in (0, 4, 8)
     ]
     for item in items:
-        assert item["capture_mode"] == "burst"
-        assert item["rotation"] == rotation
+        assert item["capture_mode"] == "full sensor" and item["rotation"] == rotation
         assert (item["width"], item["height"], item["fps"]) == (80, 60, 15.75)
-        assert item["settings"]["AnalogueGain"] == 4
-        assert len(item["focus"]) == 9
         with Image.open(deck.root / item["file"]) as image:
             assert image.size == (80, 60)
-            assert all(
-                abs(c - 200) <= 3 for c in image.convert("RGB").getpixel((40, 30))
-            )
         assert (deck.root / (item["id"] + ".thumb.jpg")).exists()
         assert (deck.root / (item["id"] + ".preview.jpg")).exists()
-
     assert deck.applied == {"ExposureTime": 1000, "AeEnable": False}
-    deck.open.assert_called_once_with(0, "1080p", 30, rotation)
+    deck.camera.create_video_configuration.assert_not_called()
+    deck.camera.stop.assert_not_called()
 
 
 def test_continuous_photos_accept_daily_interval(burst_deck):
     deck = burst_deck
     deck.start_sequence("burst", {"rate": 1 / 86400, "count": 1})
-    requests = []
-    feed_frames(deck, requests)
-    deck.sequence_worker.join(5)
-    assert deck.sequence["error"] is None and not deck.sequence["active"]
-    assert deck.sequence["completed"] == 1
-    items = [json.loads(p.read_text()) for p in deck.root.glob("*.json")]
+    feed_frames(deck)
+    assert deck.sequence["error"] is None and deck.sequence["completed"] == 1
+    items = [json.loads(path.read_text()) for path in deck.root.glob("*.json")]
     assert len(items) == 1
     assert items[0]["sequence"]["settings"]["rate"] == 1 / 86400
 
@@ -1240,12 +894,8 @@ def test_burst_failure_stops_releases_frames_and_restores(burst_deck):
     deck.applied = {"AeEnable": True}
     deck._space = Mock(side_effect=[None, ValueError("256 MB")])
     deck.start_sequence("burst", {"threads": 1})
-    requests = []
-    feed_frames(deck, requests)
-    deck.sequence_worker.join(5)
-    assert not deck.sequence["active"]
-    assert "256 MB" in deck.sequence["error"]
+    assert feed_frames(deck)
+    assert not deck.sequence["active"] and "256 MB" in deck.sequence["error"]
     assert deck.sequence["completed"] == 0
-    assert requests and all(request.references == 0 for request in requests)
     assert not list(deck.root.glob("*.json"))
     assert deck.applied == {"AeEnable": True}

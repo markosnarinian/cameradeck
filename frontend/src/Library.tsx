@@ -163,6 +163,13 @@ export function Library({
     setSelected(next);
     setFeedback("");
   };
+  const chooseOnPointerDown = (id: string, e: MouseEvent) => {
+    // macOS Control-click can open a context menu without emitting a click.
+    if (!busy && e.button === 0 && e.ctrlKey) {
+      e.preventDefault();
+      choose(id, e);
+    }
+  };
   const act = async (fn: () => Promise<void>) => {
     if (busy) return;
     setBusy(true);
@@ -456,7 +463,16 @@ export function Library({
             >
               <button
                 className="thumbnail"
-                onClick={() => setViewed(item)}
+                onPointerDown={(e) => chooseOnPointerDown(item.id, e)}
+                onContextMenu={(e) => {
+                  if (e.ctrlKey) e.preventDefault();
+                }}
+                onClick={(e) => {
+                  if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                    if (!busy && !(e.ctrlKey && e.detail > 0))
+                      choose(item.id, e);
+                  } else setViewed(item);
+                }}
                 aria-label={`Open ${item.file}`}
               >
                 <img
@@ -468,13 +484,29 @@ export function Library({
                   <span className="video-label">Video</span>
                 )}
               </button>
-              <label className="select-label">
+              <label
+                className="select-label"
+                onPointerDown={(e) => chooseOnPointerDown(item.id, e)}
+                onContextMenu={(e) => {
+                  if (e.ctrlKey) e.preventDefault();
+                }}
+                onClick={(e) => {
+                  // Use the original label event, not a forwarded checkbox click.
+                  if (
+                    !(e.target instanceof HTMLInputElement) ||
+                    busy ||
+                    (e.ctrlKey && e.detail > 0)
+                  )
+                    e.preventDefault();
+                  if (!busy && !(e.ctrlKey && e.detail > 0))
+                    choose(item.id, e);
+                }}
+              >
                 <input
                   type="checkbox"
                   checked={selected.has(item.id)}
                   aria-label={`Select ${item.file}`}
                   disabled={busy}
-                  onClick={(e) => choose(item.id, e)}
                   onChange={() => {}}
                 />
                 <span>{date(item.created)}</span>

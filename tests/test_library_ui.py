@@ -46,9 +46,13 @@ def library_page(tmp_path):
     thread.start()
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                executable_path=os.environ.get("CHROMIUM", "/usr/bin/chromium"),
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            browser = (
+                p.webkit.launch()
+                if os.environ.get("CAMERADECK_BROWSER") == "webkit"
+                else p.chromium.launch(
+                    executable_path=os.environ.get("CHROMIUM", "/usr/bin/chromium"),
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
             )
             page = browser.new_page(viewport={"width": 1440, "height": 1100})
             errors = []
@@ -238,21 +242,39 @@ def test_library_selection_ranges_and_limit(library_page):
 
     checks.nth(2).click(modifiers=["Shift"])
     selected([2])
-    checks.nth(7).click()
-    checks.nth(4).click(modifiers=["Shift"])
+    page.locator(".select-label span").nth(7).click()
+    page.locator(".select-label span").nth(4).click(modifiers=["Shift"])
+    selected([2, 4, 5, 6, 7])
+    page.locator(".thumbnail").nth(9).click(modifiers=["Shift"])
+    selected([2, 4, 5, 6, 7, 8, 9])
+    # Control-click on macOS may only deliver pointer-down and a context menu.
+    checks.nth(9).hover()
+    page.keyboard.down("Control")
+    page.keyboard.down("Shift")
+    page.mouse.down()
+    selected([2, 4, 5, 6])
+    checks.nth(9).dispatch_event("contextmenu", {"ctrlKey": True, "shiftKey": True})
+    selected([2, 4, 5, 6])
+    page.mouse.up()
+    page.keyboard.up("Shift")
+    page.keyboard.up("Control")
+    selected([2, 4, 5, 6])
+    page.locator(".thumbnail").nth(6).click(modifiers=["Control", "Shift"])
+    selected([2, 4, 5])
+    page.locator(".thumbnail").nth(6).click(modifiers=["Shift"])
     selected([2, 4, 5, 6, 7])
     # Refresh preserves the ID anchor; repeated Shift never moves it.
     page.get_by_role("button", name="Refresh").click()
     expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
     checks.nth(9).click(modifiers=["Shift"])
     selected([2, 4, 5, 6, 7, 8, 9])
-    checks.nth(4).click(modifiers=["Control"])
+    page.locator(".thumbnail").nth(4).click(modifiers=["Control"])
     selected([2, 5, 6, 7, 8, 9])
     page.locator(".select-label").nth(9).click(
         modifiers=["Control", "Shift"], position={"x": 3, "y": 3}
     )
     selected([2])
-    checks.nth(1).click(modifiers=["Meta", "Shift"])
+    page.locator(".thumbnail").nth(1).click(modifiers=["Meta", "Shift"])
     selected([])
     checks.nth(0).focus()
     checks.nth(0).press("Space")

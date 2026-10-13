@@ -94,6 +94,8 @@ the center. Overshooting clamps to the first or last page.
 
 Checkbox click toggles one item and establishes a range anchor. Shift adds an
 inclusive range; Ctrl/Command+Shift removes it. Shift does not move the anchor.
+These shortcuts work on the checkbox, date label, or thumbnail. A plain thumbnail
+click still opens the viewer; Ctrl/Command-click toggles one item without opening it.
 Ranges stay within the current page. Selected IDs persist across pages/filters;
 off-page selections are counted explicitly. Select no more than 100 items for
 one bulk operation.

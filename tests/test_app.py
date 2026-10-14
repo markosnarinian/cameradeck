@@ -437,6 +437,45 @@ def test_page_pagination_validation_and_clamping(deck, client):
     assert client.get("/api/media?kind=unknown").status_code == 400
 
 
+def test_library_range_ids_filter_and_limit(deck, client):
+    ids = []
+    for index in range(102):
+        entry = make_media(deck, ident=f"20260916_120000_{index:08x}")
+        ids.append(entry["id"])
+        if index == 50:
+            entry["kind"] = "video"
+            (deck.root / (entry["id"] + ".json")).write_text(json.dumps(entry))
+            deck.media_published(entry)
+
+    def resolve(start, end, **kwargs):
+        return client.post(
+            "/api/media/range", json={"start": start, "end": end, **kwargs}
+        )
+
+    for start, end in ((ids[20], ids[60]), (ids[60], ids[20])):
+        assert resolve(start, end).json["ids"] == list(reversed(ids[20:61]))
+        assert resolve(start, end, kind="still").json["ids"] == [
+            ident for ident in reversed(ids[20:61]) if ident != ids[50]
+        ]
+    assert resolve(ids[20], ids[20]).json["ids"] == [ids[20]]
+    assert len(resolve(ids[0], ids[99]).json["ids"]) == 100
+    oversized = resolve(ids[0], ids[100])
+    assert oversized.status_code == 400
+    assert "Selection limit is 100" in oversized.json["error"]
+    assert resolve(
+        ids[0], ids[101], kind="still", ids=[ids[20], ids[50], ids[60]]
+    ).json["ids"] == [ids[60], ids[20]]
+    assert resolve(ids[0], ids[101], kind="still", ids=[ids[50]]).json["ids"] == []
+    for kwargs in ({"kind": "bad"}, {"ids": []}, {"ids": ["bad"]}):
+        assert resolve(ids[0], ids[10], **kwargs).status_code == 400
+    assert resolve("bad", ids[10]).status_code == 400
+    assert resolve(ids[20], ids[50], kind="still").status_code == 400
+    assert client.delete(f"/api/media/{ids[20]}").status_code == 200
+    missing = resolve(ids[20], ids[60])
+    assert missing.status_code == 400
+    assert "no longer available" in missing.json["error"]
+
+
 def test_bulk_download_and_delete(deck, client):
     import zipfile
 

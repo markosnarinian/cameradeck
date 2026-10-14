@@ -63,7 +63,7 @@ export function Library({
       return "medium";
     }
   });
-  const anchor = useRef<{ id: string; scope: string } | null>(null),
+  const anchor = useRef<{ id: string; kind: string } | null>(null),
     urls = useRef(new Set<string>());
   const scope = `${kind}:${page}:${perPage}`;
   useEffect(() => {
@@ -92,6 +92,7 @@ export function Library({
       timer: ReturnType<typeof setTimeout>;
     setLoading(true);
     setError("");
+    if (anchor.current?.kind !== kind) anchor.current = null;
     const load = async () => {
       try {
         const next: MediaPage = await request(
@@ -101,11 +102,6 @@ export function Library({
         );
         if (!alive) return;
         setData(next);
-        if (
-          anchor.current?.scope === scope &&
-          !next.items.some((i) => i.id === anchor.current?.id)
-        )
-          anchor.current = null;
         if (next.page !== page)
           setParams(
             { kind, page: String(next.page), per_page: String(perPage) },
@@ -136,32 +132,47 @@ export function Library({
   const choose = (id: string, e: MouseEvent) => {
     const next = new Set(selected),
       at = items.findIndex((i) => i.id === id),
-      start =
-        anchor.current?.scope === scope
-          ? items.findIndex((i) => i.id === anchor.current?.id)
-          : -1;
-    if (e.shiftKey) {
-      const from = start >= 0 ? start : at;
-      for (const item of items.slice(
-        Math.min(from, at),
-        Math.max(from, at) + 1,
-      )) {
-        if (e.ctrlKey || e.metaKey) next.delete(item.id);
-        else next.add(item.id);
+      fromAnchor = anchor.current?.kind === kind ? anchor.current : null,
+      start = items.findIndex((i) => i.id === fromAnchor?.id),
+      removing = e.shiftKey ? e.ctrlKey || e.metaKey : next.has(id);
+    const apply = (ids: string[]) => {
+      for (const ident of ids) {
+        if (removing) next.delete(ident);
+        else next.add(ident);
       }
-    } else {
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      anchor.current = { id, scope };
-    }
-    if (next.size > 100) {
-      setFeedback(
-        "Selection limit is 100 captures. Clear some items before adding more.",
-      );
+      if (next.size > 100) {
+        setFeedback(
+          "Selection limit is 100 captures. Clear some items before adding more.",
+        );
+        return;
+      }
+      setSelected(next);
+      setFeedback("");
+    };
+    if (e.shiftKey && fromAnchor && start < 0) {
+      if (removing && !next.size) return;
+      void act(async () => {
+        const response = await request("/api/media/range", {
+          kind,
+          start: fromAnchor.id,
+          end: id,
+          ...(removing ? { ids: [...next] } : {}),
+        });
+        apply(response.ids);
+      });
       return;
     }
-    setSelected(next);
-    setFeedback("");
+    if (e.shiftKey) {
+      const from = start >= 0 ? start : at;
+      apply(
+        items
+          .slice(Math.min(from, at), Math.max(from, at) + 1)
+          .map((item) => item.id),
+      );
+    } else {
+      anchor.current = { id, kind };
+      apply([id]);
+    }
   };
   const chooseOnPointerDown = (id: string, e: MouseEvent) => {
     // macOS Control-click can open a context menu without emitting a click.
@@ -211,6 +222,8 @@ export function Library({
       setSelected(
         (old) => new Set([...old].filter((id) => !removed.includes(id))),
       );
+      if (anchor.current && removed.includes(anchor.current.id))
+        anchor.current = null;
       setResult(
         `${response.deleted.length} deleted; ${response.missing.length} already missing.`,
       );

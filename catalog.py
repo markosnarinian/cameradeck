@@ -105,6 +105,37 @@ class MediaCatalog:
             index_error=self.error,
         )
 
+    def range(self, kind, start, end, limit, identifiers=None):
+        if self.indexing:
+            raise ValueError("Library indexing is still in progress. Try again later.")
+        where = " AND kind = ?" if kind != "all" else ""
+        args = (kind,) if kind != "all" else ()
+        with self.read_lock:
+            self.reader.execute("BEGIN")
+            try:
+                endpoints = self.reader.execute(
+                    "SELECT id FROM media WHERE id IN (?, ?)" + where,
+                    (start, end, *args),
+                ).fetchall()
+                if len(endpoints) != len({start, end}):
+                    raise ValueError(
+                        "Range endpoint is no longer available. Click an item to start a new range."
+                    )
+                low, high = sorted((start, end))
+                query = "SELECT id FROM media WHERE id BETWEEN ? AND ?" + where
+                values = (low, high, *args)
+                if identifiers is not None:
+                    query += " AND id IN (" + ",".join("?" for _ in identifiers) + ")"
+                    values += tuple(identifiers)
+                rows = self.reader.execute(
+                    query + " ORDER BY id DESC LIMIT ?", (*values, limit + 1)
+                ).fetchall()
+                if len(rows) > limit:
+                    raise ValueError(f"Selection limit is {limit} captures.")
+                return [row[0] for row in rows]
+            finally:
+                self.reader.rollback()
+
     def _commit_import(self, rows, unchanged):
         with self.lock, self.db:
             # Publication/deletion wins over any earlier directory observation.

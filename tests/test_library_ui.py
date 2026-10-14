@@ -224,15 +224,15 @@ def test_library_selection_ranges_and_limit(library_page):
     top = page.get_by_role("navigation", name="Top pagination")
 
     def selected(indices, total=None):
-        # Check immediately: a later status render must not hide native checkbox drift.
+        # Cross-page range resolution is asynchronous; native state must agree too.
+        expect(page.locator(".selection-bar > span")).to_contain_text(
+            f"{len(indices) if total is None else total} selected"
+        )
         assert (
             checks.evaluate_all(
                 "inputs => inputs.flatMap((input, i) => input.checked ? [i] : [])"
             )
             == indices
-        )
-        expect(page.locator(".selection-bar > span")).to_contain_text(
-            f"{len(indices) if total is None else total} selected"
         )
         for index in indices:
             expect(checks.nth(index)).to_be_checked()
@@ -287,20 +287,20 @@ def test_library_selection_ranges_and_limit(library_page):
     expect(top.get_by_role("spinbutton", name="Page number")).to_have_value("2")
     expect(checks).to_have_count(40)
     checks.nth(3).click(modifiers=["Control", "Shift"])
-    selected([], total=2)
+    selected([], total=1)
     checks.nth(3).click(modifiers=["Meta", "Shift"])
-    selected([], total=2)
+    selected([], total=1)
     checks.nth(3).click(modifiers=["Shift"])
-    selected([3], total=3)
+    selected([0, 1, 2, 3], total=38)
     checks.nth(3).click(modifiers=["Shift"])
-    selected([3], total=3)
+    selected([0, 1, 2, 3], total=38)
     checks.nth(1).click()
     checks.nth(3).click(modifiers=["Shift"])
-    selected([1, 2, 3], total=5)
+    selected([0, 1, 2, 3], total=38)
     top.get_by_role("button", name="Previous", exact=True).click()
     expect(top.get_by_role("spinbutton", name="Page number")).to_have_value("1")
     expect(checks).to_have_count(40)
-    selected([6, 7], total=5)
+    selected(list(range(6, 40)), total=38)
     screenshot(page, "photo-library-selection")
     page.get_by_role("button", name="Clear", exact=True).click()
     selected([])
@@ -336,6 +336,60 @@ def test_library_selection_ranges_and_limit(library_page):
     checks.first.click()
     selected([], total=100)
     expect(page.get_by_role("alert")).to_contain_text("Selection limit is 100")
+
+
+def test_library_ranges_across_skipped_pages(library_page):
+    page = library_page
+    checks = page.get_by_role("checkbox")
+    top = page.get_by_role("navigation", name="Top pagination")
+
+    def go(number):
+        top.get_by_role("spinbutton", name="Page number").fill(str(number))
+        top.get_by_role("button", name="Go", exact=True).click()
+        expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
+        expect(top.get_by_role("spinbutton", name="Page number")).to_have_value(
+            str(number)
+        )
+
+    def selected(indices, total):
+        expect(page.locator(".selection-bar > span")).to_contain_text(
+            f"{total} selected"
+        )
+        expect(page.locator(".media-card.selected")).to_have_count(len(indices))
+        assert (
+            checks.evaluate_all(
+                "inputs => inputs.flatMap((input, i) => input.checked ? [i] : [])"
+            )
+            == indices
+        )
+
+    checks.nth(35).click()
+    go(3)
+    checks.nth(4).click(modifiers=["Shift"])
+    selected(list(range(5)), 50)
+    go(2)
+    selected(list(range(40)), 50)
+    checks.nth(10).click(modifiers=["Control", "Shift"])
+    selected(list(range(11, 40)), 34)
+    go(3)
+    checks.nth(4).click(modifiers=["Meta", "Shift"])
+    selected([], 0)
+    checks.nth(4).click(modifiers=["Shift"])
+    selected(list(range(5)), 50)
+    page.get_by_role("combobox", name=re.compile("^Per page")).select_option("20")
+    expect(checks).to_have_count(20)
+    go(1)
+    checks.first.click(modifiers=["Shift"])
+    selected(list(range(20)), 85)
+    # Establish an anchor at 0, then remove a range wider than the batch limit.
+    checks.first.click()
+    go(7)
+    expect(checks).to_have_count(1)
+    checks.first.click(modifiers=["Control", "Shift"])
+    selected([], 0)
+    checks.first.click(modifiers=["Shift"])
+    expect(page.get_by_role("alert")).to_contain_text("Selection limit is 100")
+    selected([], 0)
 
 
 def test_library_session_reload_recovery_and_settings(library_page):

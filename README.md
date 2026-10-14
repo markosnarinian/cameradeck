@@ -96,9 +96,11 @@ Checkbox click toggles one item and establishes a range anchor. Shift adds an
 inclusive range; Ctrl/Command+Shift removes it. Shift does not move the anchor.
 These shortcuts work on the checkbox, date label, or thumbnail. A plain thumbnail
 click still opens the viewer; Ctrl/Command-click toggles one item without opening it.
-Ranges stay within the current page. Selected IDs persist across pages/filters;
-off-page selections are counted explicitly. Select no more than 100 items for
-one bulk operation.
+Ranges span pages, including skipped pages, and survive changes to items per page.
+Changing the kind filter resets the anchor, but selected IDs persist across
+pages/filters; off-page selections are counted explicitly. Select no more than
+100 items for one bulk operation. An oversized range leaves selection unchanged;
+range deselection can span any number of items.
 
 Completed JSON sidecars are the recovery source of truth. A persistent
 `.library.sqlite3` catalog provides indexed counts and pagination; HTTP requests

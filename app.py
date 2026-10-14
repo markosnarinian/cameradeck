@@ -380,6 +380,21 @@ def create_app(
         per_page = positive_integer("per_page", 40, 100)
         return jsonify(catalog.page(kind, page, per_page))
 
+    @app.post("/api/media/range")
+    def library_range():
+        body = request.get_json()
+        kind = body.get("kind", "all")
+        if kind not in ("all", "still", "video"):
+            raise ValueError("kind must be all, still, or video.")
+        start, end = body.get("start"), body.get("end")
+        if any(
+            not isinstance(ident, str) or not ID.fullmatch(ident)
+            for ident in (start, end)
+        ):
+            raise ValueError("One or more media IDs are invalid.")
+        identifiers = ids_from_request() if "ids" in body else None
+        return jsonify(ids=catalog.range(kind, start, end, MAX_BATCH, identifiers))
+
     @app.get("/api/media/<ident>")
     def detail(ident):
         return jsonify(item(ident))

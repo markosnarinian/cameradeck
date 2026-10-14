@@ -43,6 +43,10 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   When changing frontend source, use Node 22+ on a build machine:
   `npm --prefix frontend ci && npm --prefix frontend run build`, and ship the
   source, lockfile and compiled files together. The service still runs Python only.
+- Library Shift-click ranges now span pages, including skipped pages. Restart
+  the Python service with the matching frontend: off-page ranges use the new
+  read-only `POST /api/media/range` endpoint. Reload existing browser tabs after
+  updating. The 100-item selection limit remains; no migration is required.
 - Exposure time and gain now have independent Auto/Manual selectors, including
   shutter-priority (manual exposure, auto gain) and gain-priority (auto exposure,
   manual gain). No camera-stack upgrade is required: newer libcamera uses the

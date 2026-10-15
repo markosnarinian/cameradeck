@@ -13,6 +13,11 @@ from uuid import uuid4
 
 from PIL import Image
 
+# Captures are refused below MIN_FREE; the UI warns below LOW_FREE (~7 minutes
+# of 5 photos/second at typical photo sizes).
+MIN_FREE = 256 * 1024 * 1024
+LOW_FREE = 5 * 1024**3
+
 
 def plain(value):
     if isinstance(value, dict):
@@ -543,7 +548,7 @@ class CameraDeck:
             )
 
     def _space(self):
-        if shutil.disk_usage(self.root).free < 256 * 1024 * 1024:
+        if shutil.disk_usage(self.root).free < MIN_FREE:
             raise ValueError(
                 "Less than 256 MB free. Download and remove captures before continuing."
             )
@@ -667,7 +672,8 @@ class CameraDeck:
             sequence=plain(self.sequence),
             sequence_settings=plain(self.sequence_settings),
             burst_fps=self._burst_fps(),
-            free_bytes=shutil.disk_usage(self.root).free,
+            free_bytes=(free := shutil.disk_usage(self.root).free),
+            low_space=free < LOW_FREE,
         )
 
     def close(self):

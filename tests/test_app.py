@@ -433,6 +433,13 @@ def test_storage_guard(deck, monkeypatch):
         deck._new("still")
 
 
+def test_low_space_warning_threshold(deck, monkeypatch):
+    for free, low in [(5 * 1024**3 - 1, True), (5 * 1024**3, False)]:
+        monkeypatch.setattr("camera.shutil.disk_usage", lambda _: Mock(free=free))
+        status = deck.status()
+        assert (status["free_bytes"], status["low_space"]) == (free, low)
+
+
 def test_page_pagination_validation_and_clamping(deck, client):
     for index in range(41):
         make_media(deck, ident=f"20260916_1200{index // 10}{index % 10}_{index:08x}")

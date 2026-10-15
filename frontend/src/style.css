@@ -210,6 +210,10 @@ select {
 .error {
   color: #ffabb3;
 }
+.notice.warning {
+  color: #ffd98a;
+  border-color: #6b5520;
+}
 .sequence {
   font-size: 14px;
 }

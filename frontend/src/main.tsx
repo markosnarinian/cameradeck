@@ -177,6 +177,13 @@ function App() {
             {status.error}
           </div>
         )}
+        {status?.low_space && status.free_bytes != null && (
+          <div className="notice warning" role="alert">
+            Low disk space: {(status.free_bytes / 1024 ** 3).toFixed(1)} GB
+            free. Capture stops below 256 MB — transfer and remove captures
+            soon.
+          </div>
+        )}
         {seq && (seq.active || seq.completed > 0 || seq.error) && (
           <div className="sequence">
             <span>

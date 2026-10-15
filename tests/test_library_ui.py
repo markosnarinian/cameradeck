@@ -612,7 +612,10 @@ def test_library_session_reload_recovery_and_settings(library_page):
         ),
     )
     page.get_by_role("button", name="Refresh").click()
-    expect(page.get_by_role("alert")).to_contain_text("Synthetic index unavailable")
+    # The low-space warning is also an alert when the host has under 5 GB free.
+    expect(page.locator(".empty[role=alert]")).to_contain_text(
+        "Synthetic index unavailable"
+    )
     screenshot(page, "photo-library-error")
     page.unroute("**/api/media?*")
     page.get_by_role("button", name="Retry", exact=True).click()
@@ -825,9 +828,8 @@ def test_independent_exposure_modes(library_page, modern):
 
     reject = True
     exposure.select_option("manual")
-    expect(page.get_by_role("status", include_hidden=True)).to_contain_text(
-        "Control rejected"
-    )
+    # The preview also renders a status once the fixture's single frame is stale.
+    expect(page.locator(".notice[role=status]")).to_contain_text("Control rejected")
     expect(exposure).to_have_value("auto")
     expect(time_value).to_be_disabled()
     reject = False

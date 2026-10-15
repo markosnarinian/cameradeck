@@ -18,6 +18,7 @@ from PIL import Image
 
 from app import ID, create_app
 from camera import BurstSampler, CameraDeck, validate_controls, yuv420_planes
+from power import PowerManager
 from storage import S3Uploader
 from transfer import RsyncTransfer
 
@@ -530,6 +531,59 @@ def test_bulk_download_and_delete(deck, client, tmp_path, monkeypatch):
     )
     assert missing.json == {"deleted": [], "missing": ["20260907_100000_12345678"]}
     assert client.post("/api/login", json={"password": "x" * 20000}).status_code == 413
+
+
+def test_activity_reports_work_a_stop_would_interrupt(deck, app_factory):
+    seen = []
+    uploader = Mock()
+    uploader.upload.side_effect = lambda *a, **k: seen.append(
+        client.get("/api/activity").json
+    ) or {"status": "uploaded", "key": "k", "error": None}
+    power = PowerManager(executor=Mock())
+    app = app_factory(deck, uploader=uploader, power_manager=power)
+    client = app.test_client()
+    idle = {"idle": True, "operations": {}}
+    first, second = make_media(deck, b"x" * 100000), make_media(deck)
+    assert client.get("/api/activity").json == idle
+
+    viewing = client.get(f'/media/{first["id"]}/original', buffered=False)
+    assert client.get("/api/activity").json == idle
+    viewing.close()
+    for url, kind, body in [
+        (f'/media/{first["id"]}/original?download=1', "download", None),
+        ("/api/media/download", "zip_download", {"ids": [first["id"]]}),
+    ]:
+        method = client.post if body else client.get
+        response = method(url, json=body, buffered=False)
+        next(iter(response.response))
+        assert client.get("/api/activity").json == {
+            "idle": False,
+            "operations": {kind: 1},
+        }
+        response.close()
+        assert client.get("/api/activity").json == idle
+
+    client.post(
+        "/api/media/upload", json={"ids": [first["id"]], "bucket": "camera-archive"}
+    )
+    catalog = app.extensions["catalog"]
+    remove = catalog.remove
+    catalog.remove = lambda ident: seen.append(
+        client.get("/api/activity").json
+    ) or remove(ident)
+    client.post("/api/media/delete", json={"ids": [second["id"]]})
+    assert [entry["operations"] for entry in seen] == [
+        {"s3_upload": 1},
+        {"deletion": 1},
+    ]
+    assert client.get("/api/activity").json == idle
+
+    deck.sequence = {"active": True}
+    power.pending = True
+    assert client.get("/api/activity").json["operations"] == {
+        "capture_sequence": 1,
+        "power_action": 1,
+    }
 
 
 def test_upload_route_settings_and_validation(deck, app_factory):

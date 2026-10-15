@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
 from pathlib import Path
@@ -32,6 +34,40 @@ from camera import CameraDeck
 from catalog import ID, MediaCatalog
 from power import PowerManager
 from transfer import Busy, RsyncTransfer, public_key
+
+
+class Activity:
+    """Request-driven work that stopping the service would cut short."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.counts = Counter()
+
+    def begin(self, kind):
+        with self.lock:
+            self.counts[kind] += 1
+        ended = []
+
+        def end():
+            with self.lock:
+                if not ended:
+                    ended.append(True)
+                    self.counts[kind] -= 1
+
+        return end
+
+    @contextmanager
+    def track(self, kind):
+        end = self.begin(kind)
+        try:
+            yield
+        finally:
+            end()
+
+    def snapshot(self):
+        with self.lock:
+            return {kind: count for kind, count in self.counts.items() if count > 0}
+
 
 BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
@@ -107,6 +143,7 @@ def create_app(
     configured_endpoint = normalize_endpoint(s3_endpoint)
     rsync = rsync or RsyncTransfer(deck.root)
     app.extensions["rsync"] = rsync
+    activity = Activity()
 
     def authenticated():
         return not password or session.get("authenticated") == authentication
@@ -227,6 +264,22 @@ def create_app(
     def status():
         return jsonify({**deck.status(), "transfer_active": rsync.active})
 
+    @app.get("/api/activity")
+    def activity_status():
+        """Whether stopping the service now would interrupt anything (see UPDATE.md)."""
+        operations = activity.snapshot()
+        if deck.sequence and deck.sequence["active"]:
+            operations["capture_sequence"] = 1
+        if rsync.active:
+            operations["rsync_transfer"] = 1
+        if catalog.indexing:
+            operations["library_indexing"] = 1
+        if deck.recovery_worker and deck.recovery_worker.is_alive():
+            operations["clip_recovery"] = 1
+        if getattr(power_manager, "pending", False) is True:
+            operations["power_action"] = 1
+        return jsonify(idle=not operations, operations=operations)
+
     ATHENS = ZoneInfo("Europe/Athens")
 
     @app.get("/api/time")
@@ -270,7 +323,8 @@ def create_app(
 
     @app.post("/api/capture")
     def capture():
-        return jsonify(deck.capture())
+        with activity.track("photo_capture"):
+            return jsonify(deck.capture())
 
     @app.post("/api/sequence/start")
     def sequence_start():
@@ -418,6 +472,7 @@ def create_app(
     @app.get("/media/<ident>/<variant>")
     def media(ident, variant):
         entry = item(ident)
+        downloading = variant == "original" and "download" in request.args
         if variant == "original":
             path = media_path(entry)
             name = path.name
@@ -429,20 +484,30 @@ def create_app(
             path = deck.root / name
         else:
             abort(404)
-        response = send_file(
-            path,
-            conditional=True,
-            as_attachment="download" in request.args,
-            download_name=name,
-            max_age=86400,
-        )
+        end = activity.begin("download") if downloading else None
+        try:
+            response = send_file(
+                path,
+                conditional=True,
+                as_attachment="download" in request.args,
+                download_name=name,
+                max_age=86400,
+            )
+        except Exception:
+            if end:
+                end()
+            raise
+        if end:
+            # Iterate in the request thread so close marks the end of sending.
+            response.direct_passthrough = False
+            response.call_on_close(end)
         response.cache_control.public = False
         response.cache_control.private = True
         return response
 
     @app.delete("/api/media/<ident>")
     def delete(ident):
-        with deck.lock, catalog.lock:
+        with activity.track("deletion"), deck.lock, catalog.lock:
             entry = item(ident)
             media_path(entry)
             for name in [
@@ -457,7 +522,10 @@ def create_app(
 
     @app.post("/api/media/delete")
     def delete_many():
-        identifiers = ids_from_request()
+        with activity.track("deletion"):
+            return delete_entries(ids_from_request())
+
+    def delete_entries(identifiers):
         entries, missing = [], []
         for ident in identifiers:
             try:
@@ -486,6 +554,7 @@ def create_app(
     def download_many():
         identifiers = ids_from_request()
         entries = [(ident, item(ident)) for ident in identifiers]
+        end = activity.begin("zip_download")
         temporary = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
         temporary.close()
         try:
@@ -506,9 +575,11 @@ def create_app(
             # Keep Response.close in the WSGI iterator's cleanup path.
             response.direct_passthrough = False
             response.call_on_close(lambda: Path(temporary.name).unlink(missing_ok=True))
+            response.call_on_close(end)
             return response
         except Exception:
             Path(temporary.name).unlink(missing_ok=True)
+            end()
             raise
 
     @app.get("/api/settings")
@@ -517,6 +588,10 @@ def create_app(
 
     @app.post("/api/media/upload")
     def upload_many():
+        with activity.track("s3_upload"):
+            return upload_entries()
+
+    def upload_entries():
         nonlocal uploader
         data = request.get_json()
         identifiers = ids_from_request()

@@ -5,12 +5,13 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 
 ## Before you start
 
-- Only update while the camera is idle: no video recording and no capture
-  sequence (periodic stills, camera test, road experiment) active. Step 1
-  covers how to check. Recordings and periodic stills keep running until
-  someone stops them, even after every browser disconnects, so if one is
-  active, leave it to whoever started it and update once they've stopped it.
-  Don't stop someone else's run just to update.
+- Only update while CameraDeck is idle or stopped: nothing in progress that
+  stopping it would interrupt (capture, rsync, S3 upload, deletion, download,
+  library indexing, clip recovery, pending shutdown/reboot). Step 1 covers how
+  to check. Captures and transfers keep running until someone stops them, even
+  after every browser disconnects, so if one is active, leave it to whoever
+  started it and update once it has finished. Don't stop someone else's run
+  just to update.
 - Note whether CameraDeck runs as the `cameradeck` systemd service or is
   started manually (`uv run python app.py`). Use the matching stop/start
   steps below.
@@ -104,26 +105,43 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 - The preview uses short sequential `/api/preview` JPEG requests instead of a
   long-lived browser MJPEG connection. Missing/stale frames show an error rather
   than a LIVE badge. Pending legacy clip recovery also runs in the background.
+- `GET /api/activity` (authenticated) reports whether stopping the service would
+  interrupt anything: `{"idle": true, "operations": {}}`, or `"idle": false` with
+  counts such as `capture_sequence`, `photo_capture`, `rsync_transfer`,
+  `s3_upload`, `deletion`, `download`, `zip_download`, `library_indexing`,
+  `clip_recovery`, or `power_action`. `scripts/check-idle.py` wraps it together
+  with the systemd state for step 1. If using a reverse proxy, forward the route.
 - No deployment unit, system package, Python dependency, or environment-variable
   change is required for this release.
 
 ## Update steps
 
-1. **Confirm the camera is idle.** Open the web UI and check that nothing is
-   recording, no capture sequence is running, and the Transfer page shows no
-   running rsync. If the UI has just
-   reconnected, wait until status loads before deciding. Don't continue
-   until the camera is idle.
-
-2. **Stop the running instance.**
+1. **Confirm CameraDeck is idle or stopped, then stop it.** On the Pi:
 
    ```bash
-   sudo systemctl stop cameradeck   # if installed as a service
-   # or Ctrl+C the manually-run `uv run python app.py` process
+   cd /home/pi/cameradeck
+   python3 scripts/check-idle.py && sudo systemctl stop cameradeck
    ```
 
-   Stopping while idle loses nothing, and a graceful stop finalizes any
-   recording. It also stops systemd from auto-restarting CameraDeck against
+   The script checks the `cameradeck` service state and, if it is running,
+   signs in with `CAMERADECK_PASSWORD` (from the environment or `.env`) and
+   queries `GET /api/activity` on `http://127.0.0.1:80`. It exits 0 and prints
+   `idle` or `stopped` when it is safe to continue; 1 with `busy:` and the
+   operations in progress; 2 when the service is restarting (`activating`/
+   `auto-restart`), `failed`, unreachable, or too old to report activity. Only
+   continue on exit 0; otherwise wait and re-run it later. Chaining the stop
+   leaves no window for a capture or transfer to start in between. A failed
+   service may be restarted by systemd, so investigate it rather than updating
+   over it. For a manual run on another port, pass `--url http://127.0.0.1:PORT`
+   and stop it with Ctrl+C once the check passes. Releases that predate
+   `/api/activity` can only be checked manually: in the web UI confirm no capture
+   is running, the Transfer page shows no running rsync, and no Library upload,
+   deletion or download is in progress.
+
+2. **Make sure it is stopped.** If step 1 printed `idle`, the chained command
+   stopped the service.
+
+   Stopping while idle loses nothing. It also stops systemd from auto-restarting CameraDeck against
    a half-updated checkout. Confirm nothing is left running:
 
    ```bash
@@ -208,10 +226,9 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 
 If the update causes a regression:
 
-1. If the web UI is reachable, confirm the camera is idle as in step 1.
-2. Stop CameraDeck and switch to the last known-good commit:
+1. If the service is running, check that it is idle and stop it as in step 1.
+2. Switch to the last known-good commit:
    ```bash
-   sudo systemctl stop cameradeck   # or Ctrl+C a manual run
    git log --oneline -10            # find the last known-good commit
    git checkout <previous-commit-or-tag>
    uv sync --frozen --no-dev

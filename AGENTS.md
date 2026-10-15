@@ -12,9 +12,21 @@
   `UPDATE.md`, deploy matching backend and compiled frontend, preserve the
   installed service's device-specific settings, and verify the live service,
   authenticated UI/API, and preview after updating.
-- Never interrupt an active capture to update. Check live status before stopping
-  or restarting; if capture is active, leave it running and report the update as
-  pending until it is idle. Preserve media, credentials, session keys, and ledgers.
+- Only update the running instance while it is **idle** or **stopped**. Idle
+  means nothing that stopping the service would interrupt: no photo capture or
+  capture sequence, rsync transfer, S3 upload, deletion, single or ZIP download,
+  library indexing, clip recovery, or pending shutdown/reboot. Determine this
+  with `python3 scripts/check-idle.py` (exit 0 = idle or stopped, 1 = busy,
+  2 = restarting, failed, unreachable, or undeterminable) and stop in the same
+  command so nothing can start in between:
+  `python3 scripts/check-idle.py && sudo systemctl stop cameradeck`.
+  Proceed only on exit 0. A `failed` service or one that is activating/
+  auto-restarting is not stopped: systemd may restart it, so don't update it.
+  Never infer idleness from the UI, logs, or `/api/status` alone, and never
+  stop or cancel someone else's operation to make the instance idle. If the
+  check does not pass, leave the instance untouched, finish the source changes,
+  and report the update as pending (with the script's output). Preserve media,
+  credentials, session keys, and ledgers.
 - When you make a change that affects how the software is deployed or
   updated on the Pi — dependencies, the `uv`/venv setup, `deploy/` files
   (`cameradeck.service`, `90-cameradeck-power.rules`), required system

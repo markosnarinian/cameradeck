@@ -45,6 +45,12 @@ export function Library({
     [selected, setSelected] = useState<Set<string>>(new Set()),
     [feedback, setFeedback] = useState(""),
     [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{
+    label: string;
+    done?: number;
+    total?: number;
+    detail?: string;
+  } | null>(null);
   const [viewed, setViewed] = useState<Media | null>(null),
     [dialog, setDialog] = useState<"delete" | "upload" | null>(null),
     [endpoint, setEndpoint] = useState(""),
@@ -64,6 +70,8 @@ export function Library({
     }
   });
   const anchor = useRef<{ id: string; kind: string } | null>(null),
+    pointerSelection = useRef(false),
+    operation = useRef<AbortController | null>(null),
     urls = useRef(new Set<string>());
   const scope = `${kind}:${page}:${perPage}`;
   useEffect(() => {
@@ -82,6 +90,7 @@ export function Library({
         .catch(() => {});
     return () => {
       controller.abort();
+      operation.current?.abort();
       urls.current.forEach((url) => URL.revokeObjectURL(url));
       urls.current.clear();
     };
@@ -140,24 +149,24 @@ export function Library({
         if (removing) next.delete(ident);
         else next.add(ident);
       }
-      if (next.size > 100) {
-        setFeedback(
-          "Selection limit is 100 captures. Clear some items before adding more.",
-        );
-        return;
-      }
       setSelected(next);
+      if (!e.shiftKey || (!fromAnchor && !removing))
+        anchor.current = { id, kind };
       setFeedback("");
     };
     if (e.shiftKey && fromAnchor && start < 0) {
       if (removing && !next.size) return;
-      void act(async () => {
-        const response = await request("/api/media/range", {
-          kind,
-          start: fromAnchor.id,
-          end: id,
-          ...(removing ? { ids: [...next] } : {}),
-        });
+      void act("Resolving selection", async (signal) => {
+        const response = await request(
+          "/api/media/range",
+          {
+            kind,
+            start: fromAnchor.id,
+            end: id,
+            ...(removing ? { ids: [...next] } : {}),
+          },
+          { signal, timeout: 0 },
+        );
         apply(response.ids);
       });
       return;
@@ -169,37 +178,56 @@ export function Library({
           .slice(Math.min(from, at), Math.max(from, at) + 1)
           .map((item) => item.id),
       );
-    } else {
-      anchor.current = { id, kind };
-      apply([id]);
-    }
+    } else apply([id]);
   };
   const chooseOnPointerDown = (id: string, e: MouseEvent) => {
     // macOS Control-click can open a context menu without emitting a click.
-    if (!busy && e.button === 0 && e.ctrlKey) {
+    // Remember handled gestures even if Control is released before the click.
+    pointerSelection.current = e.button === 0 && e.ctrlKey;
+    if (pointerSelection.current) {
       e.preventDefault();
-      choose(id, e);
+      if (!busy) choose(id, e);
     }
   };
-  const act = async (fn: () => Promise<void>) => {
-    if (busy) return;
+  const act = async (
+    label: string,
+    fn: (signal: AbortSignal) => Promise<void>,
+  ) => {
+    if (operation.current) return;
+    const controller = new AbortController();
+    operation.current = controller;
     setBusy(true);
+    setProgress({ label });
     setFeedback("");
+    setResult("");
     try {
-      await fn();
+      await fn(controller.signal);
     } catch (e) {
       setFeedback(message(e));
-      setResult(message(e));
+      setResult((old) => `${old ? old + "\n" : ""}${message(e)}`);
     } finally {
+      operation.current = null;
       setBusy(false);
+      setProgress(null);
     }
   };
   const download = () =>
-    act(async () => {
+    act("Preparing ZIP", async (signal) => {
       const blob = (await request(
         "/api/media/download",
         { ids: [...selected] },
-        { blob: true, timeout: 300000 },
+        {
+          blob: true,
+          signal,
+          timeout: 0,
+          onProgress: (done, total) =>
+            setProgress({
+              label: "Downloading ZIP",
+              done,
+              total,
+              detail: `${(done / 1048576).toFixed(1)}${total ? ` / ${(total / 1048576).toFixed(1)}` : ""} MiB received`,
+            }),
+        },
       )) as Blob;
       const url = URL.createObjectURL(blob);
       urls.current.add(url);
@@ -214,47 +242,96 @@ export function Library({
       setFeedback("ZIP download handed to your browser.");
     });
   const remove = () =>
-    act(async () => {
-      const response = await request("/api/media/delete", {
-        ids: [...selected],
-      });
-      const removed: string[] = [...response.deleted, ...response.missing];
-      setSelected(
-        (old) => new Set([...old].filter((id) => !removed.includes(id))),
-      );
-      if (anchor.current && removed.includes(anchor.current.id))
-        anchor.current = null;
-      setResult(
-        `${response.deleted.length} deleted; ${response.missing.length} already missing.`,
-      );
-      setRevision((n) => n + 1);
+    act("Deleting captures", async (signal) => {
+      const ids = [...selected],
+        removed = new Set<string>();
+      let deleted = 0,
+        missing = 0;
+      setProgress({ label: "Deleting captures", done: 0, total: ids.length });
+      try {
+        // Batches bound lock time and provide measured progress, not a selection cap.
+        for (let at = 0; at < ids.length; at += 100) {
+          const response = await request(
+            "/api/media/delete",
+            { ids: ids.slice(at, at + 100) },
+            { signal, timeout: 0 },
+          );
+          for (const id of [...response.deleted, ...response.missing])
+            removed.add(id);
+          deleted += response.deleted.length;
+          missing += response.missing.length;
+          setProgress({
+            label: "Deleting captures",
+            done: Math.min(at + 100, ids.length),
+            total: ids.length,
+          });
+        }
+      } finally {
+        setSelected(
+          (old) => new Set([...old].filter((id) => !removed.has(id))),
+        );
+        if (anchor.current && removed.has(anchor.current.id))
+          anchor.current = null;
+        setResult(`${deleted} deleted; ${missing} already missing.`);
+        setRevision((n) => n + 1);
+      }
     });
   const upload = () =>
-    act(async () => {
-      const response = await request(
-        "/api/media/upload",
-        { ids: [...selected], endpoint, bucket, prefix },
-        { timeout: 600000 },
-      );
-      const complete = response.results.filter((r: { status: string }) =>
-        ["uploaded", "deduplicated", "reconciled"].includes(r.status),
-      ) as { id: string; status: string }[];
-      setSelected(
-        (old) =>
-          new Set([...old].filter((id) => !complete.some((r) => r.id === id))),
-      );
-      setResult(
-        response.results
-          .map(
-            (r: { id: string; status: string; error?: string }) =>
-              `${r.id}: ${r.status}${r.error ? ` — ${r.error}` : ""}`,
-          )
-          .join("\n"),
-      );
+    act("Uploading captures", async (signal) => {
+      const ids = [...selected],
+        complete = new Set<string>(),
+        failures: string[] = [];
+      setProgress({ label: "Uploading captures", done: 0, total: ids.length });
+      try {
+        for (const [at, id] of ids.entries()) {
+          const response = await request(
+            "/api/media/upload",
+            { ids: [id], endpoint, bucket, prefix },
+            { signal, timeout: 0 },
+          );
+          for (const r of response.results) {
+            if (["uploaded", "deduplicated", "reconciled"].includes(r.status))
+              complete.add(r.id);
+            else
+              failures.push(
+                `${r.id}: ${r.status}${r.error ? ` — ${r.error}` : ""}`,
+              );
+          }
+          setProgress({
+            label: "Uploading captures",
+            done: at + 1,
+            total: ids.length,
+          });
+        }
+      } finally {
+        setSelected(
+          (old) => new Set([...old].filter((id) => !complete.has(id))),
+        );
+        setResult(
+          `${complete.size} uploaded / already present; ${failures.length} need attention.${failures.length ? "\n" + failures.join("\n") : ""}`,
+        );
+      }
     });
-  const offPage = [...selected].filter(
-    (id) => !items.some((item) => item.id === id),
-  ).length;
+  const offPage =
+    selected.size - items.filter((item) => selected.has(item.id)).length;
+  const progressBar = progress && (
+    <div className="operation-progress" role="status">
+      <span>
+        {progress.label}
+        {progress.detail
+          ? ` · ${progress.detail}`
+          : progress.total
+            ? ` · ${progress.done?.toLocaleString()} / ${progress.total.toLocaleString()} captures processed`
+            : "…"}
+      </span>
+      <progress
+        aria-label={progress.label}
+        value={progress.total ? progress.done : undefined}
+        max={progress.total ?? 1}
+      />
+      <small>Keep this page open until finished.</small>
+    </div>
+  );
   const pagination = data && !error && (
     <div className="pagination">
       <div
@@ -442,6 +519,7 @@ export function Library({
           </>
         )}
       </div>
+      {!dialog && progressBar}
       {feedback && (
         <p role="alert" className="notice">
           {feedback}
@@ -481,9 +559,9 @@ export function Library({
                   if (e.ctrlKey) e.preventDefault();
                 }}
                 onClick={(e) => {
+                  if (e.detail > 0 && pointerSelection.current) return;
                   if (e.shiftKey || e.ctrlKey || e.metaKey) {
-                    if (!busy && !(e.ctrlKey && e.detail > 0))
-                      choose(item.id, e);
+                    if (!busy) choose(item.id, e);
                   } else setViewed(item);
                 }}
                 aria-label={`Open ${item.file}`}
@@ -508,10 +586,10 @@ export function Library({
                   if (
                     !(e.target instanceof HTMLInputElement) ||
                     busy ||
-                    (e.ctrlKey && e.detail > 0)
+                    (e.detail > 0 && pointerSelection.current)
                   )
                     e.preventDefault();
-                  if (!busy && !(e.ctrlKey && e.detail > 0))
+                  if (!busy && !(e.detail > 0 && pointerSelection.current))
                     choose(item.id, e);
                 }}
               >
@@ -630,6 +708,7 @@ export function Library({
               </Button>
             </form>
           )}
+          {progressBar}
           {result && (
             <pre className="result" role="status">
               {result}

@@ -1,5 +1,6 @@
 """Real compiled React UI against synthetic Flask media, never camera hardware."""
 
+import base64
 import io
 import os
 import re
@@ -218,7 +219,7 @@ def test_library_mirrored_page_jumps(library_page):
         top.screenshot(path=str(Path(directory) / "pagination-mobile-outward.png"))
 
 
-def test_library_selection_ranges_and_limit(library_page):
+def test_library_selection_ranges_without_limit(library_page):
     page = library_page
     checks = page.get_by_role("checkbox")
     top = page.get_by_role("navigation", name="Top pagination")
@@ -321,8 +322,9 @@ def test_library_selection_ranges_and_limit(library_page):
     expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
     checks.nth(5).click(modifiers=["Shift"])
     selected([5])
+    # With no previous anchor, the first Shift-click starts the new range.
     checks.nth(8).click(modifiers=["Control", "Shift"])
-    selected([5])
+    selected([])
     checks.nth(5).click(modifiers=["Meta", "Shift"])
     selected([])
     expect(page.get_by_role("button", name="ZIP", exact=True)).to_be_disabled()
@@ -334,8 +336,9 @@ def test_library_selection_ranges_and_limit(library_page):
     top.get_by_role("button", name="Next", exact=True).click()
     expect(checks).to_have_count(21)
     checks.first.click()
-    selected([], total=100)
-    expect(page.get_by_role("alert")).to_contain_text("Selection limit is 100")
+    selected([0], total=101)
+    checks.last.click(modifiers=["Shift"])
+    selected(list(range(21)), total=121)
 
 
 def test_library_ranges_across_skipped_pages(library_page):
@@ -381,15 +384,166 @@ def test_library_ranges_across_skipped_pages(library_page):
     go(1)
     checks.first.click(modifiers=["Shift"])
     selected(list(range(20)), 85)
-    # Establish an anchor at 0, then remove a range wider than the batch limit.
+    # Establish an anchor at 0, then remove and add a range beyond the old limit.
     checks.first.click()
     go(7)
     expect(checks).to_have_count(1)
     checks.first.click(modifiers=["Control", "Shift"])
     selected([], 0)
     checks.first.click(modifiers=["Shift"])
-    expect(page.get_by_role("alert")).to_contain_text("Selection limit is 100")
-    selected([], 0)
+    selected([0], 121)
+
+
+def test_library_first_shift_click_anchors_across_pages(library_page):
+    page = library_page
+    checks = page.get_by_role("checkbox")
+    top = page.get_by_role("navigation", name="Top pagination")
+    checks.nth(35).click(modifiers=["Shift"])
+    top.get_by_role("button", name="Next 2 pages", exact=True).click()
+    expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
+    pending = []
+    page.route("**/api/media/range", lambda route: pending.append(route))
+    checks.nth(4).click(modifiers=["Shift"])
+    expect(
+        page.get_by_role("progressbar", name="Resolving selection")
+    ).not_to_have_attribute("value")
+    expect(page.get_by_role("button", name="Clear", exact=True)).to_be_disabled()
+    screenshot(page, "library-selection-progress", full_page=False)
+    pending.pop(0).continue_()
+    page.unroute("**/api/media/range")
+    expect(page.locator(".selection-bar > span")).to_contain_text("50 selected")
+    expect(page.locator(".media-card input:checked")).to_have_count(5)
+    top.get_by_role("button", name="Previous", exact=True).click()
+    expect(page.get_by_role("button", name="Refresh")).to_be_enabled()
+    expect(page.locator(".media-card input:checked")).to_have_count(40)
+
+
+def test_library_delete_progress_and_partial_failure(library_page):
+    page = library_page
+    checks = page.get_by_role("checkbox")
+    checks.first.click()
+    top = page.get_by_role("navigation", name="Top pagination")
+    top.get_by_role("button", name="Last", exact=True).click()
+    expect(checks).to_have_count(1)
+    checks.first.click(modifiers=["Shift"])
+    expect(page.locator(".selection-bar > span")).to_contain_text("121 selected")
+    pending = []
+    page.route("**/api/media/delete", lambda route: pending.append(route))
+    page.get_by_role("button", name="Delete", exact=True).click()
+    page.get_by_role("button", name="Confirm deletion").click()
+    progress = page.get_by_role("progressbar", name="Deleting captures")
+    expect(progress).to_have_attribute("value", "0")
+    expect(progress).to_have_attribute("max", "121")
+    first = pending.pop(0)
+    first.fulfill(response=first.fetch())
+    expect(progress).to_have_attribute("value", "100")
+    screenshot(page, "library-delete-progress", full_page=False)
+    pending.pop(0).fulfill(status=503, json={"error": "Synthetic delete failure"})
+    expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text(
+        "100 deleted; 0 already missing.\nSynthetic delete failure"
+    )
+    expect(page.locator(".selection-bar > span")).to_contain_text("21 selected")
+    page.keyboard.press("Escape")
+    expect(checks).to_have_count(21)
+    expect(page.locator(".media-card input:checked")).to_have_count(21)
+    page.unroute("**/api/media/delete")
+    page.get_by_role("button", name="Delete", exact=True).click()
+    page.get_by_role("button", name="Confirm deletion").click()
+    expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text(
+        "21 deleted"
+    )
+    expect(page.locator(".selection-bar > span")).to_contain_text("0 selected")
+    page.keyboard.press("Escape")
+    expect(page.locator(".media-card")).to_have_count(0)
+
+
+def test_library_zip_preparation_and_byte_progress(library_page, tmp_path):
+    page = library_page
+    base = page.url.split("/library")[0]
+    checks = page.get_by_role("checkbox")
+    checks.first.click()
+    page.get_by_role("navigation", name="Top pagination").get_by_role(
+        "button", name="Last", exact=True
+    ).click()
+    expect(checks).to_have_count(1)
+    checks.first.click(modifiers=["Shift"])
+    expect(page.locator(".selection-bar > span")).to_contain_text("121 selected")
+    screenshot(page, "library-unlimited-selection", full_page=False)
+    ids = []
+    for number in (1, 2):
+        ids.extend(
+            item["id"]
+            for item in page.request.get(
+                base + f"/api/media?per_page=100&page={number}"
+            ).json()["items"]
+        )
+    archive = page.request.post(base + "/api/media/download", data={"ids": ids}).body()
+    # Deliver the real archive in controlled chunks, exercising the browser's
+    # ReadableStream without depending on loopback transfer speed.
+    page.evaluate(
+        """encoded => {
+      const bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+      const fetch = window.fetch;
+      window.fetch = (url, options) => url !== '/api/media/download'
+        ? fetch(url, options)
+        : new Promise(resolve => {
+          window.beginZIP = () => resolve(new Response(new ReadableStream({
+            start(controller) {
+              const middle = Math.floor(bytes.length / 2);
+              controller.enqueue(bytes.slice(0, middle));
+              window.finishZIP = () => {
+                controller.enqueue(bytes.slice(middle));
+                controller.close();
+              };
+            }
+          }), { headers: { 'Content-Length': String(bytes.length), 'Content-Type': 'application/zip' } }));
+        });
+    }""",
+        base64.b64encode(archive).decode(),
+    )
+    page.get_by_role("button", name="ZIP", exact=True).click()
+    expect(page.get_by_role("progressbar", name="Preparing ZIP")).not_to_have_attribute(
+        "value"
+    )
+    screenshot(page, "library-zip-preparation", full_page=False)
+    page.evaluate("window.beginZIP()")
+    progress = page.get_by_role("progressbar", name="Downloading ZIP")
+    expect(progress).to_have_attribute("value", str(len(archive) // 2))
+    expect(progress).to_have_attribute("max", str(len(archive)))
+    screenshot(page, "library-zip-transfer", full_page=False)
+    with page.expect_download() as downloaded:
+        page.evaluate("window.finishZIP()")
+    output = tmp_path / "download.zip"
+    downloaded.value.save_as(output)
+    assert output.read_bytes() == archive
+    expect(page.get_by_role("progressbar")).to_have_count(0)
+
+
+@pytest.mark.parametrize("target", ["checkbox", "date", "thumbnail"])
+def test_library_modifier_changes_during_click(library_page, target):
+    page = library_page
+    control = {
+        "checkbox": page.get_by_role("checkbox"),
+        "date": page.locator(".select-label span"),
+        "thumbnail": page.locator(".thumbnail"),
+    }[target]
+    control.nth(2).hover()
+    page.keyboard.down("Control")
+    page.mouse.down()
+    page.keyboard.up("Control")
+    page.mouse.up()
+    expect(page.locator(".selection-bar > span")).to_contain_text("1 selected")
+    expect(page.get_by_role("checkbox").nth(2)).to_be_checked()
+    expect(page.get_by_role("dialog")).not_to_be_visible()
+    # Conversely, Control may be pressed after pointer-down but before the click.
+    control.nth(5).hover()
+    page.mouse.down()
+    page.keyboard.down("Control")
+    page.mouse.up()
+    page.keyboard.up("Control")
+    expect(page.locator(".selection-bar > span")).to_contain_text("2 selected")
+    expect(page.get_by_role("checkbox").nth(5)).to_be_checked()
+    expect(page.get_by_role("dialog")).not_to_be_visible()
 
 
 def test_library_session_reload_recovery_and_settings(library_page):
@@ -450,11 +604,11 @@ def test_transfer_rsync_and_optional_upload(library_page):
             :3
         ]
     ]
-    payloads = []
+    payloads, pending = [], []
 
     def upload(route):
         payloads.append(route.request.post_data_json)
-        route.fulfill(json={"results": [{"id": ids[0], "status": "uploaded"}]})
+        pending.append(route)
 
     page.route("**/api/media/upload", upload)
     checks.first.click()
@@ -469,14 +623,26 @@ def test_transfer_rsync_and_optional_upload(library_page):
     page.get_by_label("Bucket", exact=True).fill("test-bucket")
     page.get_by_label("Prefix", exact=True).fill("photos/")
     page.get_by_role("button", name="Confirm upload").click()
-    expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text("uploaded")
+    progress = page.get_by_role("progressbar", name="Uploading captures")
+    expect(progress).to_have_attribute("value", "0")
+    expect(progress).to_have_attribute("max", "3")
+    pending.pop(0).fulfill(json={"results": [{"id": ids[0], "status": "uploaded"}]})
+    expect(progress).to_have_attribute("value", "1")
+    screenshot(page, "library-upload-progress-mobile", full_page=False)
+    pending.pop(0).fulfill(json={"results": [{"id": ids[1], "status": "uncertain"}]})
+    expect(progress).to_have_attribute("value", "2")
+    pending.pop(0).fulfill(json={"results": [{"id": ids[2], "status": "error"}]})
+    expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text(
+        "1 uploaded / already present; 2 need attention."
+    )
     assert payloads == [
         {
-            "ids": ids,
+            "ids": [ident],
             "endpoint": "http://192.168.1.10:3900",
             "bucket": "test-bucket",
             "prefix": "photos/",
         }
+        for ident in ids
     ]
     page.keyboard.press("Escape")
     expect(page.locator(".selection-bar > span")).to_contain_text("2 selected")

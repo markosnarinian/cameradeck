@@ -105,7 +105,7 @@ class MediaCatalog:
             index_error=self.error,
         )
 
-    def range(self, kind, start, end, limit, identifiers=None):
+    def range(self, kind, start, end, identifiers=None):
         if self.indexing:
             raise ValueError("Library indexing is still in progress. Try again later.")
         where = " AND kind = ?" if kind != "all" else ""
@@ -124,15 +124,11 @@ class MediaCatalog:
                 low, high = sorted((start, end))
                 query = "SELECT id FROM media WHERE id BETWEEN ? AND ?" + where
                 values = (low, high, *args)
-                if identifiers is not None:
-                    query += " AND id IN (" + ",".join("?" for _ in identifiers) + ")"
-                    values += tuple(identifiers)
-                rows = self.reader.execute(
-                    query + " ORDER BY id DESC LIMIT ?", (*values, limit + 1)
-                ).fetchall()
-                if len(rows) > limit:
-                    raise ValueError(f"Selection limit is {limit} captures.")
-                return [row[0] for row in rows]
+                selected = set(identifiers) if identifiers is not None else None
+                rows = self.reader.execute(query + " ORDER BY id DESC", values)
+                return [
+                    row[0] for row in rows if selected is None or row[0] in selected
+                ]
             finally:
                 self.reader.rollback()
 

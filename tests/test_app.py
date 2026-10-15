@@ -102,6 +102,13 @@ def test_authentication_and_origin(deck, app_factory):
     assert client.get("/api/session").json == {"authenticated": False, "required": True}
     for route in ["/api/status", "/api/media", "/stream.mjpg", "/media/test/original"]:
         assert client.get(route).status_code == 401
+    # Reject unauthenticated Library bodies before parsing unbounded JSON.
+    assert (
+        client.post(
+            "/api/media/delete", data="x" * 20000, content_type="application/json"
+        ).status_code
+        == 401
+    )
     for route in ("/", "/library", "/transfer"):
         assert client.get(route).status_code == 200
     assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
@@ -437,9 +444,9 @@ def test_page_pagination_validation_and_clamping(deck, client):
     assert client.get("/api/media?kind=unknown").status_code == 400
 
 
-def test_library_range_ids_filter_and_limit(deck, client):
+def test_library_range_ids_filter_without_selection_limit(deck, client):
     ids = []
-    for index in range(102):
+    for index in range(640):
         entry = make_media(deck, ident=f"20260916_120000_{index:08x}")
         ids.append(entry["id"])
         if index == 50:
@@ -459,9 +466,9 @@ def test_library_range_ids_filter_and_limit(deck, client):
         ]
     assert resolve(ids[20], ids[20]).json["ids"] == [ids[20]]
     assert len(resolve(ids[0], ids[99]).json["ids"]) == 100
-    oversized = resolve(ids[0], ids[100])
-    assert oversized.status_code == 400
-    assert "Selection limit is 100" in oversized.json["error"]
+    assert resolve(ids[0], ids[-1]).json["ids"] == list(reversed(ids))
+    # The selected-ID request also exceeds the old 16 KiB body limit.
+    assert resolve(ids[0], ids[-1], ids=ids).json["ids"] == list(reversed(ids))
     assert resolve(
         ids[0], ids[101], kind="still", ids=[ids[20], ids[50], ids[60]]
     ).json["ids"] == [ids[60], ids[20]]
@@ -476,36 +483,50 @@ def test_library_range_ids_filter_and_limit(deck, client):
     assert "no longer available" in missing.json["error"]
 
 
-def test_bulk_download_and_delete(deck, client):
+def test_bulk_download_and_delete(deck, client, tmp_path, monkeypatch):
     import zipfile
 
+    archives = tmp_path / "archives"
+    archives.mkdir()
+    monkeypatch.setattr("tempfile.tempdir", str(archives))
     first, second = make_media(deck, b"first"), make_media(deck, b"second")
-    response = client.post(
-        "/api/media/download", json={"ids": [first["id"], second["id"]]}
-    )
+    entries = [first, second] + [make_media(deck) for _ in range(638)]
+    ids = [entry["id"] for entry in entries]
+    response = client.post("/api/media/download", json={"ids": ids})
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
         assert archive.read(f'{first["id"]}/{first["file"]}') == b"first"
         assert archive.read(f'{second["id"]}/{second["id"]}.json')
-    deleted = client.post(
-        "/api/media/delete", json={"ids": [first["id"], second["id"], first["id"]]}
-    ).json
-    assert deleted["deleted"] == [first["id"], second["id"]]
-    for item in (first, second):
+        assert set(archive.namelist()) == {
+            f'{entry["id"]}/{name}'
+            for entry in entries
+            for name in (entry["file"], entry["id"] + ".json")
+        }
+    response.close()
+    assert not list(archives.iterdir())
+    interrupted = client.post("/api/media/download", json={"ids": ids}, buffered=False)
+    chunk = next(iter(interrupted.response))
+    assert 0 < len(chunk) < int(interrupted.headers["Content-Length"])
+    interrupted.close()
+    assert not list(archives.iterdir())
+    deleted = client.post("/api/media/delete", json={"ids": [*ids, first["id"]]}).json
+    assert deleted["deleted"] == ids
+    assert client.get("/api/media").json["total"] == 0
+    for item in entries:
         assert not list(deck.root.glob(item["id"] + ".*"))
     assert (
         client.post("/api/media/delete", json={"ids": ["../../etc"]}).status_code == 400
     )
-    assert (
-        client.post(
-            "/api/media/delete", json={"ids": ["20260907_100000_12345678"] * 101}
-        ).status_code
-        == 400
+    missing = client.post(
+        "/api/media/delete", json={"ids": ["20260907_100000_12345678"] * 640}
     )
+    assert missing.json == {"deleted": [], "missing": ["20260907_100000_12345678"]}
+    assert client.post("/api/login", json={"password": "x" * 20000}).status_code == 413
 
 
 def test_upload_route_settings_and_validation(deck, app_factory):
     media = make_media(deck)
+    ids = [media["id"], *[make_media(deck)["id"] for _ in range(639)]]
     uploader = Mock()
     uploader.upload.return_value = {
         "status": "uploaded",
@@ -521,14 +542,14 @@ def test_upload_route_settings_and_validation(deck, app_factory):
     response = client.post(
         "/api/media/upload",
         json={
-            "ids": [media["id"]],
+            "ids": ids,
             "endpoint": "https://objects.example.org",
             "bucket": "camera-archive",
             "prefix": "trip/one",
         },
     )
-    assert response.json["results"][0]["status"] == "uploaded"
-    uploader.upload.assert_called_once()
+    assert [result["id"] for result in response.json["results"]] == ids
+    assert {result["status"] for result in response.json["results"]} == {"uploaded"}
     assert (
         client.post(
             "/api/media/upload",

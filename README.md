@@ -93,14 +93,24 @@ Pagination appears above and below the grid. Mirrored jumps go 1, 2, 3, 5, 10,
 the center. Overshooting clamps to the first or last page.
 
 Checkbox click toggles one item and establishes a range anchor. Shift adds an
-inclusive range; Ctrl/Command+Shift removes it. Shift does not move the anchor.
+inclusive range; Ctrl/Command+Shift removes it. Shift does not move an existing
+anchor; if there is none, the first Shift-click that adds an item establishes it.
 These shortcuts work on the checkbox, date label, or thumbnail. A plain thumbnail
 click still opens the viewer; Ctrl/Command-click toggles one item without opening it.
 Ranges span pages, including skipped pages, and survive changes to items per page.
 Changing the kind filter resets the anchor, but selected IDs persist across
-pages/filters; off-page selections are counted explicitly. Select no more than
-100 items for one bulk operation. An oversized range leaves selection unchanged;
-range deselection can span any number of items.
+pages/filters; off-page selections are counted explicitly. There is no capture-count
+limit on selection, ZIP download, deletion, or S3 upload. Pagination still shows at
+most 100 items per page; it does not limit selection across pages.
+
+Long operations show a progress bar. Deletion reports completed batches and S3
+upload reports captures processed, leaving failed/uncertain items selected for
+inspection or retry. Range resolution and ZIP preparation show an indeterminate
+bar; once the ZIP is ready, transfer progress measures bytes received. These
+operations have no fixed browser request timeout. Keep the page open until the
+operation finishes: leaving stops subsequent batches, but an in-flight server
+request may still complete. Large ZIPs need temporary disk space on the Pi and
+enough memory in the browser; use rsync for very large transfers.
 
 Completed JSON sidecars are the recovery source of truth. A persistent
 `.library.sqlite3` catalog provides indexed counts and pagination; HTTP requests

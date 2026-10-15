@@ -46,7 +46,15 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 - Library Shift-click ranges now span pages, including skipped pages. Restart
   the Python service with the matching frontend: off-page ranges use the new
   read-only `POST /api/media/range` endpoint. Reload existing browser tabs after
-  updating. The 100-item selection limit remains; no migration is required.
+  updating. Selection and bulk actions no longer have a capture-count limit.
+  The matching backend also accepts Library ID lists larger than 16 KiB. If using
+  a reverse proxy, allow large JSON bodies on `/api/media/range`,
+  `/api/media/download`, `/api/media/delete`, and `/api/media/upload`, and allow long
+  requests while a ZIP is prepared or transferred. Progress bars show completed
+  deletion batches, processed uploads, and ZIP bytes received; preparation and
+  range resolution are indeterminate. Keep the browser page open until finished.
+  Large ZIPs still require temporary Pi disk space and browser memory; rsync is
+  preferable for very large transfers. No migration or dependency change is required.
 - Exposure time and gain now have independent Auto/Manual selectors, including
   shutter-priority (manual exposure, auto gain) and gain-priority (auto exposure,
   manual gain). No camera-stack upgrade is required: newer libcamera uses the

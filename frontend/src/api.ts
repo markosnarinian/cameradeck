@@ -5,13 +5,21 @@ export function onUnauthorized(callback: () => void) {
 export async function request(
   path: string,
   body?: unknown,
-  options: { signal?: AbortSignal; timeout?: number; blob?: boolean } = {},
+  options: {
+    signal?: AbortSignal;
+    timeout?: number;
+    blob?: boolean;
+    onProgress?: (received: number, total?: number) => void;
+  } = {},
 ) {
   const controller = new AbortController();
   const abort = () => controller.abort();
   options.signal?.addEventListener("abort", abort, { once: true });
   if (options.signal?.aborted) controller.abort();
-  const timer = setTimeout(abort, options.timeout ?? 15000);
+  const timer =
+    options.timeout === 0
+      ? undefined
+      : setTimeout(abort, options.timeout ?? 15000);
   try {
     const response = await fetch(path, {
       method: body === undefined ? "GET" : "POST",
@@ -29,6 +37,23 @@ export async function request(
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.error || `Request failed (${response.status})`);
+    }
+    if (options.blob && options.onProgress && response.body) {
+      const total = Number(response.headers.get("Content-Length")) || undefined;
+      const reader = response.body.getReader();
+      const chunks: BlobPart[] = [];
+      let received = 0;
+      options.onProgress(received, total);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        options.onProgress(received, total);
+      }
+      return new Blob(chunks, {
+        type: response.headers.get("Content-Type") ?? "",
+      });
     }
     return options.blob ? await response.blob() : await response.json();
   } catch (error) {

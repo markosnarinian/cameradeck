@@ -33,7 +33,6 @@ from catalog import ID, MediaCatalog
 from power import PowerManager
 
 BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
-MAX_BATCH = 100
 
 
 def normalize_endpoint(value):
@@ -90,7 +89,6 @@ def create_app(
         app.secret_key.encode(), password.encode(), "sha256"
     ).hexdigest()
     app.config.update(
-        MAX_CONTENT_LENGTH=16384,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
         PERMANENT_SESSION_LIFETIME=timedelta(days=7),
@@ -111,6 +109,13 @@ def create_app(
 
     @app.before_request
     def protect():
+        if request.path not in {
+            "/api/media/range",
+            "/api/media/download",
+            "/api/media/delete",
+            "/api/media/upload",
+        }:
+            request.max_content_length = 16384
         if not password and urlsplit(request.host_url).hostname not in {
             "localhost",
             "127.0.0.1",
@@ -124,10 +129,6 @@ def create_app(
                 or urlsplit(origin).scheme != request.scheme
             ):
                 abort(403)
-            if request.method != "DELETE" and (
-                not request.is_json or not isinstance(request.get_json(), dict)
-            ):
-                raise ValueError("Supply a JSON object.")
         if (
             not authenticated()
             and request.path
@@ -142,6 +143,10 @@ def create_app(
             and not request.path.startswith("/assets/")
         ):
             return jsonify(error="Unlock CameraDeck to continue."), 401
+        if request.method not in {"GET", "HEAD", "OPTIONS", "DELETE"} and (
+            not request.is_json or not isinstance(request.get_json(), dict)
+        ):
+            raise ValueError("Supply a JSON object.")
 
     @app.after_request
     def headers(response):
@@ -352,8 +357,6 @@ def create_app(
         identifiers = request.get_json().get("ids")
         if not isinstance(identifiers, list) or not identifiers:
             raise ValueError("Select at least one library item.")
-        if len(identifiers) > MAX_BATCH:
-            raise ValueError(f"Select no more than {MAX_BATCH} items at once.")
         if any(
             not isinstance(ident, str) or not ID.fullmatch(ident)
             for ident in identifiers
@@ -393,7 +396,7 @@ def create_app(
         ):
             raise ValueError("One or more media IDs are invalid.")
         identifiers = ids_from_request() if "ids" in body else None
-        return jsonify(ids=catalog.range(kind, start, end, MAX_BATCH, identifiers))
+        return jsonify(ids=catalog.range(kind, start, end, identifiers))
 
     @app.get("/api/media/<ident>")
     def detail(ident):
@@ -454,8 +457,8 @@ def create_app(
                     missing.append(ident)
                 else:
                     raise
-        with deck.lock, catalog.lock:
-            for ident, entry, original in entries:
+        for ident, entry, original in entries:
+            with deck.lock, catalog.lock:
                 for name in [
                     original.name,
                     ident + ".thumb.jpg",
@@ -487,6 +490,8 @@ def create_app(
                 download_name="cameradeck-media.zip",
                 max_age=0,
             )
+            # Keep Response.close in the WSGI iterator's cleanup path.
+            response.direct_passthrough = False
             response.call_on_close(lambda: Path(temporary.name).unlink(missing_ok=True))
             return response
         except Exception:

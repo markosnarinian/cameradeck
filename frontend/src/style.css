@@ -512,6 +512,77 @@ select {
     14px/1.8 ui-monospace,
     monospace;
 }
+.rsync-command-wrap {
+  position: relative;
+}
+.rsync-command-wrap .rsync-command {
+  padding-right: 130px;
+}
+.rsync-copy {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+@media (max-width: 640px) {
+  .rsync-command-wrap .rsync-command {
+    padding-right: 20px;
+    padding-top: 64px;
+  }
+}
+.transfer-section .muted {
+  color: var(--muted);
+  font-size: 14px;
+}
+.transfer-section code {
+  overflow-wrap: anywhere;
+}
+.rsync-run {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+}
+.rsync-destination-field {
+  display: grid;
+  flex: 1;
+  gap: 8px;
+  font-size: 14px;
+}
+.rsync-status {
+  position: static;
+}
+.rsync-status details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 14px;
+}
+.rsync-destination {
+  overflow-wrap: anywhere;
+}
+.rsync-log {
+  max-height: 320px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 14px;
+  background: #121518;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font:
+    12px/1.6 ui-monospace,
+    monospace;
+}
+.rsync-setup summary {
+  cursor: pointer;
+  padding: 8px 0;
+  font-weight: 600;
+}
+@media (max-width: 640px) {
+  .rsync-run {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
 .auth {
   max-width: 440px;
   margin: 14vh auto;

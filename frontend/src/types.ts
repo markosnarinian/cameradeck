@@ -25,6 +25,35 @@ export type Status = {
     settings?: { rate?: number };
   };
   sequence_settings?: { burst?: { rate: number } };
+  transfer_active?: boolean;
+};
+export type RsyncJob = {
+  destination: string;
+  command: string;
+  started: string;
+  finished: string | null;
+  elapsed: number;
+  exit_code: number | null;
+  message: string;
+  progress: {
+    transferred: string;
+    percent: number;
+    rate: string;
+    eta: string;
+    files: number | null;
+    remaining: number | null;
+    total: number | null;
+    scanning: boolean;
+  } | null;
+  log: string[];
+};
+export type RsyncStatus = {
+  state: "idle" | "running" | "stopping" | "succeeded" | "failed" | "cancelled";
+  active: boolean;
+  destination: string;
+  source: string;
+  public_key: string | null;
+  job: RsyncJob | null;
 };
 export type Media = {
   id: string;

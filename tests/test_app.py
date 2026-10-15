@@ -19,6 +19,7 @@ from PIL import Image
 from app import ID, create_app
 from camera import BurstSampler, CameraDeck, validate_controls, yuv420_planes
 from storage import S3Uploader
+from transfer import RsyncTransfer
 
 
 @pytest.fixture
@@ -586,6 +587,98 @@ def test_power_actions_are_fixed_confirmed_and_block_sequence(deck, app_factory)
         ).status_code
         == 409
     )
+
+
+def wait_for_rsync(client, timeout=20):
+    deadline = time.monotonic() + timeout
+    while (status := client.get("/api/transfer/rsync").json)["active"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    return status
+
+
+def test_rsync_from_cameradeck_copies_originals_and_metadata(
+    deck, app_factory, tmp_path
+):
+    deck.root = tmp_path / "media"
+    deck.root.mkdir()
+    client = app_factory(deck).test_client()
+    item = make_media(deck, b"x" * 300000)
+    (deck.root / ".session-key").chmod(0o600)
+    (deck.root / "partial.jpg.tmp").write_bytes(b"tmp")
+    (deck.root / "clip.pending.json").write_text("{}")
+    target = tmp_path / "copy"
+    target.mkdir()
+    for bad in ("-e sh", str(deck.root / "sub"), "relative/path", "host::module"):
+        response = client.post("/api/transfer/rsync/start", json={"destination": bad})
+        assert response.status_code == 400, bad
+    response = client.post(
+        "/api/transfer/rsync/start", json={"destination": str(target)}
+    )
+    assert response.status_code == 202
+    status = wait_for_rsync(client)
+    assert status["state"] == "succeeded", status
+    assert status["job"]["exit_code"] == 0
+    assert status["job"]["progress"]["percent"] == 100
+    assert {p.name for p in target.iterdir()} == {item["file"], item["id"] + ".json"}
+    assert (target / item["file"]).read_bytes() == b"x" * 300000
+    # The last destination is remembered, inside the excluded hidden namespace.
+    assert app_factory(deck).test_client().get(
+        "/api/transfer/rsync"
+    ).json["destination"] == str(target)
+
+
+def test_rsync_stop_and_capture_exclusion(deck, app_factory, tmp_path):
+    fake = tmp_path / "fake-rsync"
+    fake.write_text(
+        "#!/bin/sh\nprintf '  1.00M  12%%   2.00MB/s    0:00:30 (xfr#3, ir-chk=10/40)\\r'"
+        "\necho 'sending incremental file list'\nexec sleep 30\n"
+    )
+    fake.chmod(0o755)
+    rsync = RsyncTransfer(deck.root, rsync=str(fake))
+    client = app_factory(deck, rsync=rsync).test_client()
+    deck.sequence = {"active": True}
+    response = client.post(
+        "/api/transfer/rsync/start", json={"destination": "me@mac.local:/Volumes/WD APFS/x/"}
+    )
+    assert response.status_code == 409
+    deck.sequence = None
+    assert (
+        client.post(
+            "/api/transfer/rsync/start", json={"destination": "me@mac.local:/Volumes/WD APFS/x/"}
+        ).status_code
+        == 202
+    )
+    deadline = time.monotonic() + 5
+    while not (status := client.get("/api/transfer/rsync").json)["job"]["progress"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    assert status["job"]["progress"] == {
+        "transferred": "1.00M",
+        "percent": 12,
+        "rate": "2.00MB/s",
+        "eta": "0:00:30",
+        "files": 3,
+        "remaining": 10,
+        "total": 40,
+        "scanning": True,
+    }
+    assert client.get("/api/status").json["transfer_active"] is True
+    assert client.post(
+        "/api/transfer/rsync/start", json={"destination": "me@mac.local:/x/"}
+    ).status_code == 409
+    started = client.post(
+        "/api/sequence/start", json={"mode": "burst", "settings": {}}
+    )
+    assert started.status_code == 409 and "rsync" in started.json["error"]
+    assert client.post(
+        "/api/system/power", json={"action": "reboot", "confirm": "reboot"}
+    ).status_code == 409
+    assert client.post("/api/transfer/rsync/stop", json={}).json["state"] == "stopping"
+    status = wait_for_rsync(client, 5)
+    assert status["state"] == "cancelled"
+    assert "sending incremental file list" in status["job"]["log"]
+    assert client.get("/api/status").json["transfer_active"] is False
 
 
 class FakeS3:

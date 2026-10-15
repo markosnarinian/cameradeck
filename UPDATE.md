@@ -73,6 +73,18 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   previews, thumbnails, and temporary/pending sidecars as shown in `README.md`.
   Never copy the private `.session-key` to a shared destination. `--ignore-existing`
   does not repair previously copied incomplete files.
+- `/transfer` can now run and supervise rsync on the Pi (**rsync from
+  CameraDeck**), pushing to an SSH destination or a local directory. It needs
+  the `rsync` system package on the Pi (`sudo apt install rsync` if
+  `rsync --version` fails) and on the destination. For SSH destinations,
+  the service user (`pi`) also needs a key that logs in without a prompt and
+  an accepted host key; see README's "Run rsync from CameraDeck". A run is
+  stopped when the service stops, so treat an active transfer like an active
+  capture in step 1. Check `GET /api/transfer/rsync` (`"active": false`) or the
+  Transfer page before stopping. The last destination is stored in
+  `.rsync-destination` in the media directory; keep it with the other hidden files.
+  No unit file or environment change is required. If you use a reverse proxy,
+  forward the new `/api/transfer/rsync` routes.
 - On startup, `.library.sqlite3` is created inside the media directory. Existing
   completed sidecars are imported **in the background**. The Library labels
   results/counts incomplete until indexing finishes; do not interpret an early
@@ -98,7 +110,8 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 ## Update steps
 
 1. **Confirm the camera is idle.** Open the web UI and check that nothing is
-   recording and no capture sequence is running. If the UI has just
+   recording, no capture sequence is running, and the Transfer page shows no
+   running rsync. If the UI has just
    reconnected, wait until status loads before deciding. Don't continue
    until the camera is idle.
 

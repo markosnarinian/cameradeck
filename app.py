@@ -31,6 +31,7 @@ from flask import (
 from camera import CameraDeck
 from catalog import ID, MediaCatalog
 from power import PowerManager
+from transfer import Busy, RsyncTransfer, public_key
 
 BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
@@ -69,6 +70,7 @@ def create_app(
     uploader=None,
     power_manager=None,
     s3_endpoint="http://192.168.1.10:3900",
+    rsync=None,
 ):
     app = Flask(__name__, static_folder=None)
     frontend = Path(__file__).parent / "static" / "dist"
@@ -103,6 +105,8 @@ def create_app(
     catalog.start()
     power_manager = power_manager or PowerManager()
     configured_endpoint = normalize_endpoint(s3_endpoint)
+    rsync = rsync or RsyncTransfer(deck.root)
+    app.extensions["rsync"] = rsync
 
     def authenticated():
         return not password or session.get("authenticated") == authentication
@@ -221,7 +225,7 @@ def create_app(
 
     @app.get("/api/status")
     def status():
-        return jsonify(deck.status())
+        return jsonify({**deck.status(), "transfer_active": rsync.active})
 
     ATHENS = ZoneInfo("Europe/Athens")
 
@@ -271,7 +275,16 @@ def create_app(
     @app.post("/api/sequence/start")
     def sequence_start():
         data = request.get_json()
-        return jsonify(deck.start_sequence(data.get("mode"), data.get("settings", {})))
+        # deck.lock is shared with rsync start so neither can slip past the other.
+        with deck.lock:
+            if rsync.active:
+                return (
+                    jsonify(error="Stop the rsync transfer before starting capture."),
+                    409,
+                )
+            return jsonify(
+                deck.start_sequence(data.get("mode"), data.get("settings", {}))
+            )
 
     @app.post("/api/sequence/stop")
     def sequence_stop():
@@ -539,6 +552,25 @@ def create_app(
             results.append({"id": ident, **value})
         return jsonify(results=results)
 
+    @app.get("/api/transfer/rsync")
+    def rsync_status():
+        return jsonify({**rsync.status(), "public_key": public_key()})
+
+    @app.post("/api/transfer/rsync/start")
+    def rsync_start():
+        destination = request.get_json().get("destination")
+        with deck.lock:
+            if deck.sequence and deck.sequence["active"]:
+                return jsonify(error="Stop capture before starting rsync."), 409
+            try:
+                return jsonify(rsync.start(destination)), 202
+            except Busy as exc:
+                return jsonify(error=str(exc)), 409
+
+    @app.post("/api/transfer/rsync/stop")
+    def rsync_stop():
+        return jsonify(rsync.stop())
+
     @app.post("/api/system/power")
     def system_power():
         data = request.get_json()
@@ -553,6 +585,8 @@ def create_app(
                 jsonify(error="Stop the capture sequence before changing Pi power."),
                 409,
             )
+        if rsync.active:
+            return jsonify(error="Stop the rsync transfer before changing Pi power."), 409
         try:
             power_manager.schedule(action)
         except RuntimeError as exc:
@@ -585,6 +619,7 @@ def main():
     deck.start()
 
     def stop(*_):
+        app.extensions["rsync"].close()
         deck.close()
         raise SystemExit(0)
 
@@ -601,6 +636,7 @@ def main():
             threads=12,
         )
     finally:
+        app.extensions["rsync"].close()
         deck.close()
         app.extensions["catalog"].close()
 

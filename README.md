@@ -107,7 +107,11 @@ Long operations show a progress bar. Deletion reports completed batches and S3
 upload reports captures processed, leaving failed/uncertain items selected for
 inspection or retry. Range resolution and ZIP preparation show an indeterminate
 bar; once the ZIP is ready, transfer progress measures bytes received. These
-operations have no fixed browser request timeout. Keep the page open until the
+measurable operations also show ETA based on average speed so far; estimates
+adjust as work progresses. ETA is unavailable during range resolution and ZIP
+preparation, whose total work is unknown. Deletion uses 100-capture requests for
+progress checkpoints, not a total limit; backend locks are released per capture.
+These operations have no fixed browser request timeout. Keep the page open until the
 operation finishes: leaving stops subsequent batches, but an in-flight server
 request may still complete. Large ZIPs need temporary disk space on the Pi and
 enough memory in the browser; use rsync for very large transfers.
@@ -153,6 +157,37 @@ not previews/thumbnails or internal files such as `.session-key` (private),
 It never deletes the source. `--ignore-existing` skips destination files even
 if incomplete or corrupted; inspect and repair any files copied during capture
 before using this command again. Keep originals on the Pi until the copy is verified.
+
+### Run rsync from CameraDeck
+
+The Transfer page can also have the Pi push the same files itself, so the copy
+is started, watched and stopped from the browser. Under **rsync from
+CameraDeck**, enter a destination and press **Start rsync**:
+
+- `user@mac.local:/Volumes/WD APFS/Faros-OTA/boxed/` over SSH, or
+- an existing absolute directory on the Pi (for example a mounted USB drive),
+  outside the media directory.
+
+It runs the same flags and exclusions as the Mac command, with the Pi as the
+source, plus an I/O timeout. The page shows progress, rate, ETA, files copied,
+the exact command and the log tail, and can stop the run. One run at a time is
+allowed. rsync cannot start during capture, and capture and Pi power actions
+are refused while it runs. It continues if the browser leaves; restarting or
+stopping CameraDeck stops it. The last destination is remembered in the hidden
+`.rsync-destination` file in the media directory.
+
+SSH runs non-interactively (`BatchMode`), so a password or host-key prompt fails
+the run instead of hanging. Set it up once on the Pi as the CameraDeck user:
+
+```bash
+ssh-keygen -t ed25519            # if ~/.ssh has no key yet
+ssh-copy-id user@mac.local       # or paste the key shown on the Transfer page
+ssh user@mac.local true          # accept the host key
+```
+
+On the Mac, enable **System Settings → General → Sharing → Remote Login**, and
+for external volumes, allow full disk access for remote users. The Mac's
+built-in rsync is enough on the receiving side.
 
 ### Optional S3-compatible upload
 

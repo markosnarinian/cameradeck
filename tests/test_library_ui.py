@@ -407,6 +407,7 @@ def test_library_first_shift_click_anchors_across_pages(library_page):
     expect(
         page.get_by_role("progressbar", name="Resolving selection")
     ).not_to_have_attribute("value")
+    expect(page.locator(".operation-progress small")).to_contain_text("ETA unavailable")
     expect(page.get_by_role("button", name="Clear", exact=True)).to_be_disabled()
     screenshot(page, "library-selection-progress", full_page=False)
     pending.pop(0).continue_()
@@ -429,29 +430,71 @@ def test_library_delete_progress_and_partial_failure(library_page):
     expect(page.locator(".selection-bar > span")).to_contain_text("121 selected")
     pending = []
     page.route("**/api/media/delete", lambda route: pending.append(route))
+    page.clock.install()
+    page.clock.pause_at(page.evaluate("Date.now()"))
     page.get_by_role("button", name="Delete", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    close = dialog.get_by_role("button", name="Close", exact=True)
+    expect(close).to_be_enabled()
+    screenshot(page, "library-delete-review", full_page=False)
+
+    def cancel_confirmation(prompt):
+        assert prompt.type == "confirm"
+        assert "Permanently delete 121 selected captures" in prompt.message
+        assert "including 120 on other pages / filters" in prompt.message
+        assert "This cannot be undone" in prompt.message
+        prompt.dismiss()
+
+    page.once("dialog", cancel_confirmation)
+    page.get_by_role("button", name="Confirm deletion").click()
+    expect(close).to_be_enabled()
+    expect(page.get_by_role("progressbar")).to_have_count(0)
+    assert not pending
+    base = page.url.split("/library")[0]
+    assert page.request.get(base + "/api/media").json()["total"] == 121
+    close.click()
+    expect(dialog).not_to_be_visible()
+    page.get_by_role("button", name="Delete", exact=True).click()
+    page.once("dialog", lambda prompt: prompt.accept())
     page.get_by_role("button", name="Confirm deletion").click()
     progress = page.get_by_role("progressbar", name="Deleting captures")
     expect(progress).to_have_attribute("value", "0")
     expect(progress).to_have_attribute("max", "121")
+    expect(close).to_be_disabled()
+    close.click(force=True)
+    page.keyboard.press("Escape")
+    page.mouse.click(5, 5)
+    expect(dialog).to_be_visible()
+    expect(page.locator(".operation-progress small")).to_contain_text("ETA: estimating")
+    page.clock.run_for(10000)
     first = pending.pop(0)
     first.fulfill(response=first.fetch())
     expect(progress).to_have_attribute("value", "100")
+    expect(page.locator(".operation-progress small")).to_contain_text(
+        "ETA: 3s remaining (estimated)"
+    )
     screenshot(page, "library-delete-progress", full_page=False)
+    page.set_viewport_size({"width": 390, "height": 844})
+    screenshot(page, "library-delete-progress-mobile", full_page=False)
+    page.set_viewport_size({"width": 1440, "height": 1100})
     pending.pop(0).fulfill(status=503, json={"error": "Synthetic delete failure"})
+    page.clock.resume()
     expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text(
         "100 deleted; 0 already missing.\nSynthetic delete failure"
     )
+    expect(close).to_be_enabled()
     expect(page.locator(".selection-bar > span")).to_contain_text("21 selected")
     page.keyboard.press("Escape")
     expect(checks).to_have_count(21)
     expect(page.locator(".media-card input:checked")).to_have_count(21)
     page.unroute("**/api/media/delete")
     page.get_by_role("button", name="Delete", exact=True).click()
+    page.once("dialog", lambda prompt: prompt.accept())
     page.get_by_role("button", name="Confirm deletion").click()
     expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text(
         "21 deleted"
     )
+    expect(close).to_be_enabled()
     expect(page.locator(".selection-bar > span")).to_contain_text("0 selected")
     page.keyboard.press("Escape")
     expect(page.locator(".media-card")).to_have_count(0)
@@ -505,12 +548,22 @@ def test_library_zip_preparation_and_byte_progress(library_page, tmp_path):
     expect(page.get_by_role("progressbar", name="Preparing ZIP")).not_to_have_attribute(
         "value"
     )
+    expect(page.locator(".operation-progress small")).to_contain_text("ETA unavailable")
     screenshot(page, "library-zip-preparation", full_page=False)
+    page.clock.install()
+    page.clock.pause_at(page.evaluate("Date.now()"))
+    page.clock.run_for(60000)
     page.evaluate("window.beginZIP()")
     progress = page.get_by_role("progressbar", name="Downloading ZIP")
     expect(progress).to_have_attribute("value", str(len(archive) // 2))
     expect(progress).to_have_attribute("max", str(len(archive)))
+    expect(page.locator(".operation-progress small")).to_contain_text("ETA: estimating")
+    page.clock.run_for(10000)
+    expect(page.locator(".operation-progress small")).to_contain_text(
+        f"ETA: {10 if len(archive) % 2 == 0 else 11}s remaining (estimated)"
+    )
     screenshot(page, "library-zip-transfer", full_page=False)
+    page.clock.resume()
     with page.expect_download() as downloaded:
         page.evaluate("window.finishZIP()")
     output = tmp_path / "download.zip"
@@ -587,6 +640,18 @@ def test_transfer_rsync_and_optional_upload(library_page):
     assert '"/Volumes/WD APFS/Faros-OTA/boxed/"' in command
     assert "pi@192.168.1.14:/home/pi/cameradeck/media/" in command
     assert "\\\n" in command and "\\n" not in command
+    # The Pi serves plain HTTP, so exercise the non-Clipboard-API fallback.
+    page.evaluate("""() => {
+            Object.defineProperty(navigator, "clipboard", { value: undefined });
+            window.copied = [];
+            document.execCommand = (name) => {
+                window.copied.push([name, document.activeElement.value]);
+                return true;
+            };
+        }""")
+    page.get_by_role("button", name="Copy", exact=True).click()
+    expect(page.get_by_role("button", name="Copied", exact=True)).to_be_visible()
+    assert page.evaluate("window.copied") == [["copy", command]]
     page.reload()
     expect(page.get_by_role("heading", name="Transfer", exact=True)).to_be_visible()
     screenshot(page, "transfer-desktop")
@@ -622,16 +687,28 @@ def test_transfer_rsync_and_optional_upload(library_page):
     expect(page.get_by_label("S3 endpoint")).to_have_value("http://192.168.1.10:3900")
     page.get_by_label("Bucket", exact=True).fill("test-bucket")
     page.get_by_label("Prefix", exact=True).fill("photos/")
+    page.clock.install()
+    page.clock.pause_at(page.evaluate("Date.now()"))
     page.get_by_role("button", name="Confirm upload").click()
     progress = page.get_by_role("progressbar", name="Uploading captures")
     expect(progress).to_have_attribute("value", "0")
     expect(progress).to_have_attribute("max", "3")
+    expect(page.locator(".operation-progress small")).to_contain_text("ETA: estimating")
+    page.clock.run_for(10000)
     pending.pop(0).fulfill(json={"results": [{"id": ids[0], "status": "uploaded"}]})
     expect(progress).to_have_attribute("value", "1")
+    expect(page.locator(".operation-progress small")).to_contain_text(
+        "ETA: 20s remaining (estimated)"
+    )
     screenshot(page, "library-upload-progress-mobile", full_page=False)
+    page.clock.run_for(10000)
     pending.pop(0).fulfill(json={"results": [{"id": ids[1], "status": "uncertain"}]})
     expect(progress).to_have_attribute("value", "2")
+    expect(page.locator(".operation-progress small")).to_contain_text(
+        "ETA: 10s remaining (estimated)"
+    )
     pending.pop(0).fulfill(json={"results": [{"id": ids[2], "status": "error"}]})
+    page.clock.resume()
     expect(page.get_by_role("dialog").get_by_role("status")).to_contain_text(
         "1 uploaded / already present; 2 need attention."
     )
@@ -872,3 +949,33 @@ def test_camera_preview_and_requested_vs_measured(library_page):
     page.set_viewport_size({"width": 390, "height": 844})
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     screenshot(page, "photo-camera-mobile")
+
+
+def test_transfer_runs_and_supervises_rsync_on_the_pi(library_page, tmp_path_factory):
+    page = library_page
+    target = tmp_path_factory.mktemp("rsync-copy")
+    page.get_by_role("link", name="Transfer", exact=True).click()
+    section = page.locator("section", has=page.get_by_role("heading", name="rsync from CameraDeck"))
+    expect(section.get_by_role("status")).to_contain_text("Not run since CameraDeck started")
+    start = section.get_by_role("button", name="Start rsync")
+    expect(start).to_be_disabled()
+    section.get_by_label("Destination").fill("-e sh")
+    start.click()
+    expect(section.get_by_role("alert")).to_contain_text("must not start with '-'")
+    section.get_by_label("Destination").fill(str(target))
+    start.click()
+    expect(section.get_by_role("status")).to_contain_text("Finished", timeout=30000)
+    expect(section.get_by_role("status")).to_contain_text("Transfer complete.")
+    expect(section.get_by_role("progressbar", name="rsync progress")).to_have_attribute(
+        "value", "100"
+    )
+    expect(section.get_by_role("alert")).to_have_count(0)
+    section.get_by_text("Command and log").click()
+    expect(section.get_by_label("rsync log")).to_contain_text("--exclude=.*")
+    names = {p.name for p in target.iterdir()}
+    assert len(names) == 242 and all(n.endswith((".jpg", ".json")) for n in names)
+    assert not any(n.endswith((".thumb.jpg", ".preview.jpg")) for n in names)
+    section.get_by_text("SSH setup").click()
+    screenshot(page, "transfer-pi-rsync")
+    page.set_viewport_size({"width": 390, "height": 844})
+    screenshot(page, "transfer-pi-rsync-mobile")

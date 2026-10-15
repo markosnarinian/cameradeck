@@ -196,7 +196,13 @@ export function CameraPage({
               !status?.ready ||
               !Number.isFinite(rate) ||
               rate <= 0 ||
-              rate > 30
+              rate > 30 ||
+              !!status?.transfer_active
+            }
+            title={
+              status?.transfer_active
+                ? "Stop the rsync transfer before starting capture."
+                : undefined
             }
             onClick={() =>
               run(async () => {

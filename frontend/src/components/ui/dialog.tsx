@@ -9,8 +9,10 @@ export const DialogTitle = Primitive.Title;
 export const DialogDescription = Primitive.Description;
 export const DialogContent = React.forwardRef<
   React.ElementRef<typeof Primitive.Content>,
-  React.ComponentPropsWithoutRef<typeof Primitive.Content>
->(({ className, children, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof Primitive.Content> & {
+    closeDisabled?: boolean;
+  }
+>(({ className, children, closeDisabled = false, ...props }, ref) => (
   <Primitive.Portal>
     <Primitive.Overlay className="dialog-overlay" />
     <Primitive.Content
@@ -19,7 +21,11 @@ export const DialogContent = React.forwardRef<
       {...props}
     >
       {children}
-      <Primitive.Close className="dialog-close" aria-label="Close">
+      <Primitive.Close
+        className="dialog-close"
+        aria-label="Close"
+        disabled={closeDisabled}
+      >
         <X size={20} />
       </Primitive.Close>
     </Primitive.Content>

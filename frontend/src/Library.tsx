@@ -51,6 +51,17 @@ export function Library({
     total?: number;
     detail?: string;
   } | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    setElapsed(0);
+    if (!progress) return;
+    const started = performance.now();
+    const timer = setInterval(
+      () => setElapsed((performance.now() - started) / 1000),
+      1000,
+    );
+    return () => clearInterval(timer);
+  }, [progress?.label]);
   const [viewed, setViewed] = useState<Media | null>(null),
     [dialog, setDialog] = useState<"delete" | "upload" | null>(null),
     [endpoint, setEndpoint] = useState(""),
@@ -241,15 +252,21 @@ export function Library({
       }, 60000);
       setFeedback("ZIP download handed to your browser.");
     });
-  const remove = () =>
-    act("Deleting captures", async (signal) => {
+  const remove = () => {
+    if (
+      !window.confirm(
+        `Permanently delete ${selected.size.toLocaleString()} selected captures, including ${offPage.toLocaleString()} on other pages / filters? Originals and metadata will be removed from the Pi. This cannot be undone.`,
+      )
+    )
+      return;
+    void act("Deleting captures", async (signal) => {
       const ids = [...selected],
         removed = new Set<string>();
       let deleted = 0,
         missing = 0;
       setProgress({ label: "Deleting captures", done: 0, total: ids.length });
       try {
-        // Batches bound lock time and provide measured progress, not a selection cap.
+        // Batches provide progress checkpoints, not a selection cap.
         for (let at = 0; at < ids.length; at += 100) {
           const response = await request(
             "/api/media/delete",
@@ -276,6 +293,7 @@ export function Library({
         setRevision((n) => n + 1);
       }
     });
+  };
   const upload = () =>
     act("Uploading captures", async (signal) => {
       const ids = [...selected],
@@ -314,6 +332,16 @@ export function Library({
     });
   const offPage =
     selected.size - items.filter((item) => selected.has(item.id)).length;
+  const remaining =
+    progress?.total && progress.done && elapsed > 0
+      ? Math.ceil((elapsed * (progress.total - progress.done)) / progress.done)
+      : null;
+  const eta =
+    remaining === null
+      ? progress?.total
+        ? "ETA: estimating…"
+        : "ETA unavailable until progress can be measured."
+      : `ETA: ${remaining >= 3600 ? `${Math.floor(remaining / 3600)}h ` : ""}${remaining >= 60 ? `${Math.floor((remaining % 3600) / 60)}m ` : ""}${remaining % 60}s remaining (estimated)`;
   const progressBar = progress && (
     <div className="operation-progress" role="status">
       <span>
@@ -329,7 +357,7 @@ export function Library({
         value={progress.total ? progress.done : undefined}
         max={progress.total ?? 1}
       />
-      <small>Keep this page open until finished.</small>
+      <small>{eta} · Keep this page open until finished.</small>
     </div>
   );
   const pagination = data && !error && (
@@ -641,6 +669,7 @@ export function Library({
         }}
       >
         <DialogContent
+          closeDisabled={busy}
           onEscapeKeyDown={(e) => {
             if (busy) e.preventDefault();
           }}

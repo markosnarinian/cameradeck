@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Keep in step with the Mac pull command on the Transfer page and in README.md.
+# Keep in step with the Pi push command on the Transfer page and in README.md.
 EXCLUDES = ("*.preview.jpg", "*.thumb.jpg", ".*", "*.tmp", "*.pending.*")
 SSH = "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 REMOTE = re.compile(
@@ -62,7 +62,9 @@ class RsyncTransfer:
         try:
             self.destination = self.saved.read_text().strip()
         except OSError:
-            self.destination = ""
+            self.destination = (
+                "faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+            )
 
     @property
     def active(self):

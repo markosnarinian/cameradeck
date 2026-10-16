@@ -12,8 +12,8 @@ const RSYNC_COMMAND = `rsync -r --whole-file --info=progress2,stats2 --human-rea
   --exclude='.*' \\
   --exclude='*.tmp' \\
   --exclude='*.pending.*' \\
-  pi@192.168.1.14:/home/pi/cameradeck/media/ \\
-  "/Volumes/WD APFS/Faros-OTA/boxed/"`;
+  /home/pi/cameradeck/media/ \\
+  faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/`;
 
 // The device UI is served over plain HTTP, where navigator.clipboard is absent.
 async function copyText(text: string) {
@@ -122,7 +122,7 @@ function PiRsync({ capturing }: { capturing: boolean }) {
       <h2 id="pi-rsync-heading">rsync from CameraDeck</h2>
       <p>
         The Pi pushes the same files to an SSH destination such as{" "}
-        <code>user@mac.local:/Volumes/WD APFS/Faros-OTA/boxed/</code>, or to a
+        <code>faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/</code>, or to a
         directory on a drive mounted on the Pi. Capture is blocked while it
         runs.
       </p>
@@ -259,7 +259,7 @@ export function Transfer({ capturing }: { capturing: boolean }) {
       </div>
       <section className="transfer-section" aria-labelledby="rsync-heading">
         <h2 id="rsync-heading">rsync</h2>
-        <p>Run on your Mac after stopping capture.</p>
+        <p>Run on the Pi after stopping capture.</p>
         <div className="rsync-command-wrap">
           <pre className="rsync-command" tabIndex={0} aria-label="rsync command">
             <code>{RSYNC_COMMAND}</code>

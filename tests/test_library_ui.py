@@ -640,8 +640,12 @@ def test_transfer_rsync_and_optional_upload(library_page):
     assert "--ignore-existing" in command
     for pattern in ("*.preview.jpg", "*.thumb.jpg", ".*", "*.tmp", "*.pending.*"):
         assert f"--exclude='{pattern}'" in command
-    assert '"/Volumes/WD APFS/Faros-OTA/boxed/"' in command
-    assert "pi@192.168.1.14:/home/pi/cameradeck/media/" in command
+    assert command.endswith(
+        "  /home/pi/cameradeck/media/ \\\n  faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+    )
+    expect(page.get_by_label("Destination", exact=True)).to_have_value(
+        "faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+    )
     assert "\\\n" in command and "\\n" not in command
     # The Pi serves plain HTTP, so exercise the non-Clipboard-API fallback.
     page.evaluate("""() => {
@@ -960,6 +964,8 @@ def test_transfer_runs_and_supervises_rsync_on_the_pi(library_page, tmp_path_fac
     section = page.locator("section", has=page.get_by_role("heading", name="rsync from CameraDeck"))
     expect(section.get_by_role("status")).to_contain_text("Not run since CameraDeck started")
     start = section.get_by_role("button", name="Start rsync")
+    expect(start).to_be_enabled()
+    section.get_by_label("Destination").fill("")
     expect(start).to_be_disabled()
     section.get_by_label("Destination").fill("-e sh")
     start.click()

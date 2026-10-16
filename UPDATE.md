@@ -68,7 +68,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   same origin. If using a reverse proxy, forward the new routes too; avoid
   caching app HTML/API responses. Hashed assets can be cached. Direct `/library`
   and `/transfer` reloads must reach Flask, not a proxy filesystem lookup.
-- Transfer tools have moved off the Library page. `/transfer` shows the Mac
+- Transfer tools have moved off the Library page. `/transfer` shows the Pi push
   rsync command first; optional S3 upload is collapsed until opened. For rsync,
   stop capture first and exclude hidden internal files (`--exclude='.*'`),
   previews, thumbnails, and temporary/pending sidecars as shown in `README.md`.
@@ -84,6 +84,10 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   capture in step 1. Check `GET /api/transfer/rsync` (`"active": false`) or the
   Transfer page before stopping. The last destination is stored in
   `.rsync-destination` in the media directory; keep it with the other hidden files.
+  Without a saved destination, it defaults to
+  `faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/`, matching
+  the copyable command (now run on the Pi, not the Mac). Saved destinations
+  are preserved and can be changed in the Transfer page.
   No unit file or environment change is required. If you use a reverse proxy,
   forward the new `/api/transfer/rsync` routes.
 - On startup, `.library.sqlite3` is created inside the media directory. Existing

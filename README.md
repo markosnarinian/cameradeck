@@ -136,9 +136,9 @@ retention or loop deletion**. At 5 photos/s, 18,000 images are selected per hour
 storage consumption depends on scene, JPEG size and derivatives. Monitor storage
 and use reliable power. Abrupt power loss can damage the filesystem.
 
-### Transfer to your Mac with rsync
+### Transfer from the Pi with rsync
 
-The Transfer page shows a command to run on your Mac after stopping capture:
+The Transfer page shows a command to run on the Pi after stopping capture:
 
 ```bash
 rsync -r --whole-file --info=progress2,stats2 --human-readable --ignore-existing \
@@ -147,8 +147,8 @@ rsync -r --whole-file --info=progress2,stats2 --human-readable --ignore-existing
   --exclude='.*' \
   --exclude='*.tmp' \
   --exclude='*.pending.*' \
-  pi@192.168.1.14:/home/pi/cameradeck/media/ \
-  "/Volumes/WD APFS/Faros-OTA/boxed/"
+  /home/pi/cameradeck/media/ \
+  faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/
 ```
 
 Adjust host and destination if needed. This copies originals and JSON metadata,
@@ -164,11 +164,12 @@ The Transfer page can also have the Pi push the same files itself, so the copy
 is started, watched and stopped from the browser. Under **rsync from
 CameraDeck**, enter a destination and press **Start rsync**:
 
-- `user@mac.local:/Volumes/WD APFS/Faros-OTA/boxed/` over SSH, or
+- `faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/` over SSH
+  (the default), or
 - an existing absolute directory on the Pi (for example a mounted USB drive),
   outside the media directory.
 
-It runs the same flags and exclusions as the Mac command, with the Pi as the
+It runs the same flags and exclusions as the command above, with the Pi as the
 source, plus an I/O timeout. The page shows progress, rate, ETA, files copied,
 the exact command and the log tail, and can stop the run. One run at a time is
 allowed. rsync cannot start during capture, and capture and Pi power actions

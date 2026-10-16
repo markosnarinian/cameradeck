@@ -3,14 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+export PATH="$HOME/.local/share/cameradeck/node-$(cat .node-version)/bin:$PATH"
 # Keep resume fast: report broken prerequisites rather than installing on wake.
 trap 'echo "CameraDeck prerequisites are incomplete; run .agents/setup before testing." >&2' ERR
 for command in uv node npm ffmpeg ffprobe rsync; do
   command -v "$command" >/dev/null
 done
-node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
+test "$(node --version)" = "v$(cat .node-version)"
 test -x frontend/node_modules/.bin/tsc
-test -f static/dist/index.html
+python3 scripts/frontend.py check
 .venv/bin/python - <<'PY'
 import pytest
 from simplejpeg import encode_jpeg_yuv_planes

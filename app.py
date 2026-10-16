@@ -34,6 +34,7 @@ from flask import (
 from camera import CameraDeck
 from catalog import ID, MediaCatalog
 from power import PowerManager
+from scripts.frontend import check as check_frontend
 from transfer import Busy, RsyncTransfer, public_key
 
 
@@ -741,6 +742,7 @@ def main():
     password = os.environ.get("CAMERADECK_PASSWORD", "")
     if args.host not in {"127.0.0.1", "::1", "localhost"} and not password:
         parser.error("Network access requires CAMERADECK_PASSWORD to be set.")
+    check_frontend()
     logging.basicConfig(level=logging.INFO)
     deck = CameraDeck(args.media)
     app = create_app(

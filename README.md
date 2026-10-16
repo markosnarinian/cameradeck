@@ -16,17 +16,65 @@ camera drivers. Check `rpicam-hello --list-cameras` first. CameraDeck does not
 install drivers, overlays, firmware, or camera tuning files.
 
 ```bash
-sudo apt install python3-picamera2 python3-venv python3-av ffmpeg
+sudo apt install python3-picamera2 python3-venv python3-av ffmpeg rsync git curl xz-utils
 curl -LsSf astral.sh/uv/install.sh | sh
 git clone https://github.com/markosnarinian/cameradeck.git
 cd cameradeck
-uv venv --system-site-packages
-uv sync --frozen --no-dev
-uv run --no-dev python app.py
 ```
 
-Open `http://127.0.0.1:8080` on the Pi. Compiled frontend files are included in
-`static/dist/`; Node is only needed when changing the frontend source.
+Install the pinned build toolchain below, then run as the CameraDeck user:
+
+```bash
+uv venv --system-site-packages
+uv sync --frozen --no-dev &&
+  python3 scripts/frontend.py build &&
+  uv run --no-dev python app.py
+```
+
+Open `http://127.0.0.1:8080` on the Pi. A clean clone contains **no compiled
+frontend**. Installation and every update build `static/dist/` locally using
+`npm ci --include=dev` and TypeScript/Vite. A failed install/build leaves the
+old bundle intact and must not be followed by a start/restart. The application
+and example systemd unit reject a missing, stale or damaged bundle at startup;
+the check needs Python, not Node, and never downloads anything at boot.
+
+### Pinned frontend toolchain
+
+Use Node **22.23.3** (`.node-version`) and its bundled npm **10.9.9**
+(`frontend/package.json`). Both versions are checked before building. Install
+the official Linux binary as your normal user, without replacing system Node:
+
+```bash
+(
+  set -eu
+  version=$(cat .node-version)
+  case "$(uname -m)" in
+    aarch64) arch=arm64 ;;  # 64-bit Raspberry Pi OS
+    x86_64) arch=x64 ;;    # development machines
+    *) echo 'Unsupported architecture' >&2; exit 1 ;;
+  esac
+  archive="node-v$version-linux-$arch.tar.xz"
+  download=$(mktemp -d)
+  trap 'rm -rf "$download"' EXIT
+  curl -fsSL "https://nodejs.org/dist/v$version/$archive" -o "$download/$archive"
+  curl -fsSL "https://nodejs.org/dist/v$version/SHASUMS256.txt" -o "$download/SHASUMS256.txt"
+  (cd "$download" && grep "  $archive$" SHASUMS256.txt | sha256sum -c -)
+  mkdir -p "$HOME/.local/share/cameradeck/node-$version"
+  tar -xJf "$download/$archive" --strip-components=1 -C "$HOME/.local/share/cameradeck/node-$version"
+)
+export PATH="$HOME/.local/share/cameradeck/node-$(cat .node-version)/bin:$PATH"
+node --version
+npm --version
+```
+
+Repeat the `export PATH=...` in each install/update shell. Keep the committed
+lockfile; do not substitute `npm install`, omit dev dependencies, or use sudo
+for npm. Internet access (or a populated npm cache) and space for dependencies,
+the staged build and existing bundle are required during updates, not operation.
+Build only while stopped; do not edit source or run concurrent builds. The build
+stages output beside `static/dist`, then replaces it after success. The build
+receipt checks frontend input and output hashes, not Git HEAD, so committing
+unchanged built source does not invalidate it.
 
 The system-site-packages venv sees apt's Picamera2/libcamera/simplejpeg. Locked
 NumPy 2 takes precedence over apt packages, so compiled camera modules must
@@ -131,6 +179,13 @@ the standalone `quality.py` analyzer remains available for old experiment data.
 Interrupted legacy video recovery runs in the background and preserves
 unrecoverable originals and `.pending.json` files.
 
+Transfer's **Delete all media** action requires the exact text `DELETE ALL` and
+an idle CameraDeck. It removes completed Library media across every page, not
+just selections. Verify your remote copies first: CameraDeck does not verify
+backups. It preserves remote copies, settings, credentials, the upload ledger,
+pending clips, old experiment directories and unrelated files. Keep the page
+open until deletion finishes; in-flight deletion cannot be cancelled.
+
 Capture is refused below a 256 MiB free-space reserve. There is **no automatic
 retention or loop deletion**. At 5 photos/s, 18,000 images are selected per hour;
 storage consumption depends on scene, JPEG size and derivatives. Monitor storage
@@ -216,7 +271,7 @@ sudo cp deploy/90-cameradeck-power.rules /etc/polkit-1/rules.d/
 sudo chown root:root /etc/polkit-1/rules.d/90-cameradeck-power.rules
 sudo chmod 644 /etc/polkit-1/rules.d/90-cameradeck-power.rules
 sudo systemctl daemon-reload
-sudo systemctl enable --now cameradeck
+python3 scripts/frontend.py build && sudo systemctl enable --now cameradeck
 journalctl -u cameradeck -f
 ```
 
@@ -226,18 +281,27 @@ guards; it is not placed in the primary interface.
 
 ## Development and verification
 
-Node **22 or newer** is a build-time dependency only:
+Use the pinned Node/npm toolchain above. The production build helper installs
+locked frontend dependencies and builds a startup-checked bundle:
 
 ```bash
-npm --prefix frontend ci
-npm --prefix frontend run build
+python3 scripts/frontend.py build
 uv sync --frozen
 uv run python -m pytest -q
 ```
 
-Commit frontend source, lockfile, and rebuilt `static/dist/` together. Flask serves
+Commit frontend source and lockfile, **never** `static/dist/`, dependencies or
+temporary build output. `npm --prefix frontend run typecheck` is available for
+a quick check; direct Vite builds do not produce a deployment receipt. Flask serves
 `/`, `/library` and `/transfer` as app routes and `/assets/*` as public hashed assets, so the
 unlock screen can load before authentication.
+
+The header and locked screen show Git HEAD captured when the backend starts
+(`git rev-parse --short=12 HEAD`, or `unknown` without Git metadata). This is
+not a dirty-tree fingerprint or the checkout's current HEAD after a later pull.
+Deploy clean committed source with its matching build and restart together;
+reload browser tabs after updating. Compare the label with the deployed
+checkout's `git rev-parse --short=12 HEAD`, not a build-machine commit.
 
 Tests use synthetic captures and camera requests, never real hardware. Chromium
 is required for browser tests. Set `CAMERADECK_SCREENSHOTS=.amp/in/artifacts` to

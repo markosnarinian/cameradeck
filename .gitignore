@@ -8,3 +8,5 @@ test-results/
 .amp/portals/*
 frontend/node_modules/
 frontend/*.tsbuildinfo
+static/dist/
+static/.frontend-*/

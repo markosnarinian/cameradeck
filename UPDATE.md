@@ -39,11 +39,14 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   require setting a persistent value through `/api/controls` first so the burst
   can restore it. Restoration of automatic exposure/white balance remains
   supported. Normal UI capture is unchanged.
-- The React/React Router frontend is compiled into tracked `static/dist/`.
-  A normal update needs **no Node installation or frontend build on the Pi**.
-  When changing frontend source, use Node 22+ on a build machine:
-  `npm --prefix frontend ci && npm --prefix frontend run build`, and ship the
-  source, lockfile and compiled files together. The service still runs Python only.
+- **Frontend build migration:** `static/dist/` is no longer tracked. Every
+  installation/update builds on the Pi with pinned Node 22.23.3 and npm 10.9.9,
+  `npm ci --include=dev`, and TypeScript/Vite. Follow the backup step below
+  **before pulling**: the first Git update removes the old tracked bundle.
+  `scripts/frontend.py build` stages output without touching the installed
+  bundle on dependency/build failure. Never restart after a failed command.
+  Startup checks frontend source/output hashes; stale, missing or damaged
+  output is rejected. Node is not run at service startup or during operation.
 - Library Shift-click ranges now span pages, including skipped pages. Restart
   the Python service with the matching frontend: off-page ranges use the new
   read-only `POST /api/media/range` endpoint. Reload existing browser tabs after
@@ -118,8 +121,15 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   `s3_upload`, `deletion`, `download`, `zip_download`, `library_indexing`,
   `clip_recovery`, or `power_action`. `scripts/check-idle.py` wraps it together
   with the systemd state for step 1. If using a reverse proxy, forward the route.
-- No deployment unit, system package, Python dependency, or environment-variable
-  change is required for this release.
+- The example systemd unit now has a Python-only `ExecCondition` build check.
+  Install that directive while preserving device-specific user, paths, port,
+  environment and other settings (step 5). Build-time Node/npm, `curl` and
+  `xz-utils` are newly required; no Python dependency or environment-variable
+  migration is needed. The existing venv and media remain in place.
+- The header and locked screen identify Git HEAD at backend startup, not dirty
+  working-tree contents or a later checkout change. Deploy committed source,
+  build it, restart, and reload tabs together. An unavailable Git checkout
+  displays `unknown`.
 
 ## Update steps
 
@@ -159,6 +169,20 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    Don't reboot the Pi until step 6. The service is enabled at boot and
    would start against a partly updated checkout.
 
+   **Back up the running version's bundle before Git removes tracked output.**
+   Keep this directory outside the checkout until the update is verified:
+
+   ```bash
+   backup=$(mktemp -d "$HOME/cameradeck-rollback.XXXXXX")
+   git rev-parse HEAD > "$backup/revision"
+   cp -a static/dist "$backup/dist"
+   printf 'Rollback backup: %s\n' "$backup"
+   ```
+
+   If the backup fails, do not pull. This also protects against an interrupted
+   installation. Record the printed path; do not delete or move media, `.env`,
+   `.session-key`, `.rotation`, `.time_offset`, or either SQLite ledger.
+
 3. **Fetch and apply the new code.**
 
    ```bash
@@ -170,11 +194,24 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    If you have local modifications you want to keep, `git stash` before
    pulling and `git stash pop` after.
 
-4. **Re-sync dependencies.**
+4. **Re-sync dependencies and build the frontend on the Pi.** Install the
+   pinned Node/npm toolchain from README's "Pinned frontend toolchain" if not
+   present (`sudo apt install curl xz-utils` supplies the download tools).
+   Run as the service user, never with sudo npm:
 
    ```bash
-   uv sync --frozen --no-dev
+   export PATH="$HOME/.local/share/cameradeck/node-$(cat .node-version)/bin:$PATH"
+   uv sync --frozen --no-dev && python3 scripts/frontend.py build
    ```
+
+   **Continue only if the entire command succeeds.** On any failure leave the
+   service stopped, fix the toolchain/network/disk/source problem and retry, or
+   roll back below. Do not start, restart or reboot into a half-updated checkout.
+   `npm ci` installs the lockfile including build-time dev dependencies even
+   with `NODE_ENV=production`. Build output is staged beside `static/dist`, then
+   replaces it only after success; the old bundle is preserved on npm/build
+   failure. The first migration's old tracked files may already be removed by
+   Git, which is why step 2's separate backup is mandatory.
 
    `--no-dev` leaves out the test and formatting tools, and removes them if
    an earlier sync installed them. Keep using the existing
@@ -198,35 +235,54 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    diff deploy/90-cameradeck-power.rules /etc/polkit-1/rules.d/90-cameradeck-power.rules
    ```
 
-   If either differs (review the diff — paths/usernames may be
-   site-specific), re-install it:
+   Preserve installed paths/usernames, HTTP port (80 on `pi4`), environment,
+   credentials and other device settings. Do not blindly overwrite a customized
+   unit. For this migration, add this directive under `[Service]` in the installed
+   unit (adjust only the checkout path if necessary):
+
+   ```ini
+   ExecCondition=/usr/bin/python3 /home/pi/cameradeck/scripts/frontend.py check
+   ```
+
+   It returns nonzero without starting the service if the bundle is invalid;
+   unlike a failing pre-start command, an `ExecCondition` exit 1 does not trigger
+   the unit's restart loop. `app.py` also checks before opening the camera, so
+   manually launched instances cannot bypass the build requirement.
+   If replacing files, merge site-specific settings into the candidate first:
 
    ```bash
-   sudo cp deploy/cameradeck.service /etc/systemd/system/
+   sudoedit /etc/systemd/system/cameradeck.service
    sudo cp deploy/90-cameradeck-power.rules /etc/polkit-1/rules.d/
    sudo chown root:root /etc/polkit-1/rules.d/90-cameradeck-power.rules
    sudo chmod 644 /etc/polkit-1/rules.d/90-cameradeck-power.rules
    sudo systemctl daemon-reload
    ```
 
-6. **Start it back up.**
+6. **Start it back up only after step 4 succeeded.** Recheck the build immediately
+   before restarting:
 
    ```bash
-   sudo systemctl restart cameradeck
+   python3 scripts/frontend.py check && sudo systemctl restart cameradeck
    journalctl -u cameradeck -f
    ```
 
    For a manual run, export `CAMERADECK_PASSWORD` in the current shell
    first (see README's "Access from your phone"; `.env` is only read by the
-   service), then run `uv run --no-dev python app.py --host 0.0.0.0`
+   service), then run `python3 scripts/frontend.py check && uv run --no-dev python app.py --host 0.0.0.0`
    (without `--no-dev`, `uv run` installs the dev tools again).
 
 7. **Verify.** Open the web UI, sign in, reload `/library`, and wait for indexing
    to finish. Confirm the count, pagination, preview, and measured exposure.
    Take a test photo, then perform a short 5/s run while browsing the Library;
    stop it and inspect completed count, achieved rate and skipped frames. A
-   configured target is not a hardware throughput guarantee. Check `git log -1`
-   matches the intended revision. Interrupted legacy clip errors preserve the
+   configured target is not a hardware throughput guarantee. Confirm the locked
+   screen/header's Commit label and `/api/session` revision equal
+   `git rev-parse --short=12 HEAD`, and `git status --short` shows no source edits
+   (the local bundle is ignored). Check authenticated `/api/status`, preview,
+   direct `/library` and `/transfer` reloads, the six camera readings, and the
+   rsync command. Test destructive actions only with disposable captures after
+   verifying backups. Keep the rollback backup until these checks pass.
+   Interrupted legacy clip errors preserve the
    original files; see README's "Library and storage".
 
 ## Rolling back
@@ -240,14 +296,23 @@ If the update causes a regression:
    git checkout <previous-commit-or-tag>
    uv sync --frozen --no-dev
    ```
-3. Repeat step 5 so the installed unit and polkit rule match the
-   rolled-back checkout (including `sudo systemctl daemon-reload`).
-4. Start it again as in step 6.
+3. For releases with `scripts/frontend.py`, install their pinned Node/npm,
+   then run `python3 scripts/frontend.py build`. If offline, restore the saved
+   bundle only with its exact saved source revision and require
+   `python3 scripts/frontend.py check` to pass. For a pre-migration release,
+   Git restores its tracked bundle; the backup is also available at
+   `$backup/dist`. Remove the new `ExecCondition` if that older checkout lacks
+   `scripts/frontend.py`.
+4. Repeat step 5 so the installed unit and polkit rule match the rolled-back
+   checkout, preserving device settings; run `sudo systemctl daemon-reload`.
+5. Start only after the matching dependencies and bundle are restored. New
+   releases use step 6; older releases without the check script use
+   `sudo systemctl restart cameradeck`. Verify the live UI/API and preview again.
 
 `media/`, `.env`, `.uploads.sqlite3`, `.library.sqlite3`, and `.session-key` are
 untouched by checking out a different commit, so no data is lost by rolling back.
 Older releases ignore the new catalog/key and use their original library/login
 behavior. The compiled frontend must match the Python revision; a Git checkout
-restores both tracked parts. The checkout is now on
+alone no longer restores the bundle for new releases. The checkout is now on
 a detached commit. To return to the latest code later, run `git checkout main`
 and follow the update steps again.

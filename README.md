@@ -148,7 +148,7 @@ rsync -r --whole-file --info=progress2,stats2 --human-readable --ignore-existing
   --exclude='*.tmp' \
   --exclude='*.pending.*' \
   /home/pi/cameradeck/media/ \
-  faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/
+  faros@192.168.1.10:/mnt/wd2tb/faros
 ```
 
 Adjust host and destination if needed. This copies originals and JSON metadata,
@@ -164,7 +164,7 @@ The Transfer page can also have the Pi push the same files itself, so the copy
 is started, watched and stopped from the browser. Under **rsync from
 CameraDeck**, enter a destination and press **Start rsync**:
 
-- `faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/` over SSH
+- `faros@192.168.1.10:/mnt/wd2tb/faros` over SSH
   (the default), or
 - an existing absolute directory on the Pi (for example a mounted USB drive),
   outside the media directory.

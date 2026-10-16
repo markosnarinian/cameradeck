@@ -63,7 +63,7 @@ class RsyncTransfer:
             self.destination = self.saved.read_text().strip()
         except OSError:
             self.destination = (
-                "faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+                "faros@192.168.1.10:/mnt/wd2tb/faros"
             )
 
     @property

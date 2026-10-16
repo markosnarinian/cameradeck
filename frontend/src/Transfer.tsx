@@ -13,7 +13,7 @@ const RSYNC_COMMAND = `rsync -r --whole-file --info=progress2,stats2 --human-rea
   --exclude='*.tmp' \\
   --exclude='*.pending.*' \\
   /home/pi/cameradeck/media/ \\
-  faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/`;
+  faros@192.168.1.10:/mnt/wd2tb/faros`;
 
 // The device UI is served over plain HTTP, where navigator.clipboard is absent.
 async function copyText(text: string) {
@@ -122,7 +122,7 @@ function PiRsync({ capturing }: { capturing: boolean }) {
       <h2 id="pi-rsync-heading">rsync from CameraDeck</h2>
       <p>
         The Pi pushes the same files to an SSH destination such as{" "}
-        <code>faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/</code>, or to a
+        <code>faros@192.168.1.10:/mnt/wd2tb/faros</code>, or to a
         directory on a drive mounted on the Pi. Capture is blocked while it
         runs.
       </p>

@@ -85,9 +85,12 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   Transfer page before stopping. The last destination is stored in
   `.rsync-destination` in the media directory; keep it with the other hidden files.
   Without a saved destination, it defaults to
-  `faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/`, matching
+  `faros@192.168.1.10:/mnt/wd2tb/faros`, matching
   the copyable command (now run on the Pi, not the Mac). Saved destinations
-  are preserved and can be changed in the Transfer page.
+  are preserved and can be changed in the Transfer page. The default used to be
+  `faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/`; an
+  install that saved that value keeps using it until you change the
+  destination in the Transfer page (or delete `.rsync-destination` while idle).
   No unit file or environment change is required. If you use a reverse proxy,
   forward the new `/api/transfer/rsync` routes.
 - On startup, `.library.sqlite3` is created inside the media directory. Existing

@@ -665,7 +665,7 @@ def test_rsync_from_cameradeck_copies_originals_and_metadata(
     deck.root.mkdir()
     client = app_factory(deck).test_client()
     assert client.get("/api/transfer/rsync").json["destination"] == (
-        "faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+        "faros@192.168.1.10:/mnt/wd2tb/faros"
     )
     item = make_media(deck, b"x" * 300000)
     (deck.root / ".session-key").chmod(0o600)

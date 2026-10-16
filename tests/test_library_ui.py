@@ -720,10 +720,10 @@ def test_transfer_rsync_and_optional_upload(library_page):
     for pattern in ("*.preview.jpg", "*.thumb.jpg", ".*", "*.tmp", "*.pending.*"):
         assert f"--exclude='{pattern}'" in command
     assert command.endswith(
-        "  /home/pi/cameradeck/media/ \\\n  faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+        "  /home/pi/cameradeck/media/ \\\n  faros@192.168.1.10:/mnt/wd2tb/faros"
     )
     expect(page.get_by_label("Destination", exact=True)).to_have_value(
-        "faros@192.168.1.10:/mnt/cvat-external/wd-images/Faros-OTA/boxed/"
+        "faros@192.168.1.10:/mnt/wd2tb/faros"
     )
     assert "\\\n" in command and "\\n" not in command
     # The Pi serves plain HTTP, so exercise the non-Clipboard-API fallback.

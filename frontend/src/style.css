@@ -58,6 +58,11 @@ header {
   padding: 0 max(24px, calc((100vw - 1240px) / 2));
   border-bottom: 1px solid var(--border);
 }
+.header-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
 .brand {
   font-size: 19px;
   font-weight: 720;
@@ -636,9 +641,6 @@ select {
     height: auto;
     min-height: 64px;
     flex-wrap: wrap;
-  }
-  header > .button {
-    margin-left: auto;
   }
   .brand {
     font-size: 17px;

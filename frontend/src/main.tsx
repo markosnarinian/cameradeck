@@ -5,6 +5,13 @@ import { request, message, onUnauthorized } from "./api";
 import type { Status } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "./components/ui/dialog";
+import { Power } from "lucide-react";
 import { CameraPage } from "./Camera";
 import { Library } from "./Library";
 import { Transfer } from "./Transfer";
@@ -22,6 +29,12 @@ function App() {
     [busy, setBusy] = useState(false),
     [password, setPassword] = useState(""),
     [epoch, setEpoch] = useState(0);
+  const [powerOpen, setPowerOpen] = useState(false),
+    [powerAction, setPowerAction] = useState("shutdown"),
+    [powerConfirm, setPowerConfirm] = useState(""),
+    [powerError, setPowerError] = useState(""),
+    [powerBusy, setPowerBusy] = useState(false),
+    [powerPending, setPowerPending] = useState("");
   const session = useCallback(async () => {
     setAuth("checking");
     setError("");
@@ -44,7 +57,7 @@ function App() {
     return () => onUnauthorized(() => {});
   }, [session]);
   useEffect(() => {
-    if (auth !== "ready") return;
+    if (auth !== "ready" || powerPending) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>,
       stopped = false;
@@ -73,7 +86,7 @@ function App() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [auth, epoch]);
+  }, [auth, epoch, powerPending]);
   const run = async (fn: () => Promise<void>) => {
     if (busy) return;
     setBusy(true);
@@ -87,6 +100,23 @@ function App() {
       setBusy(false);
     }
   };
+  if (powerPending)
+    return (
+      <main className="auth">
+        <h1>CameraDeck</h1>
+        <h2 role="status">
+          {powerPending === "shutdown"
+            ? "Pi is shutting down…"
+            : "Pi is rebooting…"}
+        </h2>
+        <p>
+          {powerPending === "shutdown"
+            ? "Physical access is required to turn the Pi back on."
+            : "Wait for the Pi to restart, then reload this page to reconnect."}
+        </p>
+        <Button onClick={() => window.location.reload()}>Reload page</Button>
+      </main>
+    );
   if (auth !== "ready")
     return (
       <main className="auth">
@@ -149,23 +179,131 @@ function App() {
           <NavLink to="/library">Library</NavLink>
           <NavLink to="/transfer">Transfer</NavLink>
         </nav>
-        {required && (
+        <div className="header-actions">
           <Button
             variant="ghost"
-            disabled={busy}
-            onClick={() =>
-              void run(async () => {
-                await request("/api/logout", {});
-                setAuth("locked");
-                setStatus(null);
-                setConnected(false);
-              })
-            }
+            onClick={() => {
+              setPowerConfirm("");
+              setPowerError("");
+              setPowerOpen(true);
+            }}
           >
-            Lock
+            <Power size={16} /> Power
           </Button>
-        )}
+          {required && (
+            <Button
+              variant="ghost"
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  await request("/api/logout", {});
+                  setAuth("locked");
+                  setStatus(null);
+                  setConnected(false);
+                })
+              }
+            >
+              Lock
+            </Button>
+          )}
+        </div>
       </header>
+      <Dialog
+        open={powerOpen}
+        onOpenChange={(open) => {
+          if (!powerBusy) setPowerOpen(open);
+        }}
+      >
+        <DialogContent closeDisabled={powerBusy}>
+          <DialogTitle>Pi power</DialogTitle>
+          <DialogDescription>
+            Stop capture and transfers and finish any downloads or deletions
+            first. Shutting down requires physical access to turn the Pi back
+            on.
+          </DialogDescription>
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (powerBusy || powerConfirm.toLowerCase() !== powerAction)
+                return;
+              setPowerBusy(true);
+              setPowerError("");
+              try {
+                await request("/api/system/power", {
+                  action: powerAction,
+                  confirm: powerConfirm,
+                });
+                setPowerPending(powerAction);
+              } catch (e) {
+                setPowerError(message(e));
+              } finally {
+                setPowerBusy(false);
+              }
+            }}
+          >
+            <label className="field">
+              Action
+              <select
+                value={powerAction}
+                disabled={powerBusy}
+                onChange={(e) => {
+                  setPowerAction(e.target.value);
+                  setPowerConfirm("");
+                  setPowerError("");
+                }}
+              >
+                <option value="shutdown">Shut down</option>
+                <option value="reboot">Reboot</option>
+              </select>
+            </label>
+            <label className="field">
+              Type {powerAction.toUpperCase()} to confirm
+              <Input
+                value={powerConfirm}
+                disabled={powerBusy}
+                autoComplete="off"
+                onChange={(e) => setPowerConfirm(e.target.value)}
+              />
+            </label>
+            {seq?.active && (
+              <p role="alert">
+                Stop the capture sequence before changing Pi power.
+              </p>
+            )}
+            {powerError && (
+              <p className="error" role="alert">
+                {powerError}
+              </p>
+            )}
+            <div className="viewer-actions">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={powerBusy}
+                onClick={() => setPowerOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={
+                  powerBusy ||
+                  busy ||
+                  !connected ||
+                  !!seq?.active ||
+                  powerConfirm.toLowerCase() !== powerAction
+                }
+              >
+                {powerBusy
+                  ? "Sending…"
+                  : powerAction === "shutdown"
+                    ? "Shut down Pi"
+                    : "Reboot Pi"}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
       <main>
         {error && (
           <div className="notice error" role="alert">

@@ -6,6 +6,7 @@ import os
 import re
 import threading
 from pathlib import Path
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -37,7 +38,7 @@ def library_page(tmp_path):
         draw.text((20, 50), f"Synthetic {index + 1}", fill="white")
         image.save(deck.root / item["file"])
         deck._finish(item, image)
-    app = create_app(deck, "synthetic-password")
+    app = create_app(deck, "synthetic-password", power_manager=Mock())
     assert app.extensions["catalog"].finished.wait(10)
     output = io.BytesIO()
     image.save(output, "JPEG")
@@ -71,6 +72,65 @@ def library_page(tmp_path):
         thread.join(10)
         server.server_close()
         app.extensions["catalog"].close()
+
+
+@pytest.mark.parametrize("action", ["shutdown", "reboot"])
+def test_header_power_confirmation_and_result(library_page, action):
+    page = library_page
+    requests, pending = [], []
+
+    def power(route):
+        requests.append(route.request.post_data_json)
+        pending.append(route)
+
+    page.route("**/api/system/power", power)
+    header = page.locator("header")
+    expect(header.get_by_role("button", name="Lock", exact=True)).to_be_visible()
+    for width, height in ((1440, 1100), (390, 844)):
+        page.set_viewport_size({"width": width, "height": height})
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        screenshot(page, f"power-header-{width}", full_page=False)
+        header.get_by_role("button", name="Power", exact=True).click()
+        page.get_by_role("combobox", name="Action", exact=True).select_option(action)
+        dialog = page.get_by_role("dialog")
+        submit = dialog.get_by_role(
+            "button", name="Shut down Pi" if action == "shutdown" else "Reboot Pi"
+        )
+        expect(submit).to_be_disabled()
+        page.get_by_label(f"Type {action.upper()} to confirm").fill("wrong")
+        expect(submit).to_be_disabled()
+        page.get_by_label(f"Type {action.upper()} to confirm").fill(action.upper())
+        expect(submit).to_be_enabled()
+        screenshot(page, f"power-{action}-{width}", full_page=False)
+        dialog.get_by_role("button", name="Cancel", exact=True).click()
+        expect(dialog).not_to_be_visible()
+        assert requests == []
+
+    header.get_by_role("button", name="Power", exact=True).click()
+    expect(page.get_by_label(f"Type {action.upper()} to confirm")).to_have_value("")
+    other = "reboot" if action == "shutdown" else "shutdown"
+    page.get_by_label(f"Type {action.upper()} to confirm").fill(action)
+    page.get_by_role("combobox", name="Action", exact=True).select_option(other)
+    expect(page.get_by_label(f"Type {other.upper()} to confirm")).to_have_value("")
+    page.get_by_role("combobox", name="Action", exact=True).select_option(action)
+    page.get_by_label(f"Type {action.upper()} to confirm").fill(action.upper())
+    submit.click()
+    expect(dialog.get_by_role("button", name="Close", exact=True)).to_be_disabled()
+    page.keyboard.press("Escape")
+    expect(dialog).to_be_visible()
+    pending.pop(0).fulfill(
+        status=409, json={"error": "Stop the rsync transfer before changing Pi power."}
+    )
+    expect(dialog.get_by_role("alert")).to_contain_text("Stop the rsync transfer")
+    expect(submit).to_be_enabled()
+    submit.click()
+    pending.pop(0).fulfill(status=202, json={"accepted": True, "action": action})
+    expect(page.get_by_role("status")).to_have_text(
+        "Pi is shutting down…" if action == "shutdown" else "Pi is rebooting…"
+    )
+    expect(dialog).not_to_be_visible()
+    assert requests == [{"action": action, "confirm": action.upper()}] * 2
+    screenshot(page, f"power-{action}-accepted", full_page=False)
 
 
 def test_library_navigation_and_viewer(library_page):

@@ -1,5 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# CameraDeck has no backing services or per-thread authentication to restore.
-echo "CameraDeck orb ready"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# Keep resume fast: report broken prerequisites rather than installing on wake.
+trap 'echo "CameraDeck prerequisites are incomplete; run .agents/setup before testing." >&2' ERR
+for command in uv node npm ffmpeg ffprobe rsync; do
+  command -v "$command" >/dev/null
+done
+node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
+test -x frontend/node_modules/.bin/tsc
+test -f static/dist/index.html
+.venv/bin/python - <<'PY'
+import pytest
+from simplejpeg import encode_jpeg_yuv_planes
+from playwright.sync_api import sync_playwright
+
+# Verify the same browser and launch flags used by the UI tests.
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path="/usr/bin/chromium",
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    browser.close()
+PY
+
+echo "CameraDeck orb ready: Python, JPEG encoder, Chromium, rsync, and frontend verified"

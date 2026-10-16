@@ -1,18 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 echo "==> Checking system dependencies"
+packages=()
 if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+  packages+=(ffmpeg)
+fi
+if ! command -v rsync >/dev/null; then
+  packages+=(rsync)
+fi
+# Browser tests default to this system executable, not Playwright's browser cache.
+if [[ ! -x /usr/bin/chromium ]]; then
+  packages+=(chromium)
+fi
+if ((${#packages[@]})); then
   sudo apt-get update
-  sudo apt-get install -y ffmpeg
+  sudo apt-get install -y "${packages[@]}"
 fi
 
 if ! command -v uv >/dev/null; then
   echo "uv is required but is not installed in this orb" >&2
   exit 1
 fi
+if ! command -v node >/dev/null || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'; then
+  echo "Node 22 or newer is required for the frontend build" >&2
+  exit 1
+fi
 
 echo "==> Installing locked Python dependencies"
-time uv sync --frozen
+# Preserve the orb-only JPEG encoder across warm setup runs.
+time uv sync --frozen --inexact
+
+echo "==> Installing the synthetic capture JPEG encoder"
+# On the Pi this comes from python3-picamera2; the x86 orb needs a wheel.
+time uv pip install --python .venv/bin/python simplejpeg==1.9.0
+
+echo "==> Installing and building the frontend"
+time npm --prefix frontend ci
+time npm --prefix frontend run build
+
+bash .agents/resume
 
 echo "==> CameraDeck orb setup complete"

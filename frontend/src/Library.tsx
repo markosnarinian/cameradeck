@@ -332,6 +332,12 @@ export function Library({
     });
   const offPage =
     selected.size - items.filter((item) => selected.has(item.id)).length;
+  const allItemsOnPageSelected =
+    items.length > 0 && items.every((item) => selected.has(item.id));
+  const selectPage = () => {
+    setSelected((current) => new Set([...current, ...items.map((item) => item.id)]));
+    setFeedback("");
+  };
   const remaining =
     progress?.total && progress.done && elapsed > 0
       ? Math.ceil((elapsed * (progress.total - progress.done)) / progress.done)
@@ -503,6 +509,13 @@ export function Library({
           {selected.size} selected
           {offPage > 0 ? ` · ${offPage} on other pages / filters` : ""}
         </span>
+        <Button
+          variant="ghost"
+          disabled={loading || busy || !items.length || allItemsOnPageSelected}
+          onClick={selectPage}
+        >
+          Select all on page
+        </Button>
         <Button
           variant="ghost"
           disabled={!selected.size || busy}

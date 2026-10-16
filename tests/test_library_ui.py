@@ -169,6 +169,25 @@ def test_library_navigation_and_viewer(library_page):
     screenshot(page, "photo-library-mobile")
 
 
+def test_library_select_all_on_page(library_page):
+    page = library_page
+    select_all = page.get_by_role("button", name="Select all on page", exact=True)
+    checks = page.get_by_role("checkbox")
+
+    expect(select_all).to_be_enabled()
+    select_all.click()
+    expect(page.locator(".selection-bar > span")).to_contain_text("40 selected")
+    expect(checks).to_have_count(40)
+    assert checks.evaluate_all("inputs => inputs.every(input => input.checked)")
+    expect(select_all).to_be_disabled()
+    screenshot(page, "library-select-all")
+
+    page.get_by_role("button", name="Clear", exact=True).click()
+    expect(page.locator(".selection-bar > span")).to_contain_text("0 selected")
+    assert checks.evaluate_all("inputs => inputs.every(input => !input.checked)")
+    expect(select_all).to_be_enabled()
+
+
 def test_library_mirrored_page_jumps(library_page):
     page = library_page
     base = page.url.split("/library")[0]

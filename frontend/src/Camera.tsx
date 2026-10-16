@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Settings2, Camera as CameraIcon } from "lucide-react";
 import { request, message } from "./api";
 import type { Status } from "./types";
@@ -12,7 +12,13 @@ import {
 } from "./components/ui/dialog";
 
 let snapshotPending: Promise<unknown> = Promise.resolve();
-function Preview({ enabled }: { enabled: boolean }) {
+function Preview({
+  enabled,
+  children,
+}: {
+  enabled: boolean;
+  children?: ReactNode;
+}) {
   const [src, setSrc] = useState(""),
     [note, setNote] = useState("Waiting for a fresh frame…");
   useEffect(() => {
@@ -110,6 +116,7 @@ function Preview({ enabled }: { enabled: boolean }) {
         <div className="preview-empty">
           <CameraIcon size={36} />
           <p role="status">{note}</p>
+          {children}
         </div>
       )}
     </div>
@@ -137,8 +144,40 @@ export function CameraPage({
     }
   }, [status]);
   const active = !!status?.sequence?.active;
+  const fresh =
+    connected &&
+    !!status?.ready &&
+    status.metadata_age != null &&
+    status.metadata_age <= 5;
+  const metadata = status?.metadata ?? {};
+  const readings = [
+    [
+      "Exposure",
+      "ExposureTime",
+      (v: number) =>
+        v < 1000
+          ? `${v.toFixed(0)} µs`
+          : v < 1_000_000
+            ? `${(v / 1000).toFixed(2)} ms`
+            : `${(v / 1_000_000).toFixed(2)} s`,
+    ],
+    ["Analogue gain", "AnalogueGain", (v: number) => `${v.toFixed(2)}×`],
+    [
+      "Sensor rate",
+      "FrameDuration",
+      (v: number) => (v > 0 ? `${(1_000_000 / v).toFixed(1)} fps` : "—"),
+    ],
+    ["Lens position", "LensPosition", (v: number) => `${v.toFixed(2)} dpt`],
+    ["White balance", "ColourTemperature", (v: number) => `${v.toFixed(0)} K`],
+    [
+      "Light level",
+      "Lux",
+      (v: number) =>
+        `${v.toLocaleString("en", { notation: "compact", maximumFractionDigits: 1 })} lx`,
+    ],
+  ] as const;
   return (
-    <>
+    <section className="camera-page" aria-label="Camera">
       <div className="heading">
         <h1>Camera</h1>
         <Button
@@ -149,20 +188,49 @@ export function CameraPage({
           <Settings2 size={17} /> Settings
         </Button>
       </div>
-      <Preview enabled={connected && !!status?.ready} />
-      {connected && status && !status.ready && (
-        <Button
-          variant="outline"
-          disabled={busy}
-          onClick={() =>
-            run(async () => {
-              await request("/api/configure", {});
-            })
-          }
-        >
-          Retry camera
-        </Button>
-      )}
+      <Preview enabled={connected && !!status?.ready}>
+        {connected && status && !status.ready && (
+          <Button
+            className="camera-retry"
+            variant="outline"
+            disabled={busy}
+            onClick={() =>
+              run(async () => {
+                await request("/api/configure", {});
+              })
+            }
+          >
+            Retry camera
+          </Button>
+        )}
+      </Preview>
+      <section
+        className="camera-readings"
+        aria-label="Measured camera statistics"
+      >
+        <div className="readings-heading">
+          <span>Camera readings</span>
+          <span className={fresh ? "readings-state fresh" : "readings-state"}>
+            {fresh
+              ? "Updating live"
+              : status?.metadata_age != null
+                ? "Readings stale"
+                : "Unavailable"}
+          </span>
+        </div>
+        <dl>
+          {readings.map(([label, key, format]) => (
+            <div key={key}>
+              <dt>{label}</dt>
+              <dd>
+                {fresh && Number.isFinite(metadata[key])
+                  ? format(metadata[key])
+                  : "—"}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </section>
       <div className="capture-bar">
         <Button
           disabled={busy || !connected || !status?.ready || active}
@@ -175,7 +243,7 @@ export function CameraPage({
           <CameraIcon size={18} /> Take photo
         </Button>
         <label className="inline-label">
-          Photos / second
+          <span>Photos / second</span>
           <Input
             aria-label="Photos per second"
             type="number"
@@ -231,7 +299,7 @@ export function CameraPage({
           )}
         </DialogContent>
       </Dialog>
-    </>
+    </section>
   );
 }
 

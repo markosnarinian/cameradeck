@@ -4,6 +4,7 @@ import base64
 import io
 import os
 import re
+import subprocess
 import threading
 from pathlib import Path
 from unittest.mock import Mock
@@ -61,9 +62,16 @@ def library_page(tmp_path):
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{server.server_port}/library")
             expect(page.get_by_role("heading", name="Locked")).to_be_visible()
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "--short=12", "HEAD"],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+            ).strip()
+            expect(page.locator(".revision")).to_have_text(f"Commit {revision}")
             page.get_by_label("Password").fill("synthetic-password")
             page.get_by_role("button", name="Sign in").click()
             expect(page.locator(".media-card")).to_have_count(40)
+            expect(page.locator("header .revision")).to_have_text(f"Commit {revision}")
             yield page
             assert not errors, errors
             browser.close()
@@ -709,6 +717,54 @@ def test_library_session_reload_recovery_and_settings(library_page):
     expect(page.locator(".media-card")).to_have_count(40)
 
 
+def test_transfer_delete_all_confirmation_and_result(library_page):
+    page = library_page
+    page.get_by_role("link", name="Transfer", exact=True).click()
+    base = page.url.split("/transfer")[0]
+    open_delete = page.get_by_role("button", name="Delete all media", exact=True)
+    open_delete.click()
+    dialog = page.get_by_role("dialog")
+    confirm = dialog.get_by_role(
+        "button", name="Permanently delete all media", exact=True
+    )
+    expect(confirm).to_be_disabled()
+    page.get_by_label("Type DELETE ALL to confirm").fill("DELETE")
+    expect(confirm).to_be_disabled()
+    dialog.get_by_role("button", name="Cancel", exact=True).click()
+    assert page.request.get(base + "/api/media").json()["total"] == 121
+    open_delete.click()
+    expect(page.get_by_label("Type DELETE ALL to confirm")).to_have_value("")
+    screenshot(page, "delete-all-confirmation-desktop", full_page=False)
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    page.get_by_label("Type DELETE ALL to confirm").fill("DELETE ALL")
+    screenshot(page, "delete-all-confirmation-narrow", full_page=False)
+    pending = []
+    page.route("**/api/media/delete-all", lambda route: pending.append(route))
+    confirm.click()
+    expect(dialog.get_by_role("button", name="Deleting…", exact=True)).to_be_disabled()
+    expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    page.keyboard.press("Escape")
+    expect(dialog).to_be_visible()
+    expect(dialog.get_by_role("status")).to_contain_text("Deleting all Library media")
+    assert pending[0].request.post_data_json == {"confirm": "DELETE ALL"}
+    pending.pop().fulfill(
+        status=409, json={"error": "CameraDeck must be idle before deleting all media."}
+    )
+    expect(dialog.get_by_role("alert")).to_contain_text("must be idle")
+    assert page.request.get(base + "/api/media").json()["total"] == 121
+    page.unroute("**/api/media/delete-all")
+    confirm.click()
+    expect(dialog).not_to_be_visible()
+    expect(
+        page.get_by_role("region", name="Free up space").get_by_role("status")
+    ).to_contain_text("Deleted 121 captures from the Pi.")
+    assert page.request.get(base + "/api/media").json()["total"] == 0
+    screenshot(page, "delete-all-success-narrow", full_page=False)
+    page.get_by_role("link", name="Library", exact=True).click()
+    expect(page.locator(".media-card")).to_have_count(0)
+
+
 def test_transfer_rsync_and_optional_upload(library_page):
     page = library_page
     page.get_by_role("link", name="Transfer", exact=True).click()
@@ -716,7 +772,10 @@ def test_transfer_rsync_and_optional_upload(library_page):
     expect(page.get_by_role("checkbox")).to_have_count(0)
     expect(page.get_by_role("button", name="Upload", exact=True)).to_have_count(0)
     command = page.get_by_label("rsync command").inner_text()
-    assert "--ignore-existing" in command
+    assert command.startswith(
+        "rsync --archive --info=progress2,stats2 --human-readable --whole-file"
+    )
+    assert "--ignore-existing" not in command
     for pattern in ("*.preview.jpg", "*.thumb.jpg", ".*", "*.tmp", "*.pending.*"):
         assert f"--exclude='{pattern}'" in command
     assert command.endswith(
@@ -935,8 +994,16 @@ def test_camera_preview_and_requested_vs_measured(library_page):
     status = page.request.get(base + "/api/status").json()
     status.update(
         ready=True,
+        low_space=False,
         metadata_age=0,
-        metadata={"ExposureTime": 2300, "AnalogueGain": 2},
+        metadata={
+            "ExposureTime": 2300,
+            "AnalogueGain": 2,
+            "FrameDuration": 40000,
+            "LensPosition": 1.75,
+            "ColourTemperature": 4870,
+            "Lux": 123.4,
+        },
         applied={"AeEnable": False, "ExposureTime": 1000, "AnalogueGain": 4},
         controls={
             "AeEnable": {
@@ -989,6 +1056,12 @@ def test_camera_preview_and_requested_vs_measured(library_page):
     page.wait_for_timeout(2500)
     assert page.evaluate("window.previewStats.calls") >= 3
     assert page.evaluate("window.previewStats.max") == 1
+    readings = page.get_by_role("region", name="Measured camera statistics")
+    expect(readings.locator("dd")).to_have_text(
+        ["2.30 ms", "2.00×", "25.0 fps", "1.75 dpt", "4870 K", "123.4 lx"]
+    )
+    status["metadata"]["Lux"] = 98.7
+    expect(readings.locator("dd").last).to_have_text("98.7 lx")
     screenshot(page, "photo-camera-desktop")
     payloads = []
 
@@ -1015,6 +1088,58 @@ def test_camera_preview_and_requested_vs_measured(library_page):
     expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible()
     assert payloads == [{"mode": "burst", "settings": {"rate": 5, "count": 0}}]
     expect(page.locator(".sequence")).to_contain_text("25 photos")
+    # Include reduced CSS viewports for Android display scaling/browser chrome,
+    # and iPhone landscape with Safari's toolbars still expanded.
+    viewports = (
+        (1440, 800),
+        (1280, 720),
+        (1920, 1080),
+        (1080, 1920),
+        (960, 540),
+        (600, 900),
+        (390, 664),
+        (844, 284),
+        (750, 284),
+    )
+    for capturing in (False, True):
+        status["sequence"]["active"] = capturing
+        expect(page.locator(".sequence")).to_contain_text(
+            "Capturing" if capturing else "Stopped"
+        )
+        for warning in (False, True):
+            status.update(low_space=warning, free_bytes=2.7 * 1024**3)
+            if warning:
+                expect(page.locator(".warning")).to_have_text(
+                    "Low disk space: 2.7 GB free. Capture stops below 256 MB — transfer and remove captures soon."
+                )
+            else:
+                expect(page.locator(".warning")).to_have_count(0)
+            for width, height in viewports:
+                page.set_viewport_size({"width": width, "height": height})
+                page.evaluate(
+                    "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+                )
+                assert page.evaluate("""() => {
+          const doc = document.documentElement;
+          const within = el => {
+            const r = el.getBoundingClientRect();
+            return r.left >= 0 && r.top >= 0 && r.right <= innerWidth + 1
+              && r.bottom <= innerHeight + 1 && r.width > 0 && r.height > 0;
+          };
+          const preview = document.querySelector('.preview').getBoundingClientRect();
+          const readings = document.querySelector('.camera-readings').getBoundingClientRect();
+          const controls = [...document.querySelectorAll('main button, main input')];
+          const noOverlap = controls.every((a, i) => controls.slice(i + 1).every(b => {
+            const x = a.getBoundingClientRect(), y = b.getBoundingClientRect();
+            return Math.min(x.right, y.right) <= Math.max(x.left, y.left) + 1
+              || Math.min(x.bottom, y.bottom) <= Math.max(x.top, y.top) + 1;
+          }));
+          return doc.scrollWidth <= innerWidth && doc.scrollHeight <= innerHeight
+            && readings.top >= preview.bottom && noOverlap
+            && [...document.querySelectorAll('dt, dd')].every(el => el.scrollWidth <= el.clientWidth + 1)
+            && [...document.querySelectorAll('header a, header button, main button, main input, dt, dd, .preview')].every(within);
+        }"""), (capturing, warning, width, height)
+    page.set_viewport_size({"width": 1440, "height": 1100})
     screenshot(page, "photo-camera-capturing")
     page.get_by_role("link", name="Library", exact=True).click()
     expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible()
@@ -1031,17 +1156,33 @@ def test_camera_preview_and_requested_vs_measured(library_page):
     status["metadata_age"] = 10
     expect(page.locator(".measured")).to_contain_text("Unavailable / stale")
     page.keyboard.press("Escape")
+    expect(readings).to_contain_text("Readings stale")
+    expect(readings.locator("dd")).to_have_text(["—"] * 6)
+    status["metadata_age"] = 0
+    status["metadata"] = {"ExposureTime": 125, "AnalogueGain": 1, "FrameDuration": 0}
+    expect(readings.locator("dd")).to_have_text(["125 µs", "1.00×", "—", "—", "—", "—"])
     page.set_viewport_size({"width": 390, "height": 844})
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     screenshot(page, "photo-camera-mobile")
+    page.route(
+        "**/api/status",
+        lambda route: route.fulfill(status=503, json={"error": "Offline"}),
+    )
+    expect(readings).to_contain_text("Readings stale")
+    expect(readings.locator("dd")).to_have_text(["—"] * 6)
+    expect(page.get_by_role("button", name="Take photo", exact=True)).to_be_disabled()
 
 
 def test_transfer_runs_and_supervises_rsync_on_the_pi(library_page, tmp_path_factory):
     page = library_page
     target = tmp_path_factory.mktemp("rsync-copy")
     page.get_by_role("link", name="Transfer", exact=True).click()
-    section = page.locator("section", has=page.get_by_role("heading", name="rsync from CameraDeck"))
-    expect(section.get_by_role("status")).to_contain_text("Not run since CameraDeck started")
+    section = page.locator(
+        "section", has=page.get_by_role("heading", name="rsync from CameraDeck")
+    )
+    expect(section.get_by_role("status")).to_contain_text(
+        "Not run since CameraDeck started"
+    )
     start = section.get_by_role("button", name="Start rsync")
     expect(start).to_be_enabled()
     section.get_by_label("Destination").fill("")

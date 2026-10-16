@@ -93,11 +93,10 @@ class RsyncTransfer:
     def command(self, destination):
         return [
             self.rsync,
-            "-r",
-            "--whole-file",
+            "--archive",
             "--info=progress2,stats2",
             "--human-readable",
-            "--ignore-existing",
+            "--whole-file",
             "--outbuf=N",
             "--timeout=120",
             "-e",

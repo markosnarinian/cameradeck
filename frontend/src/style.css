@@ -63,10 +63,21 @@ header {
   gap: 4px;
   margin-left: auto;
 }
+.header-brand {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 4px;
+}
 .brand {
   font-size: 19px;
   font-weight: 720;
   letter-spacing: -0.7px;
+}
+.revision {
+  color: var(--muted);
+  font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
 }
 nav {
   display: flex;
@@ -645,6 +656,9 @@ select {
   .brand {
     font-size: 17px;
   }
+  .revision {
+    margin-right: auto;
+  }
   nav {
     gap: 0;
     order: 1;
@@ -738,6 +752,277 @@ select {
   }
   .notice {
     font-size: 13px;
+  }
+}
+.camera-shell {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.camera-shell > header {
+  flex-shrink: 0;
+}
+.camera-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  padding: 16px 24px;
+  gap: 10px;
+}
+.camera-main > .notice,
+.camera-main > .sequence {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 8px 12px;
+  overflow-wrap: anywhere;
+}
+.camera-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.camera-page > .heading {
+  margin: 0;
+  flex-shrink: 0;
+}
+.camera-page > .preview {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  max-height: none;
+  aspect-ratio: auto;
+}
+.camera-page .preview-empty {
+  padding: 8px;
+  font-size: 13px;
+}
+.camera-page .preview-empty p {
+  margin: 6px 0;
+}
+.camera-readings {
+  flex-shrink: 0;
+}
+.readings-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.readings-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.readings-state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #9da5ad;
+}
+.readings-state.fresh::before {
+  background: #8bd5b0;
+}
+.camera-readings dl {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #1a1e22;
+}
+.camera-readings dl > div {
+  min-width: 0;
+  padding: 10px 14px;
+  border-left: 1px solid var(--border);
+}
+.camera-readings dl > div:first-child {
+  border-left: 0;
+}
+.camera-readings dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.camera-readings dd {
+  margin: 5px 0 0;
+  font-size: 19px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.camera-page > .capture-bar {
+  flex-shrink: 0;
+  padding: 0;
+  flex-wrap: nowrap;
+}
+.camera-page .button,
+.camera-page .input,
+.camera-shell header .button,
+.camera-shell nav a {
+  min-height: 44px;
+}
+.camera-retry {
+  margin-top: 8px;
+}
+@media (max-width: 740px) {
+  .camera-main {
+    padding: 12px 16px;
+  }
+  .camera-readings dl {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .camera-readings dl > div {
+    padding: 9px 10px;
+  }
+  .camera-readings dl > div:nth-child(4) {
+    border-left: 0;
+  }
+  .camera-readings dl > div:nth-child(n + 4) {
+    border-top: 1px solid var(--border);
+  }
+  .camera-readings dd {
+    font-size: 17px;
+  }
+  .camera-page > .capture-bar {
+    gap: 8px;
+    align-items: flex-end;
+  }
+  .camera-page .inline-label {
+    flex: 1;
+    margin-left: auto;
+    flex-direction: column;
+    gap: 3px;
+    align-items: flex-end;
+    font-size: 12px;
+  }
+  .camera-page .inline-label input {
+    width: 76px;
+    font-size: 16px;
+  }
+  .camera-page .capture-bar .button {
+    padding: 9px 12px;
+  }
+}
+@media (max-height: 540px) and (min-width: 641px) {
+  .camera-shell > header {
+    height: 48px;
+    gap: 20px;
+  }
+  .camera-main {
+    padding: 8px 16px;
+    gap: 6px;
+  }
+  .camera-main > .notice {
+    padding: 4px 8px;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .camera-main > .sequence {
+    padding: 2px 8px;
+    font-size: 12px;
+  }
+  .camera-page {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    grid-template-rows: minmax(0, 1fr) auto;
+    gap: 8px 16px;
+  }
+  .camera-page > .heading {
+    position: absolute;
+    right: 0;
+    top: 0;
+  }
+  .camera-page h1 {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .camera-page > .preview {
+    grid-column: 1;
+    grid-row: 1;
+    height: 100%;
+  }
+  .camera-page > .capture-bar {
+    grid-column: 2;
+    grid-row: 1 / 3;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-self: start;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .camera-page .capture-bar > .button {
+    grid-row: 2;
+    padding: 9px 12px;
+  }
+  .camera-page .capture-bar > .button:first-child {
+    grid-row: 1;
+    grid-column: 1;
+    justify-self: start;
+  }
+  .camera-page .inline-label {
+    grid-column: 1;
+    grid-row: 2;
+    flex: 0 0 auto;
+    margin-left: 0;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+  }
+  .camera-page .inline-label input {
+    width: 68px;
+    font-size: 16px;
+  }
+  .camera-page > .camera-readings {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .readings-heading {
+    margin-bottom: 4px;
+  }
+  .camera-readings dl {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+  .camera-readings dl > div {
+    padding: 6px;
+  }
+  .camera-readings dt {
+    font-size: 11px;
+  }
+  .camera-readings dl > div:nth-child(n + 4) {
+    border-top: 0;
+    border-left: 1px solid var(--border);
+  }
+  .camera-readings dd {
+    font-size: clamp(12px, 1.65vw, 14px);
+    margin-top: 3px;
+  }
+  .camera-page .preview-empty {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .camera-page .preview-empty > svg {
+    display: none;
+  }
+  .camera-page .preview-empty p,
+  .camera-retry {
+    margin: 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {

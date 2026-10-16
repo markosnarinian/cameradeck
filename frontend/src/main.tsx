@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
+import {
+  BrowserRouter,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router-dom";
 import { request, message, onUnauthorized } from "./api";
 import type { Status } from "./types";
 import { Button } from "./components/ui/button";
@@ -18,10 +24,12 @@ import { Transfer } from "./Transfer";
 import "./style.css";
 
 function App() {
+  const cameraPage = useLocation().pathname === "/";
   const [auth, setAuth] = useState<
       "checking" | "locked" | "ready" | "unreachable"
     >("checking"),
-    [required, setRequired] = useState(false);
+    [required, setRequired] = useState(false),
+    [revision, setRevision] = useState("unknown");
   const [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [status, setStatus] = useState<Status | null>(null),
@@ -41,6 +49,7 @@ function App() {
     try {
       const s = await request("/api/session");
       setRequired(s.required);
+      setRevision(s.revision);
       setAuth(s.authenticated || !s.required ? "ready" : "locked");
     } catch (e) {
       setAuth("unreachable");
@@ -121,6 +130,7 @@ function App() {
     return (
       <main className="auth">
         <h1>CameraDeck</h1>
+        <p className="revision">Commit {revision}</p>
         {auth === "checking" ? (
           <p role="status">Checking session…</p>
         ) : auth === "unreachable" ? (
@@ -167,11 +177,14 @@ function App() {
     );
   const seq = status?.sequence;
   return (
-    <>
+    <div className={cameraPage ? "app-shell camera-shell" : "app-shell"}>
       <header>
-        <NavLink to="/" className="brand">
-          CameraDeck
-        </NavLink>
+        <div className="header-brand">
+          <NavLink to="/" className="brand">
+            CameraDeck
+          </NavLink>
+          <span className="revision">Commit {revision}</span>
+        </div>
         <nav>
           <NavLink to="/" end>
             Camera
@@ -304,7 +317,7 @@ function App() {
           </form>
         </DialogContent>
       </Dialog>
-      <main>
+      <main className={cameraPage ? "camera-main" : undefined}>
         {error && (
           <div className="notice error" role="alert">
             {error}
@@ -387,7 +400,7 @@ function App() {
           />
         </Routes>
       </main>
-    </>
+    </div>
   );
 }
 createRoot(document.getElementById("root")!).render(

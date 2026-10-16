@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, Copy, Play, Square } from "lucide-react";
+import { Check, Copy, Play, Square, Trash2 } from "lucide-react";
 import { message, request } from "./api";
 import { Library } from "./Library";
 import type { RsyncStatus } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+} from "./components/ui/dialog";
 
-const RSYNC_COMMAND = `rsync -r --whole-file --info=progress2,stats2 --human-readable --ignore-existing \\
+const RSYNC_COMMAND = `rsync --archive --info=progress2,stats2 --human-readable --whole-file \\
   --exclude='*.preview.jpg' \\
   --exclude='*.thumb.jpg' \\
   --exclude='.*' \\
@@ -122,9 +128,8 @@ function PiRsync({ capturing }: { capturing: boolean }) {
       <h2 id="pi-rsync-heading">rsync from CameraDeck</h2>
       <p>
         The Pi pushes the same files to an SSH destination such as{" "}
-        <code>faros@192.168.1.10:/mnt/wd2tb/faros</code>, or to a
-        directory on a drive mounted on the Pi. Capture is blocked while it
-        runs.
+        <code>faros@192.168.1.10:/mnt/wd2tb/faros</code>, or to a directory on a
+        drive mounted on the Pi. Capture is blocked while it runs.
       </p>
       <form
         className="rsync-run"
@@ -158,7 +163,9 @@ function PiRsync({ capturing }: { capturing: boolean }) {
           <Button
             type="submit"
             disabled={busy || !rsync || capturing || !destination?.trim()}
-            title={capturing ? "Stop capture before starting rsync." : undefined}
+            title={
+              capturing ? "Stop capture before starting rsync." : undefined
+            }
           >
             <Play /> Start rsync
           </Button>
@@ -193,8 +200,10 @@ function PiRsync({ capturing }: { capturing: boolean }) {
                       `${progress.transferred} transferred`,
                       progress.rate,
                       active && `ETA ${progress.eta}`,
-                      progress.files !== null && `${progress.files} files copied`,
-                      progress.scanning && "still listing files; total may grow",
+                      progress.files !== null &&
+                        `${progress.files} files copied`,
+                      progress.scanning &&
+                        "still listing files; total may grow",
                     ]
                       .filter(Boolean)
                       .join(" · ")
@@ -251,7 +260,37 @@ function PiRsync({ capturing }: { capturing: boolean }) {
 }
 
 export function Transfer({ capturing }: { capturing: boolean }) {
-  const [uploadOpened, setUploadOpened] = useState(false);
+  const [uploadOpened, setUploadOpened] = useState(false),
+    [uploadRevision, setUploadRevision] = useState(0),
+    [deleteOpen, setDeleteOpen] = useState(false),
+    [confirmation, setConfirmation] = useState(""),
+    [deleting, setDeleting] = useState(false),
+    [deleteError, setDeleteError] = useState(""),
+    [feedback, setFeedback] = useState("");
+  const removeAll = async () => {
+    setDeleting(true);
+    setDeleteError("");
+    setFeedback("");
+    try {
+      const result: { deleted: string[]; missing: string[] } = await request(
+        "/api/media/delete-all",
+        { confirm: confirmation },
+        { timeout: 0 },
+      );
+      setUploadRevision((value) => value + 1);
+      setFeedback(
+        `Deleted ${result.deleted.length} captures from the Pi.` +
+          (result.missing.length
+            ? ` ${result.missing.length} unavailable captures could not be deleted. Check the Library.`
+            : " Remote copies were not changed."),
+      );
+      setDeleteOpen(false);
+    } catch (e) {
+      setDeleteError(message(e));
+    } finally {
+      setDeleting(false);
+    }
+  };
   return (
     <>
       <div className="heading">
@@ -261,15 +300,18 @@ export function Transfer({ capturing }: { capturing: boolean }) {
         <h2 id="rsync-heading">rsync</h2>
         <p>Run on the Pi after stopping capture.</p>
         <div className="rsync-command-wrap">
-          <pre className="rsync-command" tabIndex={0} aria-label="rsync command">
+          <pre
+            className="rsync-command"
+            tabIndex={0}
+            aria-label="rsync command"
+          >
             <code>{RSYNC_COMMAND}</code>
           </pre>
           <CopyButton className="rsync-copy" text={RSYNC_COMMAND} />
         </div>
         <p>
           Copies originals and metadata; skips previews, thumbnails, internal
-          files and temporary sidecars. Existing files are skipped, not
-          repaired.
+          files and temporary sidecars.
         </p>
       </section>
       <PiRsync capturing={capturing} />
@@ -280,8 +322,111 @@ export function Transfer({ capturing }: { capturing: boolean }) {
         }}
       >
         <summary>S3 upload</summary>
-        {uploadOpened && <Library capturing={capturing} uploading />}
+        {uploadOpened && (
+          <Library key={uploadRevision} capturing={capturing} uploading />
+        )}
       </details>
+      <section
+        className="transfer-section"
+        aria-labelledby="delete-all-heading"
+      >
+        <h2 id="delete-all-heading">Free up space</h2>
+        <p>
+          After verifying your remote copies, permanently delete all Library
+          photos and videos from the Pi, including originals, metadata,
+          thumbnails, and previews. Remote copies and CameraDeck settings are
+          not changed.
+        </p>
+        <Button
+          variant="destructive"
+          disabled={capturing || deleting}
+          onClick={() => {
+            setConfirmation("");
+            setDeleteError("");
+            setDeleteOpen(true);
+          }}
+        >
+          <Trash2 /> Delete all media
+        </Button>
+        {capturing && (
+          <p className="muted">Stop capture before deleting all media.</p>
+        )}
+        {feedback && <p role="status">{feedback}</p>}
+      </section>
+      <Dialog
+        open={deleteOpen}
+        onOpenChange={(open) => {
+          if (!deleting) setDeleteOpen(open);
+        }}
+      >
+        <DialogContent
+          closeDisabled={deleting}
+          onEscapeKeyDown={(e) => {
+            if (deleting) e.preventDefault();
+          }}
+          onPointerDownOutside={(e) => {
+            if (deleting) e.preventDefault();
+          }}
+        >
+          <DialogTitle>Delete all media?</DialogTitle>
+          <DialogDescription>
+            This permanently removes every Library photo and video from the Pi,
+            not just selected items. This cannot be undone. Verify that your
+            transfer finished and your remote copies are complete first.
+          </DialogDescription>
+          <p>
+            CameraDeck must be idle. This does not verify or delete remote
+            copies.
+          </p>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (confirmation === "DELETE ALL" && !deleting && !capturing)
+                void removeAll();
+            }}
+          >
+            <label className="field">
+              Type DELETE ALL to confirm
+              <Input
+                value={confirmation}
+                onChange={(e) => setConfirmation(e.target.value)}
+                disabled={deleting}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            {deleteError && (
+              <div className="error" role="alert">
+                {deleteError}
+              </div>
+            )}
+            <div className="viewer-actions">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={deleting}
+                onClick={() => setDeleteOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="destructive"
+                disabled={
+                  deleting || capturing || confirmation !== "DELETE ALL"
+                }
+              >
+                {deleting ? "Deleting…" : "Permanently delete all media"}
+              </Button>
+            </div>
+            {deleting && (
+              <p role="status">
+                Deleting all Library media… Keep this page open.
+              </p>
+            )}
+          </form>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

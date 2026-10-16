@@ -101,7 +101,10 @@ def test_network_startup_preserves_existing_password(tmp_path, monkeypatch):
 
 def test_authentication_and_origin(deck, app_factory):
     client = app_factory(deck, "test-password").test_client()
-    assert client.get("/api/session").json == {"authenticated": False, "required": True}
+    session = client.get("/api/session").json
+    assert session["authenticated"] is False
+    assert session["required"] is True
+    assert re.fullmatch(r"[0-9a-f]{12}|unknown", session["revision"])
     for route in ["/api/status", "/api/media", "/stream.mjpg", "/media/test/original"]:
         assert client.get(route).status_code == 401
     # Reject unauthenticated Library bodies before parsing unbounded JSON.
@@ -117,7 +120,7 @@ def test_authentication_and_origin(deck, app_factory):
     assert (
         client.post("/api/login", json={"password": "test-password"}).status_code == 200
     )
-    assert client.get("/api/session").json == {"authenticated": True, "required": True}
+    assert client.get("/api/session").json == {**session, "authenticated": True}
     cookie = client.get_cookie("session")
     restarted = app_factory(CameraDeck(deck.root), "test-password").test_client()
     restarted.set_cookie("session", cookie.value)
@@ -140,6 +143,56 @@ def test_authentication_and_origin(deck, app_factory):
     )
     assert restarted.post("/api/logout", json={}).status_code == 200
     assert restarted.get("/api/session").json["authenticated"] is False
+
+
+def test_revision_identifies_head_at_startup_not_later_checkout(
+    deck, app_factory, tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(source), *args], text=True
+        ).strip()
+
+    git("init", "-q")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "first",
+    )
+    first = git("rev-parse", "--short=12", "HEAD")
+    monkeypatch.setattr("app.__file__", str(source / "app.py"))
+    # Local edits deliberately do not claim to have a different commit ID.
+    (source / "app.py").write_text("uncommitted source")
+    client = app_factory(deck).test_client()
+    assert client.get("/api/session").json["revision"] == first
+    git("add", "app.py")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "second",
+    )
+    second = git("rev-parse", "--short=12", "HEAD")
+    assert first != second
+    assert client.get("/api/session").json["revision"] == first
+    restarted = app_factory(deck).test_client()
+    assert restarted.get("/api/session").json["revision"] == second
+    (source / ".git").rename(source / "git-unavailable")
+    assert (
+        app_factory(deck).test_client().get("/api/session").json["revision"]
+        == "unknown"
+    )
 
 
 def test_login_rate_limit(deck, app_factory):
@@ -173,7 +226,10 @@ def test_request_validation_and_host(client):
     )
     assert client.post("/api/configure", json=[]).status_code == 400
     assert client.post("/api/controls", data="Brightness=1").status_code == 400
-    assert client.get("/api/session").json == {"authenticated": True, "required": False}
+    session = client.get("/api/session").json
+    assert session["authenticated"] is True
+    assert session["required"] is False
+    assert re.fullmatch(r"[0-9a-f]{12}|unknown", session["revision"])
 
 
 def test_preview_requires_fresh_frame(deck, client, monkeypatch):
@@ -533,6 +589,132 @@ def test_bulk_download_and_delete(deck, client, tmp_path, monkeypatch):
     assert client.post("/api/login", json={"password": "x" * 20000}).status_code == 413
 
 
+def test_delete_all_requires_confirmation_and_preserves_internal_files(deck, client):
+    entries = [make_media(deck) for _ in range(103)]
+    video = entries[-1]
+    (deck.root / video["file"]).rename(deck.root / (video["id"] + ".mp4"))
+    video.update(kind="video", file=video["id"] + ".mp4")
+    (deck.root / (video["id"] + ".json")).write_text(json.dumps(video))
+    preserved = {
+        name: b"preserve this"
+        for name in (
+            ".rotation",
+            ".time_offset",
+            ".uploads.sqlite3",
+            ".rsync-destination",
+        )
+    }
+    preserved[".session-key"] = (deck.root / ".session-key").read_bytes()
+    for name, content in preserved.items():
+        (deck.root / name).write_bytes(content)
+    for confirmation in ({}, {"confirm": "DELETE"}, {"confirm": True}):
+        assert (
+            client.post("/api/media/delete-all", json=confirmation).status_code == 400
+        )
+        assert client.get("/api/media").json["total"] == 103
+    response = client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"})
+    assert response.status_code == 200
+    assert set(response.json["deleted"]) == {entry["id"] for entry in entries}
+    assert response.json["missing"] == []
+    assert client.get("/api/media").json["total"] == 0
+    for entry in entries:
+        assert not list(deck.root.glob(entry["id"] + ".*"))
+    for name, content in preserved.items():
+        assert (deck.root / name).read_bytes() == content
+    assert client.post(
+        "/api/media/delete-all", json={"confirm": "DELETE ALL"}
+    ).json == {"deleted": [], "missing": []}
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["capture", "rsync", "indexing", "recovery", "power", "download", "zip"],
+)
+def test_delete_all_refuses_busy_media(deck, app_factory, operation):
+    power = Mock(pending=False)
+    rsync = Mock(active=False)
+    app = app_factory(deck, power_manager=power, rsync=rsync)
+    client = app.test_client()
+    entry = make_media(deck)
+    download = None
+    if operation == "capture":
+        deck.sequence = {"active": True}
+    elif operation == "rsync":
+        rsync.active = True
+    elif operation == "indexing":
+        app.extensions["catalog"].indexing = True
+    elif operation == "recovery":
+        deck.recovery_worker = Mock()
+        deck.recovery_worker.is_alive.return_value = True
+    elif operation == "power":
+        power.pending = True
+    elif operation == "download":
+        download = client.get(
+            f'/media/{entry["id"]}/original?download=1', buffered=False
+        )
+    else:
+        download = client.post(
+            "/api/media/download", json={"ids": [entry["id"]]}, buffered=False
+        )
+    try:
+        response = client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"})
+        assert response.status_code == 409
+        assert (deck.root / entry["file"]).read_bytes() == b"photo"
+        assert client.get("/api/media").json["total"] == 1
+    finally:
+        if download:
+            download.close()
+
+
+def test_delete_all_excludes_uploads_and_releases_after_error(deck, app_factory):
+    app = app_factory(deck)
+    client = app.test_client()
+    entry = make_media(deck)
+    started, release = threading.Event(), threading.Event()
+    catalog = app.extensions["catalog"]
+    remove = catalog.remove
+
+    def paused_remove(ident):
+        started.set()
+        assert release.wait(10)
+        return remove(ident)
+
+    catalog.remove = paused_remove
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            app.test_client().post(
+                "/api/media/delete-all", json={"confirm": "DELETE ALL"}
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert started.wait(10)
+        assert (
+            client.post(
+                "/api/media/upload", json={"ids": [entry["id"]], "bucket": "archive"}
+            ).status_code
+            == 409
+        )
+    finally:
+        release.set()
+        worker.join(10)
+    assert results[0].status_code == 200
+    # Invalid metadata must not leave the exclusive deletion gate closed.
+    (deck.root / (entry["id"] + ".json")).write_text("invalid JSON")
+    assert (
+        client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"}).status_code
+        == 400
+    )
+    assert client.get("/api/activity").json == {"idle": True, "operations": {}}
+    (deck.root / (entry["id"] + ".json")).unlink()
+    assert (
+        client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"}).status_code
+        == 200
+    )
+
+
 def test_activity_reports_work_a_stop_would_interrupt(deck, app_factory):
     seen = []
     uploader = Mock()
@@ -673,6 +855,11 @@ def test_rsync_from_cameradeck_copies_originals_and_metadata(
     (deck.root / "clip.pending.json").write_text("{}")
     target = tmp_path / "copy"
     target.mkdir()
+    # An incomplete destination must be replaced, not skipped; archive mode
+    # preserves the original's mode and modification time.
+    (target / item["file"]).write_bytes(b"incomplete")
+    original = deck.root / item["file"]
+    original.chmod(0o640)
     for bad in ("-e sh", str(deck.root / "sub"), "relative/path", "host::module"):
         response = client.post("/api/transfer/rsync/start", json={"destination": bad})
         assert response.status_code == 400, bad
@@ -680,16 +867,23 @@ def test_rsync_from_cameradeck_copies_originals_and_metadata(
         "/api/transfer/rsync/start", json={"destination": str(target)}
     )
     assert response.status_code == 202
+    assert response.json["job"]["command"].startswith(
+        "rsync --archive --info=progress2,stats2 --human-readable --whole-file"
+    )
+    assert "--ignore-existing" not in response.json["job"]["command"]
     status = wait_for_rsync(client)
     assert status["state"] == "succeeded", status
     assert status["job"]["exit_code"] == 0
     assert status["job"]["progress"]["percent"] == 100
     assert {p.name for p in target.iterdir()} == {item["file"], item["id"] + ".json"}
     assert (target / item["file"]).read_bytes() == b"x" * 300000
+    copied = (target / item["file"]).stat()
+    assert copied.st_mode == original.stat().st_mode
+    assert int(copied.st_mtime) == int(original.stat().st_mtime)
     # The last destination is remembered, inside the excluded hidden namespace.
-    assert app_factory(deck).test_client().get(
-        "/api/transfer/rsync"
-    ).json["destination"] == str(target)
+    assert app_factory(deck).test_client().get("/api/transfer/rsync").json[
+        "destination"
+    ] == str(target)
 
 
 def test_rsync_stop_and_capture_exclusion(deck, app_factory, tmp_path):
@@ -703,13 +897,15 @@ def test_rsync_stop_and_capture_exclusion(deck, app_factory, tmp_path):
     client = app_factory(deck, rsync=rsync).test_client()
     deck.sequence = {"active": True}
     response = client.post(
-        "/api/transfer/rsync/start", json={"destination": "me@mac.local:/Volumes/WD APFS/x/"}
+        "/api/transfer/rsync/start",
+        json={"destination": "me@mac.local:/Volumes/WD APFS/x/"},
     )
     assert response.status_code == 409
     deck.sequence = None
     assert (
         client.post(
-            "/api/transfer/rsync/start", json={"destination": "me@mac.local:/Volumes/WD APFS/x/"}
+            "/api/transfer/rsync/start",
+            json={"destination": "me@mac.local:/Volumes/WD APFS/x/"},
         ).status_code
         == 202
     )
@@ -728,16 +924,20 @@ def test_rsync_stop_and_capture_exclusion(deck, app_factory, tmp_path):
         "scanning": True,
     }
     assert client.get("/api/status").json["transfer_active"] is True
-    assert client.post(
-        "/api/transfer/rsync/start", json={"destination": "me@mac.local:/x/"}
-    ).status_code == 409
-    started = client.post(
-        "/api/sequence/start", json={"mode": "burst", "settings": {}}
+    assert (
+        client.post(
+            "/api/transfer/rsync/start", json={"destination": "me@mac.local:/x/"}
+        ).status_code
+        == 409
     )
+    started = client.post("/api/sequence/start", json={"mode": "burst", "settings": {}})
     assert started.status_code == 409 and "rsync" in started.json["error"]
-    assert client.post(
-        "/api/system/power", json={"action": "reboot", "confirm": "reboot"}
-    ).status_code == 409
+    assert (
+        client.post(
+            "/api/system/power", json={"action": "reboot", "confirm": "reboot"}
+        ).status_code
+        == 409
+    )
     assert client.post("/api/transfer/rsync/stop", json={}).json["state"] == "stopping"
     status = wait_for_rsync(client, 5)
     assert status["state"] == "cancelled"

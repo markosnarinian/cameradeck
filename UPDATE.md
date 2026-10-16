@@ -70,10 +70,10 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   and `/transfer` reloads must reach Flask, not a proxy filesystem lookup.
 - Transfer tools have moved off the Library page. `/transfer` shows the Pi push
   rsync command first; optional S3 upload is collapsed until opened. For rsync,
-  stop capture first and exclude hidden internal files (`--exclude='.*'`),
-  previews, thumbnails, and temporary/pending sidecars as shown in `README.md`.
-  Never copy the private `.session-key` to a shared destination. `--ignore-existing`
-  does not repair previously copied incomplete files.
+  stop capture first and use `--archive --info=progress2,stats2 --human-readable`
+  `--whole-file`, excluding hidden internal files (`--exclude='.*'`), previews,
+  thumbnails, and temporary/pending sidecars as shown in `README.md`. Never copy
+  the private `.session-key` to a shared destination.
 - `/transfer` can now run and supervise rsync on the Pi (**rsync from
   CameraDeck**), pushing to an SSH destination or a local directory. It needs
   the `rsync` system package on the Pi (`sudo apt install rsync` if

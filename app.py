@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -42,9 +43,17 @@ class Activity:
     def __init__(self):
         self.lock = threading.Lock()
         self.counts = Counter()
+        self.exclusive = False
 
-    def begin(self, kind):
+    def begin(self, kind, *, exclusive=False):
         with self.lock:
+            if self.exclusive or (exclusive and any(self.counts.values())):
+                abort(
+                    409,
+                    description="Wait for media operations to finish before continuing.",
+                )
+            if exclusive:
+                self.exclusive = True
             self.counts[kind] += 1
         ended = []
 
@@ -53,12 +62,14 @@ class Activity:
                 if not ended:
                     ended.append(True)
                     self.counts[kind] -= 1
+                    if exclusive:
+                        self.exclusive = False
 
         return end
 
     @contextmanager
-    def track(self, kind):
-        end = self.begin(kind)
+    def track(self, kind, *, exclusive=False):
+        end = self.begin(kind, exclusive=exclusive)
         try:
             yield
         finally:
@@ -70,6 +81,20 @@ class Activity:
 
 
 BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+
+
+def head_commit():
+    """Return the source revision that started this CameraDeck process."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=Path(__file__).parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def normalize_endpoint(value):
@@ -110,6 +135,7 @@ def create_app(
 ):
     app = Flask(__name__, static_folder=None)
     frontend = Path(__file__).parent / "static" / "dist"
+    revision = head_commit()
     key_path = deck.root / ".session-key"
     try:
         with open(
@@ -226,7 +252,9 @@ def create_app(
 
     @app.get("/api/session")
     def session_status():
-        return jsonify(authenticated=authenticated(), required=bool(password))
+        return jsonify(
+            authenticated=authenticated(), required=bool(password), revision=revision
+        )
 
     @app.post("/api/logout")
     def logout():
@@ -525,6 +553,31 @@ def create_app(
         with activity.track("deletion"):
             return delete_entries(ids_from_request())
 
+    @app.post("/api/media/delete-all")
+    def delete_all():
+        if request.get_json().get("confirm") != "DELETE ALL":
+            raise ValueError("Type DELETE ALL to confirm.")
+        # Keep capture/rsync starts out until the entire deletion is complete.
+        with deck.lock:
+            if (
+                (deck.sequence and deck.sequence["active"])
+                or rsync.active
+                or catalog.indexing
+                or (deck.recovery_worker and deck.recovery_worker.is_alive())
+                or getattr(power_manager, "pending", False) is True
+            ):
+                abort(
+                    409,
+                    description="CameraDeck must be idle before deleting all media.",
+                )
+            with activity.track("deletion", exclusive=True):
+                identifiers = [
+                    path.stem
+                    for path in deck.root.glob("*.json")
+                    if ID.fullmatch(path.stem)
+                ]
+                return delete_entries(identifiers)
+
     def delete_entries(identifiers):
         entries, missing = [], []
         for ident in identifiers:
@@ -655,17 +708,23 @@ def create_app(
         confirmation = data.get("confirm")
         if not isinstance(confirmation, str) or confirmation.casefold() != action:
             raise ValueError(f"Type {action.upper()} to confirm.")
-        if deck.sequence and deck.sequence["active"]:
-            return (
-                jsonify(error="Stop the capture sequence before changing Pi power."),
-                409,
-            )
-        if rsync.active:
-            return jsonify(error="Stop the rsync transfer before changing Pi power."), 409
-        try:
-            power_manager.schedule(action)
-        except RuntimeError as exc:
-            return jsonify(error=str(exc)), 409
+        with deck.lock:
+            if deck.sequence and deck.sequence["active"]:
+                return (
+                    jsonify(
+                        error="Stop the capture sequence before changing Pi power."
+                    ),
+                    409,
+                )
+            if rsync.active:
+                return (
+                    jsonify(error="Stop the rsync transfer before changing Pi power."),
+                    409,
+                )
+            try:
+                power_manager.schedule(action)
+            except RuntimeError as exc:
+                return jsonify(error=str(exc)), 409
         return jsonify(accepted=True, action=action), 202
 
     return app

@@ -141,7 +141,7 @@ and use reliable power. Abrupt power loss can damage the filesystem.
 The Transfer page shows a command to run on the Pi after stopping capture:
 
 ```bash
-rsync -r --whole-file --info=progress2,stats2 --human-readable --ignore-existing \
+rsync --archive --info=progress2,stats2 --human-readable --whole-file \
   --exclude='*.preview.jpg' \
   --exclude='*.thumb.jpg' \
   --exclude='.*' \
@@ -154,9 +154,7 @@ rsync -r --whole-file --info=progress2,stats2 --human-readable --ignore-existing
 Adjust host and destination if needed. This copies originals and JSON metadata,
 not previews/thumbnails or internal files such as `.session-key` (private),
 `.library.sqlite3` or `.uploads.sqlite3`, nor temporary/pending sidecars.
-It never deletes the source. `--ignore-existing` skips destination files even
-if incomplete or corrupted; inspect and repair any files copied during capture
-before using this command again. Keep originals on the Pi until the copy is verified.
+It never deletes the source. Keep originals on the Pi until the copy is verified.
 
 ### Run rsync from CameraDeck
 

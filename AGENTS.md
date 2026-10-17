@@ -1,5 +1,6 @@
 # Agent instructions
 
+- All typed confirmation prompts must accept case-insensitive input.
 - See `UPDATE.md` for how to update an already-deployed checkout of this
   software on its Raspberry Pi target.
 - After changing CameraDeck software on a device where CameraDeck is already

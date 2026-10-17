@@ -612,7 +612,7 @@ def test_delete_all_requires_confirmation_and_preserves_internal_files(deck, cli
             client.post("/api/media/delete-all", json=confirmation).status_code == 400
         )
         assert client.get("/api/media").json["total"] == 103
-    response = client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"})
+    response = client.post("/api/media/delete-all", json={"confirm": "delete all"})
     assert response.status_code == 200
     assert set(response.json["deleted"]) == {entry["id"] for entry in entries}
     assert response.json["missing"] == []

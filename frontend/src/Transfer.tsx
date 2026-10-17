@@ -381,7 +381,11 @@ export function Transfer({ capturing }: { capturing: boolean }) {
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              if (confirmation === "DELETE ALL" && !deleting && !capturing)
+              if (
+                confirmation.toLowerCase() === "delete all" &&
+                !deleting &&
+                !capturing
+              )
                 void removeAll();
             }}
           >
@@ -413,7 +417,9 @@ export function Transfer({ capturing }: { capturing: boolean }) {
                 type="submit"
                 variant="destructive"
                 disabled={
-                  deleting || capturing || confirmation !== "DELETE ALL"
+                  deleting ||
+                  capturing ||
+                  confirmation.toLowerCase() !== "delete all"
                 }
               >
                 {deleting ? "Deleting…" : "Permanently delete all media"}

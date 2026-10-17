@@ -556,7 +556,8 @@ def create_app(
 
     @app.post("/api/media/delete-all")
     def delete_all():
-        if request.get_json().get("confirm") != "DELETE ALL":
+        confirmation = request.get_json().get("confirm")
+        if not isinstance(confirmation, str) or confirmation.casefold() != "delete all":
             raise ValueError("Type DELETE ALL to confirm.")
         # Keep capture/rsync starts out until the entire deletion is complete.
         with deck.lock:

@@ -737,7 +737,7 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     screenshot(page, "delete-all-confirmation-desktop", full_page=False)
     page.set_viewport_size({"width": 390, "height": 844})
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-    page.get_by_label("Type DELETE ALL to confirm").fill("DELETE ALL")
+    page.get_by_label("Type DELETE ALL to confirm").fill("delete all")
     screenshot(page, "delete-all-confirmation-narrow", full_page=False)
     pending = []
     page.route("**/api/media/delete-all", lambda route: pending.append(route))
@@ -747,7 +747,7 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     page.keyboard.press("Escape")
     expect(dialog).to_be_visible()
     expect(dialog.get_by_role("status")).to_contain_text("Deleting all Library media")
-    assert pending[0].request.post_data_json == {"confirm": "DELETE ALL"}
+    assert pending[0].request.post_data_json == {"confirm": "delete all"}
     pending.pop().fulfill(
         status=409, json={"error": "CameraDeck must be idle before deleting all media."}
     )

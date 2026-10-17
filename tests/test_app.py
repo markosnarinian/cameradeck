@@ -624,6 +624,39 @@ def test_delete_all_requires_confirmation_and_preserves_internal_files(deck, cli
 
 
 @pytest.mark.parametrize(
+    "metadata", ["", "invalid JSON", "null", "[]", '{"file": "keep.jpg"}']
+)
+def test_delete_all_handles_damaged_metadata(deck, client, metadata):
+    healthy = make_media(deck)
+    damaged = make_media(deck)
+    (deck.root / (damaged["id"] + ".json")).write_text(metadata)
+    # A completed sidecar whose original is gone must also be cleaned up.
+    missing = make_media(deck)
+    (deck.root / missing["file"]).unlink()
+    preserved = {
+        "keep.jpg": b"unrelated original",
+        "notes.json": b"not capture metadata",
+        damaged["id"] + ".txt": b"unrelated file with a capture prefix",
+        "20260101_120000_12345678.pending.json": b"pending metadata",
+        "20260101_120000_12345678.mp4": b"pending original",
+    }
+    for name, data in preserved.items():
+        (deck.root / name).write_bytes(data)
+    response = client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"})
+    assert response.status_code == 200
+    assert set(response.json["deleted"]) == {
+        entry["id"] for entry in (healthy, damaged, missing)
+    }
+    assert response.json["missing"] == []
+    assert client.get("/api/media").json["total"] == 0
+    for entry in (healthy, damaged, missing):
+        for suffix in (".jpg", ".thumb.jpg", ".preview.jpg", ".json"):
+            assert not (deck.root / (entry["id"] + suffix)).exists()
+    for name, data in preserved.items():
+        assert (deck.root / name).read_bytes() == data
+
+
+@pytest.mark.parametrize(
     "operation",
     ["capture", "rsync", "indexing", "recovery", "power", "download", "zip"],
 )
@@ -690,14 +723,17 @@ def test_delete_all_releases_after_error(deck, app_factory):
     release.set()
     worker.join(10)
     assert results[0].status_code == 200
-    # Invalid metadata must not leave the exclusive deletion gate closed.
-    (deck.root / (entry["id"] + ".json")).write_text("invalid JSON")
+    # A filesystem error must not leave the exclusive deletion gate closed.
+    entry = make_media(deck)
+    original = deck.root / entry["file"]
+    original.unlink()
+    original.mkdir()
     assert (
         client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"}).status_code
-        == 400
+        == 500
     )
     assert client.get("/api/activity").json == {"idle": True, "operations": {}}
-    (deck.root / (entry["id"] + ".json")).unlink()
+    original.rmdir()
     assert (
         client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"}).status_code
         == 200

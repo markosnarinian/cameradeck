@@ -541,9 +541,23 @@ def create_app(
                 identifiers = [
                     path.stem
                     for path in deck.root.glob("*.json")
-                    if ID.fullmatch(path.stem)
+                    if ID.fullmatch(path.stem) and path.is_file()
                 ]
-                return delete_entries(identifiers)
+                # Completed sidecars can be empty/corrupt. Use only CameraDeck's
+                # filenames, never paths read from damaged metadata or a glob
+                # that could also remove pending clips or unrelated files.
+                for ident in identifiers:
+                    with catalog.lock:
+                        for suffix in (
+                            ".jpg",
+                            ".mp4",
+                            ".thumb.jpg",
+                            ".preview.jpg",
+                            ".json",
+                        ):
+                            (deck.root / (ident + suffix)).unlink(missing_ok=True)
+                        catalog.remove(ident)
+                return jsonify(deleted=identifiers, missing=[])
 
     def delete_entries(identifiers):
         entries, missing = [], []

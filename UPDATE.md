@@ -6,7 +6,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 ## Before you start
 
 - Only update while CameraDeck is idle or stopped: nothing in progress that
-  stopping it would interrupt (capture, rsync, S3 upload, deletion, download,
+  stopping it would interrupt (capture, rsync, deletion, download,
   library indexing, clip recovery, pending shutdown/reboot). Step 1 covers how
   to check. Captures and transfers keep running until someone stops them, even
   after every browser disconnects, so if one is active, leave it to whoever
@@ -15,10 +15,9 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 - Note whether CameraDeck runs as the `cameradeck` systemd service or is
   started manually (`uv run python app.py`). Use the matching stop/start
   steps below.
-- Never delete `.uploads.sqlite3` (the S3 upload ledger) or the `media/`
-  directory during an update. Both live outside the git checkout's tracked
+- Never delete the `media/` directory during an update. It lives outside the git checkout's tracked
   files and are left alone by `git pull`.
-- `.env` (password, S3 credentials/endpoint) is not tracked in git and is
+- `.env` (password) is not tracked in git and is
   not touched by an update.
 - Mounting orientation now persists in `.rotation` inside the configured
   media directory. After updating an older install, apply your preferred
@@ -30,7 +29,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 - Capture is now photo-only, defaulting to **5 photos/second until stopped**.
   Video recording, tests/experiments, separate-still sequences, mode selection,
   Help, and focus scoring are removed. Existing media, pending clips, experiment
-  directories, `.rotation`, `.time_offset`, and the S3 ledger are retained.
+  directories, `.rotation`, and `.time_offset` are retained.
   Old clients/scripts using removed routes must be updated. Stop old runs before
   installing this release; never assume closing the browser stopped them.
 - Scripts supplying temporary burst controls to `/api/sequence/start` now have
@@ -53,9 +52,9 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   updating. Selection and bulk actions no longer have a capture-count limit.
   The matching backend also accepts Library ID lists larger than 16 KiB. If using
   a reverse proxy, allow large JSON bodies on `/api/media/range`,
-  `/api/media/download`, `/api/media/delete`, and `/api/media/upload`, and allow long
-  requests while a ZIP is prepared or transferred. Progress bars show completed
-  deletion batches, processed uploads, and ZIP bytes received; preparation and
+  `/api/media/download`, and `/api/media/delete`, and allow long requests while a
+  ZIP is prepared or transferred. Progress bars show completed deletion batches
+  and ZIP bytes received; preparation and
   range resolution are indeterminate. Keep the browser page open until finished.
   Large ZIPs still require temporary Pi disk space and browser memory; rsync is
   preferable for very large transfers. No migration or dependency change is required.
@@ -71,18 +70,12 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   same origin. If using a reverse proxy, forward the new routes too; avoid
   caching app HTML/API responses. Hashed assets can be cached. Direct `/library`
   and `/transfer` reloads must reach Flask, not a proxy filesystem lookup.
-- Transfer tools have moved off the Library page. `/transfer` shows the Pi push
-  rsync command first; optional S3 upload is collapsed until opened. For rsync,
-  stop capture first and use `--archive --info=progress2,stats2 --human-readable`
-  `--whole-file`, excluding hidden internal files (`--exclude='.*'`), previews,
-  thumbnails, and temporary/pending sidecars as shown in `README.md`. Never copy
-  the private `.session-key` to a shared destination.
-- `/transfer` can now run and supervise rsync on the Pi (**rsync from
-  CameraDeck**), pushing to an SSH destination or a local directory. It needs
+- Transfer tools have moved off the Library page. `/transfer` can run and
+  supervise rsync on the Pi, pushing to an SSH destination or a local directory. It needs
   the `rsync` system package on the Pi (`sudo apt install rsync` if
   `rsync --version` fails) and on the destination. For SSH destinations,
   the service user (`pi`) also needs a key that logs in without a prompt and
-  an accepted host key; see README's "Run rsync from CameraDeck". A run is
+  an accepted host key. A run is
   stopped when the service stops, so treat an active transfer like an active
   capture in step 1. Check `GET /api/transfer/rsync` (`"active": false`) or the
   Transfer page before stopping. The last destination is stored in
@@ -105,7 +98,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   on restart. There is no separate operator-run migration.
 - The catalog is rebuildable from JSON sidecars. If it must be rebuilt, stop the
   service first, then remove **only** `.library.sqlite3` and its `-wal`/`-shm`
-  companions. Never remove `.uploads.sqlite3`, originals, or metadata. Leave
+  companions. Never remove originals or metadata. Leave
   enough disk space for the index and future captures.
 - `.session-key` is created with mode 0600 in the media directory. Sessions last
   seven days and survive restarts. The first update requires signing in again;
@@ -118,7 +111,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
 - `GET /api/activity` (authenticated) reports whether stopping the service would
   interrupt anything: `{"idle": true, "operations": {}}`, or `"idle": false` with
   counts such as `capture_sequence`, `photo_capture`, `rsync_transfer`,
-  `s3_upload`, `deletion`, `download`, `zip_download`, `library_indexing`,
+  `deletion`, `download`, `zip_download`, `library_indexing`,
   `clip_recovery`, or `power_action`. `scripts/check-idle.py` wraps it together
   with the systemd state for step 1. If using a reverse proxy, forward the route.
 - The example systemd unit now has a Python-only `ExecCondition` build check.
@@ -152,8 +145,8 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    over it. For a manual run on another port, pass `--url http://127.0.0.1:PORT`
    and stop it with Ctrl+C once the check passes. Releases that predate
    `/api/activity` can only be checked manually: in the web UI confirm no capture
-   is running, the Transfer page shows no running rsync, and no Library upload,
-   deletion or download is in progress.
+   is running, the Transfer page shows no running rsync, and no Library deletion
+   or download is in progress.
 
 2. **Make sure it is stopped.** If step 1 printed `idle`, the chained command
    stopped the service.
@@ -309,7 +302,7 @@ If the update causes a regression:
    releases use step 6; older releases without the check script use
    `sudo systemctl restart cameradeck`. Verify the live UI/API and preview again.
 
-`media/`, `.env`, `.uploads.sqlite3`, `.library.sqlite3`, and `.session-key` are
+`media/`, `.env`, `.library.sqlite3`, and `.session-key` are
 untouched by checking out a different commit, so no data is lost by rolling back.
 Older releases ignore the new catalog/key and use their original library/login
 behavior. The compiled frontend must match the Python revision; a Git checkout

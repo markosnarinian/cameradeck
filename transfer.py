@@ -41,14 +41,6 @@ class Busy(RuntimeError):
     pass
 
 
-def public_key():
-    for name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
-        path = Path.home() / ".ssh" / name
-        if path.is_file():
-            return path.read_text().strip()
-    return None
-
-
 class RsyncTransfer:
     def __init__(self, root, rsync="rsync"):
         self.root = Path(root)

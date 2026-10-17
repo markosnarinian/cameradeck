@@ -13,13 +13,11 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
-from botocore.exceptions import ClientError
 from PIL import Image
 
 from app import ID, create_app
 from camera import BurstSampler, CameraDeck, validate_controls, yuv420_planes
 from power import PowerManager
-from storage import S3Uploader
 from transfer import RsyncTransfer
 
 
@@ -600,7 +598,6 @@ def test_delete_all_requires_confirmation_and_preserves_internal_files(deck, cli
         for name in (
             ".rotation",
             ".time_offset",
-            ".uploads.sqlite3",
             ".rsync-destination",
         )
     }
@@ -666,7 +663,7 @@ def test_delete_all_refuses_busy_media(deck, app_factory, operation):
             download.close()
 
 
-def test_delete_all_excludes_uploads_and_releases_after_error(deck, app_factory):
+def test_delete_all_releases_after_error(deck, app_factory):
     app = app_factory(deck)
     client = app.test_client()
     entry = make_media(deck)
@@ -689,17 +686,9 @@ def test_delete_all_excludes_uploads_and_releases_after_error(deck, app_factory)
         )
     )
     worker.start()
-    try:
-        assert started.wait(10)
-        assert (
-            client.post(
-                "/api/media/upload", json={"ids": [entry["id"]], "bucket": "archive"}
-            ).status_code
-            == 409
-        )
-    finally:
-        release.set()
-        worker.join(10)
+    assert started.wait(10)
+    release.set()
+    worker.join(10)
     assert results[0].status_code == 200
     # Invalid metadata must not leave the exclusive deletion gate closed.
     (deck.root / (entry["id"] + ".json")).write_text("invalid JSON")
@@ -717,12 +706,8 @@ def test_delete_all_excludes_uploads_and_releases_after_error(deck, app_factory)
 
 def test_activity_reports_work_a_stop_would_interrupt(deck, app_factory):
     seen = []
-    uploader = Mock()
-    uploader.upload.side_effect = lambda *a, **k: seen.append(
-        client.get("/api/activity").json
-    ) or {"status": "uploaded", "key": "k", "error": None}
     power = PowerManager(executor=Mock())
-    app = app_factory(deck, uploader=uploader, power_manager=power)
+    app = app_factory(deck, power_manager=power)
     client = app.test_client()
     idle = {"idle": True, "operations": {}}
     first, second = make_media(deck, b"x" * 100000), make_media(deck)
@@ -745,19 +730,13 @@ def test_activity_reports_work_a_stop_would_interrupt(deck, app_factory):
         response.close()
         assert client.get("/api/activity").json == idle
 
-    client.post(
-        "/api/media/upload", json={"ids": [first["id"]], "bucket": "camera-archive"}
-    )
     catalog = app.extensions["catalog"]
     remove = catalog.remove
     catalog.remove = lambda ident: seen.append(
         client.get("/api/activity").json
     ) or remove(ident)
     client.post("/api/media/delete", json={"ids": [second["id"]]})
-    assert [entry["operations"] for entry in seen] == [
-        {"s3_upload": 1},
-        {"deletion": 1},
-    ]
+    assert [entry["operations"] for entry in seen] == [{"deletion": 1}]
     assert client.get("/api/activity").json == idle
 
     deck.sequence = {"active": True}
@@ -766,45 +745,6 @@ def test_activity_reports_work_a_stop_would_interrupt(deck, app_factory):
         "capture_sequence": 1,
         "power_action": 1,
     }
-
-
-def test_upload_route_settings_and_validation(deck, app_factory):
-    media = make_media(deck)
-    ids = [media["id"], *[make_media(deck)["id"] for _ in range(639)]]
-    uploader = Mock()
-    uploader.upload.return_value = {
-        "status": "uploaded",
-        "key": "sha256/ab/hash.jpg",
-        "error": None,
-    }
-    client = app_factory(
-        deck, uploader=uploader, s3_endpoint="http://192.168.1.10:3900"
-    ).test_client()
-    assert client.get("/api/settings").json == {
-        "s3_endpoint": "http://192.168.1.10:3900"
-    }
-    response = client.post(
-        "/api/media/upload",
-        json={
-            "ids": ids,
-            "endpoint": "https://objects.example.org",
-            "bucket": "camera-archive",
-            "prefix": "trip/one",
-        },
-    )
-    assert [result["id"] for result in response.json["results"]] == ids
-    assert {result["status"] for result in response.json["results"]} == {"uploaded"}
-    assert (
-        client.post(
-            "/api/media/upload",
-            json={
-                "ids": [media["id"]],
-                "endpoint": "http://example.org",
-                "bucket": "ok-bucket",
-            },
-        ).status_code
-        == 400
-    )
 
 
 def test_power_actions_are_fixed_confirmed_and_block_sequence(deck, app_factory):
@@ -943,85 +883,6 @@ def test_rsync_stop_and_capture_exclusion(deck, app_factory, tmp_path):
     assert status["state"] == "cancelled"
     assert "sending incremental file list" in status["job"]["log"]
     assert client.get("/api/status").json["transfer_active"] is False
-
-
-class FakeS3:
-    def __init__(self, fail_put=False):
-        self.objects = {}
-        self.puts = 0
-        self.fail_put = fail_put
-
-    def head_object(self, Bucket, Key):
-        if (Bucket, Key) not in self.objects:
-            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
-        body, metadata = self.objects[(Bucket, Key)]
-        return {"ContentLength": len(body), "Metadata": metadata, "ETag": "etag"}
-
-    def put_object(self, Bucket, Key, Body, ContentLength, Metadata, IfNoneMatch):
-        self.puts += 1
-        if self.fail_put:
-            raise TimeoutError("response lost")
-        assert IfNoneMatch == "*"
-        self.objects[(Bucket, Key)] = (Body.read(), Metadata)
-
-
-def test_s3_uploader_deduplicates_copies_and_persists(deck):
-    first, second = make_media(deck, b"identical"), make_media(deck, b"identical")
-    s3 = FakeS3()
-    uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
-    results = [
-        uploader.upload(
-            deck.root / item["file"],
-            item["id"],
-            endpoint_url="https://example.org",
-            bucket="archive",
-        )
-        for item in (first, second)
-    ]
-    restarted = S3Uploader(deck.root, client_factory=lambda _: s3).upload(
-        deck.root / second["file"],
-        second["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
-    assert results[0].status == "uploaded"
-    assert results[1].status == restarted.status == "deduplicated"
-    assert s3.puts == 1
-
-
-def test_s3_ambiguous_attempt_is_never_sent_twice(deck):
-    media, s3 = make_media(deck, b"ambiguous"), FakeS3(fail_put=True)
-    results = [
-        S3Uploader(deck.root, client_factory=lambda _: s3).upload(
-            deck.root / media["file"],
-            media["id"],
-            endpoint_url="https://example.org",
-            bucket="archive",
-        )
-        for _ in range(2)
-    ]
-    assert all(result.status == "uncertain" for result in results)
-    assert s3.puts == 1
-
-
-def test_s3_overwritten_file_gets_a_new_content_key(deck):
-    media, s3 = make_media(deck, b"first version"), FakeS3()
-    uploader = S3Uploader(deck.root, client_factory=lambda _: s3)
-    first = uploader.upload(
-        deck.root / media["file"],
-        media["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
-    (deck.root / media["file"]).write_bytes(b"second version")
-    second = uploader.upload(
-        deck.root / media["file"],
-        media["id"],
-        endpoint_url="https://example.org",
-        bucket="archive",
-    )
-    assert first.status == second.status == "uploaded"
-    assert first.key != second.key and s3.puts == 2
 
 
 @pytest.mark.parametrize("saved", [None, "", "bad", "90", "180", "0"])

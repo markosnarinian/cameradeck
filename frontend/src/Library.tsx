@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Download, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Download, RefreshCw, Trash2 } from "lucide-react";
 import { request, message } from "./api";
 import type { Media, MediaPage } from "./types";
 import { Button } from "./components/ui/button";
@@ -25,13 +25,7 @@ const positive = (
   const n = Number(value);
   return Number.isSafeInteger(n) && n > 0 ? Math.min(n, max) : fallback;
 };
-export function Library({
-  capturing,
-  uploading = false,
-}: {
-  capturing: boolean;
-  uploading?: boolean;
-}) {
+export function Library({ capturing }: { capturing: boolean }) {
   const [params, setParams] = useSearchParams();
   const page = positive(params.get("page"), 1),
     perPage = positive(params.get("per_page"), 40, 100),
@@ -63,10 +57,7 @@ export function Library({
     return () => clearInterval(timer);
   }, [progress?.label]);
   const [viewed, setViewed] = useState<Media | null>(null),
-    [dialog, setDialog] = useState<"delete" | "upload" | null>(null),
-    [endpoint, setEndpoint] = useState(""),
-    [bucket, setBucket] = useState(""),
-    [prefix, setPrefix] = useState(""),
+    [dialog, setDialog] = useState<"delete" | null>(null),
     [result, setResult] = useState(""),
     [pageInput, setPageInput] = useState(String(page));
   const [size, setSize] = useState(() => {
@@ -95,17 +86,13 @@ export function Library({
   }, [size]);
   useEffect(() => {
     const controller = new AbortController();
-    if (uploading)
-      void request("/api/settings", undefined, { signal: controller.signal })
-        .then((s) => setEndpoint(s.s3_endpoint ?? ""))
-        .catch(() => {});
     return () => {
       controller.abort();
       operation.current?.abort();
       urls.current.forEach((url) => URL.revokeObjectURL(url));
       urls.current.clear();
     };
-  }, [uploading]);
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
     let alive = true,
@@ -294,42 +281,6 @@ export function Library({
       }
     });
   };
-  const upload = () =>
-    act("Uploading captures", async (signal) => {
-      const ids = [...selected],
-        complete = new Set<string>(),
-        failures: string[] = [];
-      setProgress({ label: "Uploading captures", done: 0, total: ids.length });
-      try {
-        for (const [at, id] of ids.entries()) {
-          const response = await request(
-            "/api/media/upload",
-            { ids: [id], endpoint, bucket, prefix },
-            { signal, timeout: 0 },
-          );
-          for (const r of response.results) {
-            if (["uploaded", "deduplicated", "reconciled"].includes(r.status))
-              complete.add(r.id);
-            else
-              failures.push(
-                `${r.id}: ${r.status}${r.error ? ` — ${r.error}` : ""}`,
-              );
-          }
-          setProgress({
-            label: "Uploading captures",
-            done: at + 1,
-            total: ids.length,
-          });
-        }
-      } finally {
-        setSelected(
-          (old) => new Set([...old].filter((id) => !complete.has(id))),
-        );
-        setResult(
-          `${complete.size} uploaded / already present; ${failures.length} need attention.${failures.length ? "\n" + failures.join("\n") : ""}`,
-        );
-      }
-    });
   const offPage =
     selected.size - items.filter((item) => selected.has(item.id)).length;
   const allItemsOnPageSelected =
@@ -447,7 +398,7 @@ export function Library({
   return (
     <>
       <div className="heading">
-        {uploading ? <h2>Select captures</h2> : <h1>Library</h1>}
+        <h1>Library</h1>
         <Button
           variant="outline"
           disabled={loading}
@@ -527,38 +478,23 @@ export function Library({
         >
           Clear
         </Button>
-        {uploading ? (
-          <Button
-            variant="outline"
-            disabled={!selected.size || busy}
-            onClick={() => {
-              setDialog("upload");
-              setResult("");
-            }}
-          >
-            <Upload size={16} /> Upload
-          </Button>
-        ) : (
-          <>
-            <Button
-              variant="outline"
-              disabled={!selected.size || busy}
-              onClick={download}
-            >
-              <Download size={16} /> ZIP
-            </Button>
-            <Button
-              variant="outline"
-              disabled={!selected.size || busy}
-              onClick={() => {
-                setDialog("delete");
-                setResult("");
-              }}
-            >
-              <Trash2 size={16} /> Delete
-            </Button>
-          </>
-        )}
+        <Button
+          variant="outline"
+          disabled={!selected.size || busy}
+          onClick={download}
+        >
+          <Download size={16} /> ZIP
+        </Button>
+        <Button
+          variant="outline"
+          disabled={!selected.size || busy}
+          onClick={() => {
+            setDialog("delete");
+            setResult("");
+          }}
+        >
+          <Trash2 size={16} /> Delete
+        </Button>
       </div>
       {!dialog && progressBar}
       {feedback && (
@@ -690,66 +626,22 @@ export function Library({
             if (busy) e.preventDefault();
           }}
         >
-          <DialogTitle>
-            {dialog === "delete" ? "Delete captures?" : "Upload captures"}
-          </DialogTitle>
+          <DialogTitle>Delete captures?</DialogTitle>
           <DialogDescription>
             {selected.size} selected captures, including {offPage} on other
             pages / filters.
           </DialogDescription>
-          {dialog === "delete" ? (
-            <>
-              <p>
-                Deletion is permanent. Originals and metadata will be removed
-                from the Pi.
-              </p>
-              <Button
-                variant="destructive"
-                disabled={busy || !selected.size}
-                onClick={remove}
-              >
-                {busy ? "Deleting…" : "Confirm deletion"}
-              </Button>
-            </>
-          ) : (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void upload();
-              }}
-            >
-              <label className="field">
-                S3 endpoint
-                <Input
-                  type="url"
-                  required
-                  value={endpoint}
-                  onChange={(e) => setEndpoint(e.target.value)}
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                Bucket
-                <Input
-                  required
-                  value={bucket}
-                  onChange={(e) => setBucket(e.target.value)}
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                Prefix
-                <Input
-                  value={prefix}
-                  onChange={(e) => setPrefix(e.target.value)}
-                  disabled={busy}
-                />
-              </label>
-              <Button disabled={busy || !selected.size}>
-                {busy ? "Uploading…" : "Confirm upload"}
-              </Button>
-            </form>
-          )}
+          <p>
+            Deletion is permanent. Originals and metadata will be removed from
+            the Pi.
+          </p>
+          <Button
+            variant="destructive"
+            disabled={busy || !selected.size}
+            onClick={remove}
+          >
+            {busy ? "Deleting…" : "Confirm deletion"}
+          </Button>
           {progressBar}
           {result && (
             <pre className="result" role="status">

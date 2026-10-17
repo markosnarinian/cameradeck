@@ -16,7 +16,6 @@ import zipfile
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -35,7 +34,7 @@ from camera import CameraDeck
 from catalog import ID, MediaCatalog
 from power import PowerManager
 from scripts.frontend import check as check_frontend
-from transfer import Busy, RsyncTransfer, public_key
+from transfer import Busy, RsyncTransfer
 
 
 class Activity:
@@ -81,9 +80,6 @@ class Activity:
             return {kind: count for kind, count in self.counts.items() if count > 0}
 
 
-BUCKET = re.compile(r"^(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
-
-
 def head_commit():
     """Return the source revision that started this CameraDeck process."""
     try:
@@ -98,40 +94,11 @@ def head_commit():
         return "unknown"
 
 
-def normalize_endpoint(value):
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("Enter an S3-compatible endpoint URL.")
-    value = value.strip()
-    if "://" not in value:
-        value = "https://" + value
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"https", "http"} or not parsed.hostname:
-        raise ValueError("Endpoint must be an HTTP(S) server URL.")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError(
-            "Endpoint must not contain credentials, a query, or a fragment."
-        )
-    if parsed.path not in {"", "/"}:
-        raise ValueError(
-            "Enter the server endpoint only; use Bucket and Prefix separately."
-        )
-    insecure_allowed = parsed.hostname == "localhost"
-    try:
-        insecure_allowed = insecure_allowed or ip_address(parsed.hostname).is_private
-    except ValueError:
-        pass
-    if parsed.scheme == "http" and not insecure_allowed:
-        raise ValueError("S3 endpoints must use HTTPS outside private networks.")
-    return value.rstrip("/")
-
-
 def create_app(
     deck,
     password="",
     *,
-    uploader=None,
     power_manager=None,
-    s3_endpoint="http://192.168.1.10:3900",
     rsync=None,
 ):
     app = Flask(__name__, static_folder=None)
@@ -167,7 +134,6 @@ def create_app(
     deck.media_published = catalog.publish
     catalog.start()
     power_manager = power_manager or PowerManager()
-    configured_endpoint = normalize_endpoint(s3_endpoint)
     rsync = rsync or RsyncTransfer(deck.root)
     app.extensions["rsync"] = rsync
     activity = Activity()
@@ -181,7 +147,6 @@ def create_app(
             "/api/media/range",
             "/api/media/download",
             "/api/media/delete",
-            "/api/media/upload",
         }:
             request.max_content_length = 16384
         if not password and urlsplit(request.host_url).hostname not in {
@@ -637,54 +602,9 @@ def create_app(
             end()
             raise
 
-    @app.get("/api/settings")
-    def settings():
-        return jsonify(s3_endpoint=configured_endpoint)
-
-    @app.post("/api/media/upload")
-    def upload_many():
-        with activity.track("s3_upload"):
-            return upload_entries()
-
-    def upload_entries():
-        nonlocal uploader
-        data = request.get_json()
-        identifiers = ids_from_request()
-        endpoint = normalize_endpoint(data.get("endpoint", configured_endpoint))
-        bucket = data.get("bucket", "")
-        prefix = data.get("prefix", "")
-        if not isinstance(bucket, str) or not BUCKET.fullmatch(bucket):
-            raise ValueError("Enter a valid S3 bucket name.")
-        if (
-            not isinstance(prefix, str)
-            or any(part in {".", ".."} for part in prefix.split("/"))
-            or any(ord(char) < 32 for char in prefix)
-        ):
-            raise ValueError("Prefix contains unsupported path segments.")
-        if uploader is None:
-            from storage import S3Uploader
-
-            uploader = S3Uploader(deck.root)
-        results = []
-        for ident in identifiers:
-            try:
-                entry = item(ident)
-                result = uploader.upload(
-                    media_path(entry),
-                    ident,
-                    endpoint_url=endpoint,
-                    bucket=bucket,
-                    prefix=prefix.strip("/"),
-                )
-                value = result.json() if hasattr(result, "json") else dict(result)
-            except Exception as exc:
-                value = {"status": "error", "key": None, "error": str(exc)}
-            results.append({"id": ident, **value})
-        return jsonify(results=results)
-
     @app.get("/api/transfer/rsync")
     def rsync_status():
-        return jsonify({**rsync.status(), "public_key": public_key()})
+        return jsonify(rsync.status())
 
     @app.post("/api/transfer/rsync/start")
     def rsync_start():
@@ -746,13 +666,7 @@ def main():
     check_frontend()
     logging.basicConfig(level=logging.INFO)
     deck = CameraDeck(args.media)
-    app = create_app(
-        deck,
-        password,
-        s3_endpoint=os.environ.get(
-            "CAMERADECK_S3_ENDPOINT", "http://192.168.1.10:3900"
-        ),
-    )
+    app = create_app(deck, password)
     deck.start()
 
     def stop(*_):

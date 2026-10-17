@@ -54,7 +54,6 @@ export type RsyncStatus = {
   active: boolean;
   destination: string;
   source: string;
-  public_key: string | null;
   job: RsyncJob | null;
 };
 export type Media = {

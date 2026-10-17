@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, Copy, Play, Square, Trash2 } from "lucide-react";
+import { Play, Square, Trash2 } from "lucide-react";
 import { message, request } from "./api";
-import { Library } from "./Library";
 import type { RsyncStatus } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -11,68 +10,6 @@ import {
   DialogTitle,
   DialogDescription,
 } from "./components/ui/dialog";
-
-const RSYNC_COMMAND = `rsync --archive --info=progress2,stats2 --human-readable --whole-file \\
-  --exclude='*.preview.jpg' \\
-  --exclude='*.thumb.jpg' \\
-  --exclude='.*' \\
-  --exclude='*.tmp' \\
-  --exclude='*.pending.*' \\
-  /home/pi/cameradeck/media/ \\
-  faros@192.168.1.10:/mnt/wd2tb/faros`;
-
-// The device UI is served over plain HTTP, where navigator.clipboard is absent.
-async function copyText(text: string) {
-  if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const area = document.createElement("textarea");
-  area.value = text;
-  area.setAttribute("readonly", "");
-  area.style.position = "fixed";
-  area.style.opacity = "0";
-  document.body.appendChild(area);
-  area.select();
-  try {
-    if (!document.execCommand("copy")) throw new Error("Copy failed");
-  } finally {
-    area.remove();
-  }
-}
-
-function CopyButton({
-  text,
-  label = "Copy",
-  className,
-}: {
-  text: string;
-  label?: string;
-  className?: string;
-}) {
-  const [copied, setCopied] = useState<boolean | null>(null);
-  useEffect(() => {
-    if (copied === null) return;
-    const timer = setTimeout(() => setCopied(null), 2000);
-    return () => clearTimeout(timer);
-  }, [copied]);
-  return (
-    <Button
-      className={className}
-      variant="outline"
-      onClick={() =>
-        copyText(text).then(
-          () => setCopied(true),
-          () => setCopied(false),
-        )
-      }
-      aria-live="polite"
-    >
-      {copied ? <Check size={16} /> : <Copy size={16} />}
-      {copied ? "Copied" : copied === false ? "Copy failed" : label}
-    </Button>
-  );
-}
 
 const STATE_LABELS: Record<RsyncStatus["state"], string> = {
   idle: "Not run since CameraDeck started",
@@ -125,12 +62,13 @@ function PiRsync({ capturing }: { capturing: boolean }) {
     progress = job?.progress;
   return (
     <section className="transfer-section" aria-labelledby="pi-rsync-heading">
-      <h2 id="pi-rsync-heading">rsync from CameraDeck</h2>
+      <h2 id="pi-rsync-heading">rsync</h2>
       <p>
         The Pi pushes the same files to an SSH destination such as{" "}
         <code>faros@192.168.1.10:/mnt/wd2tb/faros</code>, or to a directory on a
         drive mounted on the Pi. Capture is blocked while it runs.
       </p>
+      <p className="muted">The SSH key must already be set up.</p>
       <form
         className="rsync-run"
         onSubmit={(e) => {
@@ -228,41 +166,12 @@ function PiRsync({ capturing }: { capturing: boolean }) {
           CameraDeck stops it.
         </p>
       )}
-      <details className="rsync-setup">
-        <summary>SSH setup</summary>
-        <p>
-          The destination must allow key login for this Pi without a password
-          prompt. On a Mac, enable Remote Login and add this key to{" "}
-          <code>~/.ssh/authorized_keys</code>. Then run{" "}
-          <code>ssh user@host true</code> once on the Pi to accept the host key.
-          For external volumes, allow full disk access for remote users.
-        </p>
-        {rsync?.public_key ? (
-          <div className="rsync-command-wrap">
-            <pre className="rsync-command" aria-label="Pi public key">
-              {rsync.public_key}
-            </pre>
-            <CopyButton
-              className="rsync-copy"
-              text={rsync.public_key}
-              label="Copy key"
-            />
-          </div>
-        ) : (
-          <p>
-            This Pi has no SSH key yet. Create one as the CameraDeck user with{" "}
-            <code>ssh-keygen -t ed25519</code>, then reload this page.
-          </p>
-        )}
-      </details>
     </section>
   );
 }
 
 export function Transfer({ capturing }: { capturing: boolean }) {
-  const [uploadOpened, setUploadOpened] = useState(false),
-    [uploadRevision, setUploadRevision] = useState(0),
-    [deleteOpen, setDeleteOpen] = useState(false),
+  const [deleteOpen, setDeleteOpen] = useState(false),
     [confirmation, setConfirmation] = useState(""),
     [deleting, setDeleting] = useState(false),
     [deleteError, setDeleteError] = useState(""),
@@ -277,7 +186,6 @@ export function Transfer({ capturing }: { capturing: boolean }) {
         { confirm: confirmation },
         { timeout: 0 },
       );
-      setUploadRevision((value) => value + 1);
       setFeedback(
         `Deleted ${result.deleted.length} captures from the Pi.` +
           (result.missing.length
@@ -296,36 +204,7 @@ export function Transfer({ capturing }: { capturing: boolean }) {
       <div className="heading">
         <h1>Transfer</h1>
       </div>
-      <section className="transfer-section" aria-labelledby="rsync-heading">
-        <h2 id="rsync-heading">rsync</h2>
-        <p>Run on the Pi after stopping capture.</p>
-        <div className="rsync-command-wrap">
-          <pre
-            className="rsync-command"
-            tabIndex={0}
-            aria-label="rsync command"
-          >
-            <code>{RSYNC_COMMAND}</code>
-          </pre>
-          <CopyButton className="rsync-copy" text={RSYNC_COMMAND} />
-        </div>
-        <p>
-          Copies originals and metadata; skips previews, thumbnails, internal
-          files and temporary sidecars.
-        </p>
-      </section>
       <PiRsync capturing={capturing} />
-      <details
-        className="transfer-section"
-        onToggle={(e) => {
-          if (e.currentTarget.open) setUploadOpened(true);
-        }}
-      >
-        <summary>S3 upload</summary>
-        {uploadOpened && (
-          <Library key={uploadRevision} capturing={capturing} uploading />
-        )}
-      </details>
       <section
         className="transfer-section"
         aria-labelledby="delete-all-heading"

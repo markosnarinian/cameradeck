@@ -514,41 +514,6 @@ select {
 .transfer-section p {
   line-height: 1.6;
 }
-.transfer-section summary {
-  cursor: pointer;
-  padding: 16px 0;
-  border-top: 1px solid var(--border);
-  font-size: 22px;
-  font-weight: 600;
-}
-.rsync-command {
-  padding: 20px;
-  background: #171b1f;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font:
-    14px/1.8 ui-monospace,
-    monospace;
-}
-.rsync-command-wrap {
-  position: relative;
-}
-.rsync-command-wrap .rsync-command {
-  padding-right: 130px;
-}
-.rsync-copy {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-}
-@media (max-width: 640px) {
-  .rsync-command-wrap .rsync-command {
-    padding-right: 20px;
-    padding-top: 64px;
-  }
-}
 .transfer-section .muted {
   color: var(--muted);
   font-size: 14px;
@@ -591,11 +556,6 @@ select {
   font:
     12px/1.6 ui-monospace,
     monospace;
-}
-.rsync-setup summary {
-  cursor: pointer;
-  padding: 8px 0;
-  font-weight: 600;
 }
 @media (max-width: 640px) {
   .rsync-run {

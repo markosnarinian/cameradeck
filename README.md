@@ -148,12 +148,11 @@ click still opens the viewer; Ctrl/Command-click toggles one item without openin
 Ranges span pages, including skipped pages, and survive changes to items per page.
 Changing the kind filter resets the anchor, but selected IDs persist across
 pages/filters; off-page selections are counted explicitly. There is no capture-count
-limit on selection, ZIP download, deletion, or S3 upload. Pagination still shows at
+limit on selection, ZIP download, or deletion. Pagination still shows at
 most 100 items per page; it does not limit selection across pages.
 
-Long operations show a progress bar. Deletion reports completed batches and S3
-upload reports captures processed, leaving failed/uncertain items selected for
-inspection or retry. Range resolution and ZIP preparation show an indeterminate
+Long operations show a progress bar. Deletion reports completed batches. Range
+resolution and ZIP preparation show an indeterminate
 bar; once the ZIP is ready, transfer progress measures bytes received. These
 measurable operations also show ETA based on average speed so far; estimates
 adjust as work progresses. ETA is unavailable during range resolution and ZIP
@@ -182,8 +181,8 @@ unrecoverable originals and `.pending.json` files.
 Transfer's **Delete all media** action requires the exact text `DELETE ALL` and
 an idle CameraDeck. It removes completed Library media across every page, not
 just selections. Verify your remote copies first: CameraDeck does not verify
-backups. It preserves remote copies, settings, credentials, the upload ledger,
-pending clips, old experiment directories and unrelated files. Keep the page
+backups. It preserves remote copies, settings, pending clips, old experiment
+directories and unrelated files. Keep the page
 open until deletion finishes; in-flight deletion cannot be cancelled.
 
 Capture is refused below a 256 MiB free-space reserve. There is **no automatic
@@ -191,79 +190,32 @@ retention or loop deletion**. At 5 photos/s, 18,000 images are selected per hour
 storage consumption depends on scene, JPEG size and derivatives. Monitor storage
 and use reliable power. Abrupt power loss can damage the filesystem.
 
-### Transfer from the Pi with rsync
-
-The Transfer page shows a command to run on the Pi after stopping capture:
-
-```bash
-rsync --archive --info=progress2,stats2 --human-readable --whole-file \
-  --exclude='*.preview.jpg' \
-  --exclude='*.thumb.jpg' \
-  --exclude='.*' \
-  --exclude='*.tmp' \
-  --exclude='*.pending.*' \
-  /home/pi/cameradeck/media/ \
-  faros@192.168.1.10:/mnt/wd2tb/faros
-```
-
-Adjust host and destination if needed. This copies originals and JSON metadata,
-not previews/thumbnails or internal files such as `.session-key` (private),
-`.library.sqlite3` or `.uploads.sqlite3`, nor temporary/pending sidecars.
-It never deletes the source. Keep originals on the Pi until the copy is verified.
-
-### Run rsync from CameraDeck
+### rsync
 
 The Transfer page can also have the Pi push the same files itself, so the copy
-is started, watched and stopped from the browser. Under **rsync from
-CameraDeck**, enter a destination and press **Start rsync**:
+is started, watched and stopped from the browser. Enter a destination and press
+**Start rsync**:
 
 - `faros@192.168.1.10:/mnt/wd2tb/faros` over SSH
   (the default), or
 - an existing absolute directory on the Pi (for example a mounted USB drive),
   outside the media directory.
 
-It runs the same flags and exclusions as the command above, with the Pi as the
-source, plus an I/O timeout. The page shows progress, rate, ETA, files copied,
+It runs with an I/O timeout. The page shows progress, rate, ETA, files copied,
 the exact command and the log tail, and can stop the run. One run at a time is
 allowed. rsync cannot start during capture, and capture and Pi power actions
 are refused while it runs. It continues if the browser leaves; restarting or
 stopping CameraDeck stops it. The last destination is remembered in the hidden
 `.rsync-destination` file in the media directory.
 
-SSH runs non-interactively (`BatchMode`), so a password or host-key prompt fails
-the run instead of hanging. Set it up once on the Pi as the CameraDeck user:
-
-```bash
-ssh-keygen -t ed25519            # if ~/.ssh has no key yet
-ssh-copy-id user@mac.local       # or paste the key shown on the Transfer page
-ssh user@mac.local true          # accept the host key
-```
-
-On the Mac, enable **System Settings → General → Sharing → Remote Login**, and
-for external volumes, allow full disk access for remote users. The Mac's
-built-in rsync is enough on the receiving side.
-
-### Optional S3-compatible upload
-
-Set `CAMERADECK_S3_ENDPOINT` to override the initial endpoint (default
-`http://192.168.1.10:3900`). On `/transfer`, expand **S3 upload**, select captures,
-then enter bucket and optional prefix in the upload dialog. Selection is local
-to this page; it does not inherit the Library's selection.
-Credentials stay server-side through boto3's standard AWS credential chain.
-Use HTTPS outside private networks. Upload never removes local originals.
-
-Content-addressed SHA-256 keys and `.uploads.sqlite3` deduplicate uploads across
-renames, copies and restarts. Ambiguous failures become **uncertain** and are
-reconciled with HEAD, not resent. The server must support conditional PutObject
-and read-after-write-consistent HeadObject. Never delete the upload ledger to
-resolve uncertain uploads.
+For an SSH destination, the SSH key and host key must already be set up.
 
 ## Boot service and updates
 
 See [UPDATE.md](UPDATE.md) before updating an existing installation. The example
 `deploy/cameradeck.service` and polkit rule are not installed automatically.
-Review paths/user/network binding, put a strong password and optional S3
-environment in `.env`, and run `chmod 600 .env`.
+Review paths/user/network binding, put a strong password in `.env`, and run
+`chmod 600 .env`.
 
 ```bash
 sudo cp deploy/cameradeck.service /etc/systemd/system/

@@ -765,6 +765,7 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     expect(page.locator(".media-card")).to_have_count(0)
 
 
+@pytest.mark.skip(reason="Superseded by the rsync-only transfer page")
 def test_transfer_rsync_and_optional_upload(library_page):
     page = library_page
     page.get_by_role("link", name="Transfer", exact=True).click()
@@ -1178,7 +1179,7 @@ def test_transfer_runs_and_supervises_rsync_on_the_pi(library_page, tmp_path_fac
     target = tmp_path_factory.mktemp("rsync-copy")
     page.get_by_role("link", name="Transfer", exact=True).click()
     section = page.locator(
-        "section", has=page.get_by_role("heading", name="rsync from CameraDeck")
+        "section", has=page.get_by_role("heading", name="rsync", exact=True)
     )
     expect(section.get_by_role("status")).to_contain_text(
         "Not run since CameraDeck started"
@@ -1203,7 +1204,6 @@ def test_transfer_runs_and_supervises_rsync_on_the_pi(library_page, tmp_path_fac
     names = {p.name for p in target.iterdir()}
     assert len(names) == 242 and all(n.endswith((".jpg", ".json")) for n in names)
     assert not any(n.endswith((".thumb.jpg", ".preview.jpg")) for n in names)
-    section.get_by_text("SSH setup").click()
     screenshot(page, "transfer-pi-rsync")
     page.set_viewport_size({"width": 390, "height": 844})
     screenshot(page, "transfer-pi-rsync-mobile")

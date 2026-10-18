@@ -741,12 +741,36 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     screenshot(page, "delete-all-confirmation-narrow", full_page=False)
     pending = []
     page.route("**/api/media/delete-all", lambda route: pending.append(route))
+    progress = {"active": True, "completed": 0, "total": None, "eta_seconds": None}
+    page.route(
+        "**/api/media/delete-all/progress", lambda route: route.fulfill(json=progress)
+    )
     confirm.click()
     expect(dialog.get_by_role("button", name="Deleting…", exact=True)).to_be_disabled()
     expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
     page.keyboard.press("Escape")
     expect(dialog).to_be_visible()
     expect(dialog.get_by_role("status")).to_contain_text("Deleting all Library media")
+    bar = dialog.get_by_role("progressbar", name="Deleting all Library media")
+    expect(bar).not_to_have_attribute("value")
+    expect(dialog.get_by_role("status")).to_contain_text("ETA: estimating…")
+    screenshot(page, "delete-all-estimating-narrow", full_page=False)
+    progress.update(completed=37, total=121, eta_seconds=83.2)
+    expect(bar).to_have_attribute("value", "37")
+    expect(bar).to_have_attribute("max", "121")
+    expect(dialog.get_by_role("status")).to_contain_text("37 / 121 captures deleted")
+    expect(dialog.get_by_role("status")).to_contain_text("ETA: 1m 24s remaining")
+    screenshot(page, "delete-all-progress-narrow", full_page=False)
+    page.set_viewport_size({"width": 1440, "height": 1100})
+    screenshot(page, "delete-all-progress-desktop", full_page=False)
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    # A failed poll must not cancel the destructive request or invent progress.
+    page.unroute("**/api/media/delete-all/progress")
+    page.route("**/api/media/delete-all/progress", lambda route: route.abort())
+    expect(bar).not_to_have_attribute("value")
+    expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    page.unroute("**/api/media/delete-all/progress")
     assert pending[0].request.post_data_json == {"confirm": "delete all"}
     pending.pop().fulfill(
         status=409, json={"error": "CameraDeck must be idle before deleting all media."}

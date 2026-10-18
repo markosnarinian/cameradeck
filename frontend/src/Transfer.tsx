@@ -176,7 +176,35 @@ export function Transfer({ capturing }: { capturing: boolean }) {
     [deleting, setDeleting] = useState(false),
     [deleteError, setDeleteError] = useState(""),
     [feedback, setFeedback] = useState("");
+  const [deleteProgress, setDeleteProgress] = useState<{
+    active: boolean;
+    completed: number;
+    total: number | null;
+    eta_seconds: number | null;
+  } | null>(null);
+  useEffect(() => {
+    if (!deleting) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const progress = await request("/api/media/delete-all/progress");
+        if (!cancelled && progress.active) setDeleteProgress(progress);
+      } catch {
+        // Losing a progress poll must not interrupt the deletion request.
+        if (!cancelled) setDeleteProgress(null);
+      } finally {
+        if (!cancelled) timer = setTimeout(refresh, 1000);
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [deleting]);
   const removeAll = async () => {
+    setDeleteProgress(null);
     setDeleting(true);
     setDeleteError("");
     setFeedback("");
@@ -305,9 +333,24 @@ export function Transfer({ capturing }: { capturing: boolean }) {
               </Button>
             </div>
             {deleting && (
-              <p role="status">
-                Deleting all Library media… Keep this page open.
-              </p>
+              <div className="operation-progress" role="status">
+                <span>
+                  Deleting all Library media…
+                  {deleteProgress?.total != null &&
+                    ` · ${deleteProgress.completed.toLocaleString()} / ${deleteProgress.total.toLocaleString()} captures deleted`}
+                </span>
+                <progress
+                  aria-label="Deleting all Library media"
+                  value={deleteProgress?.total ? deleteProgress.completed : undefined}
+                  max={deleteProgress?.total || 1}
+                />
+                <small>
+                  {deleteProgress?.eta_seconds != null
+                    ? `ETA: ${duration(Math.ceil(deleteProgress.eta_seconds))} remaining (estimated)`
+                    : "ETA: estimating…"}
+                  {" · Keep this page open until finished."}
+                </small>
+              </div>
             )}
           </form>
         </DialogContent>

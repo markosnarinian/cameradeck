@@ -137,6 +137,8 @@ def create_app(
     rsync = rsync or RsyncTransfer(deck.root)
     app.extensions["rsync"] = rsync
     activity = Activity()
+    deletion_lock = threading.Lock()
+    deletion_progress = dict(active=False, completed=0, total=None, started=None)
 
     def authenticated():
         return not password or session.get("authenticated") == authentication
@@ -519,6 +521,21 @@ def create_app(
         with activity.track("deletion"):
             return delete_entries(ids_from_request())
 
+    @app.get("/api/media/delete-all/progress")
+    def delete_all_progress():
+        # Do not take deck/catalog locks: deletion holds them while doing I/O.
+        with deletion_lock:
+            active = deletion_progress["active"]
+            completed = deletion_progress["completed"]
+            total = deletion_progress["total"]
+            started = deletion_progress["started"]
+        remaining = None
+        if completed and total is not None and started is not None:
+            remaining = (time.monotonic() - started) * (total - completed) / completed
+        return jsonify(
+            active=active, completed=completed, total=total, eta_seconds=remaining
+        )
+
     @app.post("/api/media/delete-all")
     def delete_all():
         confirmation = request.get_json().get("confirm")
@@ -538,26 +555,40 @@ def create_app(
                     description="CameraDeck must be idle before deleting all media.",
                 )
             with activity.track("deletion", exclusive=True):
-                identifiers = [
-                    path.stem
-                    for path in deck.root.glob("*.json")
-                    if ID.fullmatch(path.stem) and path.is_file()
-                ]
-                # Completed sidecars can be empty/corrupt. Use only CameraDeck's
-                # filenames, never paths read from damaged metadata or a glob
-                # that could also remove pending clips or unrelated files.
-                for ident in identifiers:
-                    with catalog.lock:
-                        for suffix in (
-                            ".jpg",
-                            ".mp4",
-                            ".thumb.jpg",
-                            ".preview.jpg",
-                            ".json",
-                        ):
-                            (deck.root / (ident + suffix)).unlink(missing_ok=True)
-                        catalog.remove(ident)
-                return jsonify(deleted=identifiers, missing=[])
+                with deletion_lock:
+                    deletion_progress.update(
+                        active=True, completed=0, total=None, started=None
+                    )
+                try:
+                    identifiers = [
+                        path.stem
+                        for path in deck.root.glob("*.json")
+                        if ID.fullmatch(path.stem) and path.is_file()
+                    ]
+                    with deletion_lock:
+                        deletion_progress.update(
+                            total=len(identifiers), started=time.monotonic()
+                        )
+                    # Completed sidecars can be empty/corrupt. Use only CameraDeck's
+                    # filenames, never paths read from damaged metadata or a glob
+                    # that could also remove pending clips or unrelated files.
+                    for ident in identifiers:
+                        with catalog.lock:
+                            for suffix in (
+                                ".jpg",
+                                ".mp4",
+                                ".thumb.jpg",
+                                ".preview.jpg",
+                                ".json",
+                            ):
+                                (deck.root / (ident + suffix)).unlink(missing_ok=True)
+                            catalog.remove(ident)
+                        with deletion_lock:
+                            deletion_progress["completed"] += 1
+                    return jsonify(deleted=identifiers, missing=[])
+                finally:
+                    with deletion_lock:
+                        deletion_progress["active"] = False
 
     def delete_entries(identifiers):
         entries, missing = [], []

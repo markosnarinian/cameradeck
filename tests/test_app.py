@@ -696,17 +696,29 @@ def test_delete_all_refuses_busy_media(deck, app_factory, operation):
             download.close()
 
 
-def test_delete_all_releases_after_error(deck, app_factory):
+def test_delete_all_progress_and_release_after_error(deck, app_factory, monkeypatch):
     app = app_factory(deck)
     client = app.test_client()
-    entry = make_media(deck)
+    for _ in range(3):
+        make_media(deck)
+    assert client.get("/api/media/delete-all/progress").json == {
+        "active": False,
+        "completed": 0,
+        "total": None,
+        "eta_seconds": None,
+    }
     started, release = threading.Event(), threading.Event()
     catalog = app.extensions["catalog"]
     remove = catalog.remove
+    clock = [100.0]
+    monkeypatch.setattr("app.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    removed = []
 
     def paused_remove(ident):
-        started.set()
-        assert release.wait(10)
+        if removed:
+            started.set()
+            assert release.wait(10)
+        removed.append(ident)
         return remove(ident)
 
     catalog.remove = paused_remove
@@ -719,10 +731,26 @@ def test_delete_all_releases_after_error(deck, app_factory):
         )
     )
     worker.start()
-    assert started.wait(10)
-    release.set()
-    worker.join(10)
+    try:
+        assert started.wait(10)
+        clock[0] = 106.0
+        # Polling must work while deletion holds the deck and catalog locks.
+        assert client.get("/api/media/delete-all/progress").json == {
+            "active": True,
+            "completed": 1,
+            "total": 3,
+            "eta_seconds": 12.0,
+        }
+    finally:
+        release.set()
+        worker.join(10)
     assert results[0].status_code == 200
+    assert client.get("/api/media/delete-all/progress").json == {
+        "active": False,
+        "completed": 3,
+        "total": 3,
+        "eta_seconds": 0.0,
+    }
     # A filesystem error must not leave the exclusive deletion gate closed.
     entry = make_media(deck)
     original = deck.root / entry["file"]
@@ -733,6 +761,12 @@ def test_delete_all_releases_after_error(deck, app_factory):
         == 500
     )
     assert client.get("/api/activity").json == {"idle": True, "operations": {}}
+    assert client.get("/api/media/delete-all/progress").json == {
+        "active": False,
+        "completed": 0,
+        "total": 1,
+        "eta_seconds": None,
+    }
     original.rmdir()
     assert (
         client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"}).status_code

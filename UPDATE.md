@@ -58,6 +58,12 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   range resolution are indeterminate. Keep the browser page open until finished.
   Large ZIPs still require temporary Pi disk space and browser memory; rsync is
   preferable for very large transfers. No migration or dependency change is required.
+- Transfer's **Delete all media** now polls the authenticated read-only
+  `GET /api/media/delete-all/progress` endpoint for completed captures and an
+  estimated time remaining. Deploy the matching backend/frontend and reload
+  browser tabs; if using a reverse proxy, forward this route as well as the
+  long-running `POST /api/media/delete-all` request. Keep the page open until
+  deletion finishes. No dependency, service-setting, or data migration is needed.
 - Exposure time and gain now have independent Auto/Manual selectors, including
   shutter-priority (manual exposure, auto gain) and gain-priority (auto exposure,
   manual gain). No camera-stack upgrade is required: newer libcamera uses the

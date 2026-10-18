@@ -95,13 +95,20 @@ PyPI installation. CameraDeck does not need root privileges to run.
 
 ## Run from source
 
-A source checkout needs a local UI build. Install `uv` and the pinned
-[Node/npm toolchain](https://github.com/markosnarinian/cameradeck/blob/main/UPDATE.md#frontend-toolchain),
-then:
+A source checkout needs a local UI build. Install Git and
+[uv](https://docs.astral.sh/uv/getting-started/installation/), then clone:
 
 ```bash
+sudo apt install git
 git clone https://github.com/markosnarinian/cameradeck.git
 cd cameradeck
+```
+
+From the checkout, install the pinned
+[Node/npm toolchain](https://github.com/markosnarinian/cameradeck/blob/main/UPDATE.md#frontend-toolchain),
+then run:
+
+```bash
 uv venv --system-site-packages
 uv sync --frozen --no-dev
 python3 scripts/frontend.py build

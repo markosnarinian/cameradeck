@@ -139,6 +139,7 @@ def create_app(
     activity = Activity()
     deletion_lock = threading.Lock()
     deletion_progress = dict(active=False, completed=0, total=None, started=None)
+    deletion_cancel = threading.Event()
 
     def authenticated():
         return not password or session.get("authenticated") == authentication
@@ -536,6 +537,14 @@ def create_app(
             active=active, completed=completed, total=total, eta_seconds=remaining
         )
 
+    @app.post("/api/media/delete-all/cancel")
+    def cancel_delete_all():
+        with deletion_lock:
+            if not deletion_progress["active"]:
+                abort(409, description="No delete-all operation is active.")
+            deletion_cancel.set()
+        return jsonify(ok=True)
+
     @app.post("/api/media/delete-all")
     def delete_all():
         confirmation = request.get_json().get("confirm")
@@ -556,6 +565,7 @@ def create_app(
                 )
             with activity.track("deletion", exclusive=True):
                 with deletion_lock:
+                    deletion_cancel.clear()
                     deletion_progress.update(
                         active=True, completed=0, total=None, started=None
                     )
@@ -572,7 +582,14 @@ def create_app(
                     # Completed sidecars can be empty/corrupt. Use only CameraDeck's
                     # filenames, never paths read from damaged metadata or a glob
                     # that could also remove pending clips or unrelated files.
+                    deleted = []
+                    cancelled = False
                     for ident in identifiers:
+                        # Finish all files and the catalog entry for the current
+                        # capture before honoring cancellation at this boundary.
+                        if deletion_cancel.is_set():
+                            cancelled = True
+                            break
                         with catalog.lock:
                             for suffix in (
                                 ".jpg",
@@ -583,9 +600,15 @@ def create_app(
                             ):
                                 (deck.root / (ident + suffix)).unlink(missing_ok=True)
                             catalog.remove(ident)
+                        deleted.append(ident)
                         with deletion_lock:
                             deletion_progress["completed"] += 1
-                    return jsonify(deleted=identifiers, missing=[])
+                    return jsonify(
+                        deleted=deleted,
+                        missing=[],
+                        cancelled=cancelled,
+                        remaining=len(identifiers) - len(deleted),
+                    )
                 finally:
                     with deletion_lock:
                         deletion_progress["active"] = False

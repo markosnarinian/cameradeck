@@ -62,8 +62,12 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   `GET /api/media/delete-all/progress` endpoint for completed captures and an
   estimated time remaining. Deploy the matching backend/frontend and reload
   browser tabs; if using a reverse proxy, forward this route as well as the
-  long-running `POST /api/media/delete-all` request. Keep the page open until
-  deletion finishes. No dependency, service-setting, or data migration is needed.
+  long-running `POST /api/media/delete-all` request and the authenticated
+  `POST /api/media/delete-all/cancel` route. **Cancel deletion** stops between
+  captures: the current capture finishes deleting, already-deleted captures
+  cannot be restored, and remaining captures are left untouched. Keep the page
+  open until the completion/cancellation result appears. No dependency,
+  service-setting, or data migration is needed.
 - Exposure time and gain now have independent Auto/Manual selectors, including
   shutter-priority (manual exposure, auto gain) and gain-priority (auto exposure,
   manual gain). No camera-stack upgrade is required: newer libcamera uses the

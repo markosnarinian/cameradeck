@@ -174,6 +174,7 @@ export function Transfer({ capturing }: { capturing: boolean }) {
   const [deleteOpen, setDeleteOpen] = useState(false),
     [confirmation, setConfirmation] = useState(""),
     [deleting, setDeleting] = useState(false),
+    [cancelling, setCancelling] = useState(false),
     [deleteError, setDeleteError] = useState(""),
     [feedback, setFeedback] = useState("");
   const [deleteProgress, setDeleteProgress] = useState<{
@@ -206,16 +207,24 @@ export function Transfer({ capturing }: { capturing: boolean }) {
   const removeAll = async () => {
     setDeleteProgress(null);
     setDeleting(true);
+    setCancelling(false);
     setDeleteError("");
     setFeedback("");
     try {
-      const result: { deleted: string[]; missing: string[] } = await request(
+      const result: {
+        deleted: string[];
+        missing: string[];
+        cancelled: boolean;
+        remaining: number;
+      } = await request(
         "/api/media/delete-all",
         { confirm: confirmation },
         { timeout: 0 },
       );
       setFeedback(
-        `Deleted ${result.deleted.length} captures from the Pi.` +
+        (result.cancelled
+          ? `Deletion cancelled. Deleted ${result.deleted.length} captures from the Pi; ${result.remaining} captures left untouched. Already deleted captures cannot be restored.`
+          : `Deleted ${result.deleted.length} captures from the Pi.`) +
           (result.missing.length
             ? ` ${result.missing.length} unavailable captures could not be deleted. Check the Library.`
             : " Remote copies were not changed."),
@@ -225,6 +234,18 @@ export function Transfer({ capturing }: { capturing: boolean }) {
       setDeleteError(message(e));
     } finally {
       setDeleting(false);
+      setCancelling(false);
+    }
+  };
+  const cancelDeletion = async () => {
+    setCancelling(true);
+    setDeleteError("");
+    try {
+      await request("/api/media/delete-all/cancel", {});
+      // Keep the dialog locked until the original request reports its result.
+    } catch (e) {
+      setDeleteError(message(e));
+      setCancelling(false);
     }
   };
   return (
@@ -315,10 +336,13 @@ export function Transfer({ capturing }: { capturing: boolean }) {
               <Button
                 type="button"
                 variant="outline"
-                disabled={deleting}
-                onClick={() => setDeleteOpen(false)}
+                disabled={cancelling}
+                onClick={() => {
+                  if (deleting) void cancelDeletion();
+                  else setDeleteOpen(false);
+                }}
               >
-                Cancel
+                {cancelling ? "Cancelling…" : deleting ? "Cancel deletion" : "Cancel"}
               </Button>
               <Button
                 type="submit"
@@ -345,9 +369,11 @@ export function Transfer({ capturing }: { capturing: boolean }) {
                   max={deleteProgress?.total || 1}
                 />
                 <small>
-                  {deleteProgress?.eta_seconds != null
-                    ? `ETA: ${duration(Math.ceil(deleteProgress.eta_seconds))} remaining (estimated)`
-                    : "ETA: estimating…"}
+                  {cancelling
+                    ? "Stopping after the current capture… Already deleted captures cannot be restored."
+                    : deleteProgress?.eta_seconds != null
+                      ? `ETA: ${duration(Math.ceil(deleteProgress.eta_seconds))} remaining (estimated)`
+                      : "ETA: estimating…"}
                   {" · Keep this page open until finished."}
                 </small>
               </div>

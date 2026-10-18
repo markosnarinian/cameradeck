@@ -747,7 +747,9 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     )
     confirm.click()
     expect(dialog.get_by_role("button", name="Deleting…", exact=True)).to_be_disabled()
-    expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    expect(
+        dialog.get_by_role("button", name="Cancel deletion", exact=True)
+    ).to_be_enabled()
     page.keyboard.press("Escape")
     expect(dialog).to_be_visible()
     expect(dialog.get_by_role("status")).to_contain_text("Deleting all Library media")
@@ -769,7 +771,9 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     page.unroute("**/api/media/delete-all/progress")
     page.route("**/api/media/delete-all/progress", lambda route: route.abort())
     expect(bar).not_to_have_attribute("value")
-    expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_disabled()
+    expect(
+        dialog.get_by_role("button", name="Cancel deletion", exact=True)
+    ).to_be_enabled()
     page.unroute("**/api/media/delete-all/progress")
     assert pending[0].request.post_data_json == {"confirm": "delete all"}
     pending.pop().fulfill(
@@ -787,6 +791,73 @@ def test_transfer_delete_all_confirmation_and_result(library_page):
     screenshot(page, "delete-all-success-narrow", full_page=False)
     page.get_by_role("link", name="Library", exact=True).click()
     expect(page.locator(".media-card")).to_have_count(0)
+
+
+def test_transfer_delete_all_cancellation(library_page):
+    page = library_page
+    page.get_by_role("link", name="Transfer", exact=True).click()
+    pending, cancellations = [], []
+    page.route("**/api/media/delete-all", lambda route: pending.append(route))
+    page.route(
+        "**/api/media/delete-all/cancel", lambda route: cancellations.append(route)
+    )
+    page.route(
+        "**/api/media/delete-all/progress",
+        lambda route: route.fulfill(
+            json={"active": True, "completed": 37, "total": 121, "eta_seconds": 83.2}
+        ),
+    )
+    page.get_by_role("button", name="Delete all media", exact=True).click()
+    page.get_by_label("Type DELETE ALL to confirm").fill("delete all")
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_role(
+        "button", name="Permanently delete all media", exact=True
+    ).click()
+    cancel = dialog.get_by_role("button", name="Cancel deletion", exact=True)
+    expect(cancel).to_be_enabled()
+    cancel.click()
+    expect(
+        dialog.get_by_role("button", name="Cancelling…", exact=True)
+    ).to_be_disabled()
+    expect(dialog.get_by_role("status")).to_contain_text(
+        "Stopping after the current capture"
+    )
+    cancellations.pop().fulfill(
+        status=503, json={"error": "Cancellation failed. Try again."}
+    )
+    expect(dialog.get_by_role("alert")).to_contain_text("Cancellation failed")
+    expect(cancel).to_be_enabled()
+    cancel.click()
+    expect(
+        dialog.get_by_role("button", name="Cancelling…", exact=True)
+    ).to_be_disabled()
+    cancellations.pop().fulfill(json={"ok": True})
+    page.keyboard.press("Escape")
+    expect(dialog).to_be_visible()
+    expect(dialog.get_by_role("button", name="Close", exact=True)).to_be_disabled()
+    expect(dialog.get_by_role("status")).to_contain_text("cannot be restored")
+    screenshot(page, "delete-all-cancelling-desktop", full_page=False)
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    screenshot(page, "delete-all-cancelling-narrow", full_page=False)
+    pending.pop().fulfill(
+        json={
+            "deleted": [str(index) for index in range(38)],
+            "missing": [],
+            "cancelled": True,
+            "remaining": 83,
+        }
+    )
+    expect(dialog).not_to_be_visible()
+    feedback = page.get_by_role("region", name="Free up space").get_by_role("status")
+    expect(feedback).to_contain_text("Deletion cancelled. Deleted 38 captures")
+    expect(feedback).to_contain_text("83 captures left untouched")
+    expect(feedback).to_contain_text("Already deleted captures cannot be restored")
+    feedback.scroll_into_view_if_needed()
+    screenshot(page, "delete-all-cancelled-narrow", full_page=False)
+    page.get_by_role("button", name="Delete all media", exact=True).click()
+    expect(page.get_by_label("Type DELETE ALL to confirm")).to_have_value("")
+    expect(dialog.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
 
 
 @pytest.mark.skip(reason="Superseded by the rsync-only transfer page")

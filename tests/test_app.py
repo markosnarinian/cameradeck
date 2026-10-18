@@ -620,7 +620,7 @@ def test_delete_all_requires_confirmation_and_preserves_internal_files(deck, cli
         assert (deck.root / name).read_bytes() == content
     assert client.post(
         "/api/media/delete-all", json={"confirm": "DELETE ALL"}
-    ).json == {"deleted": [], "missing": []}
+    ).json == {"deleted": [], "missing": [], "cancelled": False, "remaining": 0}
 
 
 @pytest.mark.parametrize(
@@ -772,6 +772,82 @@ def test_delete_all_progress_and_release_after_error(deck, app_factory, monkeypa
         client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"}).status_code
         == 200
     )
+
+
+@pytest.mark.parametrize("stop_after", [1, 3])
+def test_delete_all_cancellation_finishes_current_capture(
+    deck, app_factory, monkeypatch, stop_after
+):
+    app = app_factory(deck)
+    client = app.test_client()
+    entries = [make_media(deck) for _ in range(3)]
+    originals = {deck.root / entry["file"] for entry in entries}
+    before = {
+        path: path.read_bytes()
+        for entry in entries
+        for path in deck.root.glob(entry["id"] + ".*")
+    }
+    started, release = threading.Event(), threading.Event()
+    unlink = type(deck.root).unlink
+    removed_originals = []
+
+    def paused_unlink(path, *args, **kwargs):
+        result = unlink(path, *args, **kwargs)
+        if path in originals:
+            removed_originals.append(path)
+            if len(removed_originals) == stop_after:
+                started.set()
+                assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(type(deck.root), "unlink", paused_unlink)
+    assert client.post("/api/media/delete-all/cancel", json={}).status_code == 409
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            app.test_client().post(
+                "/api/media/delete-all", json={"confirm": "DELETE ALL"}
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert started.wait(10)
+        # Cancellation returns promptly even in the middle of a capture's I/O.
+        for _ in range(2):
+            assert (
+                client.post("/api/media/delete-all/cancel", json={}).status_code == 200
+            )
+        assert client.get("/api/media/delete-all/progress").json["active"] is True
+        assert client.get("/api/activity").json == {
+            "idle": False,
+            "operations": {"deletion": 1},
+        }
+        assert client.post("/api/capture", json={}).status_code == 409
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive()
+    assert results[0].status_code == 200
+    result = results[0].json
+    assert len(result["deleted"]) == stop_after
+    assert result["remaining"] == 3 - stop_after
+    assert result["cancelled"] is (stop_after < 3)
+    for path, data in before.items():
+        if any(path.name.startswith(ident + ".") for ident in result["deleted"]):
+            assert not path.exists()
+        else:
+            assert path.read_bytes() == data
+    assert client.get("/api/media").json["total"] == 3 - stop_after
+    assert client.get("/api/activity").json == {"idle": True, "operations": {}}
+    assert client.get("/api/media/delete-all/progress").json["active"] is False
+    assert client.post("/api/media/delete-all/cancel", json={}).status_code == 409
+    # A new deletion must not inherit a previous cancellation request.
+    retry = client.post("/api/media/delete-all", json={"confirm": "DELETE ALL"})
+    assert retry.status_code == 200
+    assert len(retry.json["deleted"]) == 3 - stop_after
+    assert retry.json["cancelled"] is False
+    assert client.get("/api/media").json["total"] == 0
 
 
 def test_activity_reports_work_a_stop_would_interrupt(deck, app_factory):

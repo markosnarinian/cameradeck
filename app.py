@@ -84,7 +84,7 @@ def head_commit():
     """Return the source revision that started this CameraDeck process."""
     try:
         return subprocess.run(
-            ["git", "rev-parse", "--short=12", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=Path(__file__).parent,
             check=True,
             capture_output=True,
@@ -222,7 +222,10 @@ def create_app(
     @app.get("/api/session")
     def session_status():
         return jsonify(
-            authenticated=authenticated(), required=bool(password), revision=revision
+            authenticated=authenticated(),
+            required=bool(password),
+            revision=revision[:12],
+            full_revision=revision,
         )
 
     @app.post("/api/logout")

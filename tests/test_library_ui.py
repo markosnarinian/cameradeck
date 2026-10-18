@@ -57,21 +57,24 @@ def library_page(tmp_path):
                     args=["--no-sandbox", "--disable-dev-shm-usage"],
                 )
             )
-            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            page = browser.new_page(
+                viewport={"width": 1440, "height": 1100}, device_scale_factor=2
+            )
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{server.server_port}/library")
             expect(page.get_by_role("heading", name="Locked")).to_be_visible()
             revision = subprocess.check_output(
-                ["git", "rev-parse", "--short=12", "HEAD"],
+                ["git", "rev-parse", "HEAD"],
                 cwd=Path(__file__).resolve().parents[1],
                 text=True,
             ).strip()
-            expect(page.locator(".revision")).to_have_text(f"Commit {revision}")
+            expect(page.locator("footer code")).to_have_text([revision[:7], revision])
             page.get_by_label("Password").fill("synthetic-password")
             page.get_by_role("button", name="Sign in").click()
             expect(page.locator(".media-card")).to_have_count(40)
-            expect(page.locator("header .revision")).to_have_text(f"Commit {revision}")
+            expect(page.locator("header")).not_to_contain_text(revision[:7])
+            expect(page.locator("footer code")).to_have_text([revision[:7], revision])
             yield page
             assert not errors, errors
             browser.close()
@@ -80,6 +83,49 @@ def library_page(tmp_path):
         thread.join(10)
         server.server_close()
         app.extensions["catalog"].close()
+
+
+def test_bottom_status_bar(library_page):
+    page = library_page
+    base = page.url.split("/library")[0]
+    status = page.request.get(base + "/api/status").json()
+    status.update(free_bytes=17.25 * 1024**3, total_bytes=64 * 1024**3, low_space=False)
+    page.route("**/api/status", lambda route: route.fulfill(json=status))
+    footer = page.get_by_role("contentinfo", name="System status")
+    expect(footer).to_contain_text("17.3 GiB available / 64.0 GiB total")
+    for path in ("/library", "/transfer", "/"):
+        page.goto(base + path)
+        expect(footer).to_contain_text("17.3 GiB available / 64.0 GiB total")
+        for width, height in ((1440, 900), (390, 844)):
+            page.set_viewport_size({"width": width, "height": height})
+            assert footer.evaluate("""el => {
+                const r = el.getBoundingClientRect();
+                const main = document.querySelector('main').getBoundingClientRect();
+                return r.bottom <= innerHeight && r.bottom >= innerHeight - 1
+                    && main.bottom <= r.top
+                    && document.documentElement.scrollWidth <= innerWidth;
+            }""")
+            screenshot(
+                page, f"status-{path.strip('/') or 'camera'}-{width}", full_page=False
+            )
+            if path == "/transfer":
+                button = page.get_by_role("button", name="Delete all media", exact=True)
+                button.scroll_into_view_if_needed()
+                assert (
+                    button.bounding_box()["y"] + button.bounding_box()["height"]
+                    <= footer.bounding_box()["y"]
+                )
+                screenshot(page, f"status-transfer-scrolled-{width}", full_page=False)
+    status.update(free_bytes=2.5 * 1024**3, low_space=True)
+    expect(footer).to_contain_text("2.5 GiB available / 64.0 GiB total")
+    screenshot(page, "status-low-space", full_page=False)
+    page.unroute("**/api/status")
+    page.route("**/api/status", lambda route: route.abort())
+    expect(footer).to_contain_text("2.5 GiB available / 64.0 GiB total · stale")
+    screenshot(page, "status-disconnected", full_page=False)
+    page.get_by_role("button", name="Lock", exact=True).click()
+    expect(footer).to_contain_text("Media disk · unavailable")
+    screenshot(page, "status-locked", full_page=False)
 
 
 @pytest.mark.parametrize("action", ["shutdown", "reboot"])

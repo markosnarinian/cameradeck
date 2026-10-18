@@ -27,6 +27,7 @@ export type Status = {
   sequence_settings?: { burst?: { rate: number } };
   transfer_active?: boolean;
   free_bytes?: number;
+  total_bytes?: number;
   low_space?: boolean;
 };
 export type RsyncJob = {

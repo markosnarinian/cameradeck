@@ -23,6 +23,37 @@ import { Library } from "./Library";
 import { Transfer } from "./Transfer";
 import "./style.css";
 
+function StatusBar({
+  revision,
+  status,
+  connected,
+}: {
+  revision: string;
+  status: Status | null;
+  connected: boolean;
+}) {
+  return (
+    <footer className="status-bar" aria-label="System status">
+      <div className="status-commit">
+        <span>
+          Commit <code>{revision.slice(0, 7)}</code>
+        </span>
+        <span className="status-hash">
+          Full <code>{revision}</code>
+        </span>
+      </div>
+      <span
+        className={status?.low_space ? "status-disk low-space" : "status-disk"}
+      >
+        Media disk ·{" "}
+        {status?.free_bytes != null && status.total_bytes != null
+          ? `${(status.free_bytes / 1024 ** 3).toFixed(1)} GiB available / ${(status.total_bytes / 1024 ** 3).toFixed(1)} GiB total${!connected ? " · stale" : ""}`
+          : "unavailable"}
+      </span>
+    </footer>
+  );
+}
+
 function App() {
   const cameraPage = useLocation().pathname === "/";
   const [auth, setAuth] = useState<
@@ -49,7 +80,7 @@ function App() {
     try {
       const s = await request("/api/session");
       setRequired(s.required);
-      setRevision(s.revision);
+      setRevision(s.full_revision);
       setAuth(s.authenticated || !s.required ? "ready" : "locked");
     } catch (e) {
       setAuth("unreachable");
@@ -128,63 +159,62 @@ function App() {
     );
   if (auth !== "ready")
     return (
-      <main className="auth">
-        <h1>CameraDeck</h1>
-        <p className="revision">Commit {revision}</p>
-        {auth === "checking" ? (
-          <p role="status">Checking session…</p>
-        ) : auth === "unreachable" ? (
-          <>
-            <h2>Pi unreachable</h2>
-            <p role="alert">{error}</p>
-            <Button onClick={session}>Retry connection</Button>
-          </>
-        ) : (
-          <>
-            <h2>Locked</h2>
-            <form
-              autoComplete="off"
-              onSubmit={(e) => {
-                e.preventDefault();
-                void run(async () => {
-                  await request("/api/login", { password });
-                  setPassword("");
-                  await session();
-                });
-              }}
-            >
-              <label className="field">
-                Password
-                <Input
-                  type="password"
-                  name="camera-access"
-                  autoComplete="off"
-                  data-1p-ignore
-                  data-lpignore="true"
-                  data-bwignore="true"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                  autoFocus
-                />
-              </label>
-              <Button disabled={busy}>Sign in</Button>
-            </form>
-            {notice && <p role="alert">{notice}</p>}
-          </>
-        )}
-      </main>
+      <div className="app-shell">
+        <main className="auth">
+          <h1>CameraDeck</h1>
+          {auth === "checking" ? (
+            <p role="status">Checking session…</p>
+          ) : auth === "unreachable" ? (
+            <>
+              <h2>Pi unreachable</h2>
+              <p role="alert">{error}</p>
+              <Button onClick={session}>Retry connection</Button>
+            </>
+          ) : (
+            <>
+              <h2>Locked</h2>
+              <form
+                autoComplete="off"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void run(async () => {
+                    await request("/api/login", { password });
+                    setPassword("");
+                    await session();
+                  });
+                }}
+              >
+                <label className="field">
+                  Password
+                  <Input
+                    type="password"
+                    name="camera-access"
+                    autoComplete="off"
+                    data-1p-ignore
+                    data-lpignore="true"
+                    data-bwignore="true"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    autoFocus
+                  />
+                </label>
+                <Button disabled={busy}>Sign in</Button>
+              </form>
+              {notice && <p role="alert">{notice}</p>}
+            </>
+          )}
+        </main>
+        <StatusBar revision={revision} status={null} connected={false} />
+      </div>
     );
   const seq = status?.sequence;
   return (
     <div className={cameraPage ? "app-shell camera-shell" : "app-shell"}>
       <header>
-        <div className="header-brand">
-          <NavLink to="/" className="brand">
-            CameraDeck
-          </NavLink>
-          <span className="revision">Commit {revision}</span>
-        </div>
+        <NavLink to="/" className="brand">
+          CameraDeck
+        </NavLink>
         <nav>
           <NavLink to="/" end>
             Camera
@@ -400,6 +430,7 @@ function App() {
           />
         </Routes>
       </main>
+      <StatusBar revision={revision} status={status} connected={connected} />
     </div>
   );
 }

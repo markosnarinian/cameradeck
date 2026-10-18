@@ -165,12 +165,13 @@ def test_revision_identifies_head_at_startup_not_later_checkout(
         "-qm",
         "first",
     )
-    first = git("rev-parse", "--short=12", "HEAD")
+    first = git("rev-parse", "HEAD")
     monkeypatch.setattr("app.__file__", str(source / "app.py"))
     # Local edits deliberately do not claim to have a different commit ID.
     (source / "app.py").write_text("uncommitted source")
     client = app_factory(deck).test_client()
-    assert client.get("/api/session").json["revision"] == first
+    assert client.get("/api/session").json["revision"] == first[:12]
+    assert client.get("/api/session").json["full_revision"] == first
     git("add", "app.py")
     git(
         "-c",
@@ -181,14 +182,15 @@ def test_revision_identifies_head_at_startup_not_later_checkout(
         "-qm",
         "second",
     )
-    second = git("rev-parse", "--short=12", "HEAD")
+    second = git("rev-parse", "HEAD")
     assert first != second
-    assert client.get("/api/session").json["revision"] == first
+    assert client.get("/api/session").json["full_revision"] == first
     restarted = app_factory(deck).test_client()
-    assert restarted.get("/api/session").json["revision"] == second
+    assert restarted.get("/api/session").json["full_revision"] == second
+    assert restarted.get("/api/session").json["revision"] == second[:12]
     (source / ".git").rename(source / "git-unavailable")
     assert (
-        app_factory(deck).test_client().get("/api/session").json["revision"]
+        app_factory(deck).test_client().get("/api/session").json["full_revision"]
         == "unknown"
     )
 
@@ -488,11 +490,20 @@ def test_storage_guard(deck, monkeypatch):
         deck._new("still")
 
 
-def test_low_space_warning_threshold(deck, monkeypatch):
+def test_low_space_warning_threshold(deck, client, monkeypatch):
     for free, low in [(5 * 1024**3 - 1, True), (5 * 1024**3, False)]:
-        monkeypatch.setattr("camera.shutil.disk_usage", lambda _: Mock(free=free))
-        status = deck.status()
-        assert (status["free_bytes"], status["low_space"]) == (free, low)
+
+        def disk_usage(path):
+            assert path == deck.root
+            return Mock(free=free, total=64 * 1024**3)
+
+        monkeypatch.setattr("camera.shutil.disk_usage", disk_usage)
+        status = client.get("/api/status").json
+        assert (status["free_bytes"], status["total_bytes"], status["low_space"]) == (
+            free,
+            64 * 1024**3,
+            low,
+        )
 
 
 def test_page_pagination_validation_and_clamping(deck, client):

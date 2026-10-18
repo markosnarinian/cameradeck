@@ -651,6 +651,7 @@ class CameraDeck:
 
     def status(self):
         now = time.monotonic()
+        disk = shutil.disk_usage(self.root)
         return dict(
             ready=self.camera is not None and not self.shutdown.is_set(),
             error=self.error,
@@ -672,8 +673,9 @@ class CameraDeck:
             sequence=plain(self.sequence),
             sequence_settings=plain(self.sequence_settings),
             burst_fps=self._burst_fps(),
-            free_bytes=(free := shutil.disk_usage(self.root).free),
-            low_space=free < LOW_FREE,
+            free_bytes=disk.free,
+            total_bytes=disk.total,
+            low_space=disk.free < LOW_FREE,
         )
 
     def close(self):

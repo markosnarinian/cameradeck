@@ -50,6 +50,55 @@ select:disabled {
   outline: 2px solid #b4d8ff;
   outline-offset: 3px;
 }
+.app-shell {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.app-shell > header,
+.status-bar {
+  flex-shrink: 0;
+}
+.app-shell > main {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+}
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 24px;
+  padding: 9px max(16px, calc((100vw - 1192px) / 2));
+  border-top: 1px solid var(--border);
+  background: #1a1e22;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.status-commit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 16px;
+  min-width: 0;
+}
+.status-bar code {
+  color: var(--foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  user-select: all;
+}
+.status-hash {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.status-disk.low-space {
+  color: #f5ce88;
+}
 header {
   height: 76px;
   display: flex;
@@ -63,21 +112,11 @@ header {
   gap: 4px;
   margin-left: auto;
 }
-.header-brand {
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-  gap: 4px;
-}
 .brand {
   font-size: 19px;
   font-weight: 720;
   letter-spacing: -0.7px;
-}
-.revision {
-  color: var(--muted);
-  font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
-  white-space: nowrap;
+  flex-shrink: 0;
 }
 nav {
   display: flex;
@@ -616,9 +655,6 @@ select {
   .brand {
     font-size: 17px;
   }
-  .revision {
-    margin-right: auto;
-  }
   nav {
     gap: 0;
     order: 1;
@@ -713,17 +749,6 @@ select {
   .notice {
     font-size: 13px;
   }
-}
-.camera-shell {
-  height: 100vh;
-  height: 100dvh;
-  display: flex;
-  flex-direction: column;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right)
-    env(safe-area-inset-bottom) env(safe-area-inset-left);
-}
-.camera-shell > header {
-  flex-shrink: 0;
 }
 .camera-main {
   display: flex;

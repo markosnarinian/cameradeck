@@ -129,10 +129,15 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   environment and other settings (step 5). Build-time Node/npm, `curl` and
   `xz-utils` are newly required; no Python dependency or environment-variable
   migration is needed. The existing venv and media remain in place.
-- The header and locked screen identify Git HEAD at backend startup, not dirty
-  working-tree contents or a later checkout change. Deploy committed source,
-  build it, restart, and reload tabs together. An unavailable Git checkout
-  displays `unknown`.
+- The bottom status bar (including on the locked screen) identifies Git HEAD
+  at backend startup with its full hash and 7-character GitHub-style abbreviation,
+  not dirty working-tree contents or a later checkout change. The navbar no
+  longer shows a commit. Deploy committed source, build it, restart, and reload
+  tabs together. An unavailable Git checkout displays `unknown`. The bar also
+  shows available and total media-filesystem capacity in GiB while signed in;
+  disconnected readings are marked stale. Deploy the matching backend/frontend
+  for the new `/api/session` `full_revision` and `/api/status` `total_bytes` fields.
+  No dependencies, service settings, or migrations change.
 
 ## Update steps
 
@@ -278,9 +283,11 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    to finish. Confirm the count, pagination, preview, and measured exposure.
    Take a test photo, then perform a short 5/s run while browsing the Library;
    stop it and inspect completed count, achieved rate and skipped frames. A
-   configured target is not a hardware throughput guarantee. Confirm the locked
-   screen/header's Commit label and `/api/session` revision equal
-   `git rev-parse --short=12 HEAD`, and `git status --short` shows no source edits
+   configured target is not a hardware throughput guarantee. Confirm the bottom
+   status bar's full commit and `/api/session` `full_revision` equal
+   `git rev-parse HEAD`, the short label matches its first seven characters,
+   available/total disk space matches the media filesystem, and
+   `git status --short` shows no source edits
    (the local bundle is ignored). Check authenticated `/api/status`, preview,
    direct `/library` and `/transfer` reloads, the six camera readings, and the
    rsync command. Test destructive actions only with disposable captures after

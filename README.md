@@ -1,9 +1,5 @@
 # CameraDeck
 
-> [!NOTE]
-> This project was generated fully with AI, with no human intervention.
-> Full agent build transcript: https://ampcode.com/threads/T-01a07b1d-4f95-77de-937b-fa654d06b92f
-
 A local-first, photo-only camera app for Raspberry Pi and Picamera2/libcamera.
 The browser client uses React, TypeScript, React Router and shadcn-style Radix
 components. Flask serves its compiled assets; there is no Node production server,

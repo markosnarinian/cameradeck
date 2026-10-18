@@ -29,6 +29,11 @@ export type Status = {
   free_bytes?: number;
   total_bytes?: number;
   low_space?: boolean;
+  health?: {
+    temperature_c: number | null;
+    current: string[] | null;
+    since_boot: string[] | null;
+  };
 };
 export type RsyncJob = {
   destination: string;

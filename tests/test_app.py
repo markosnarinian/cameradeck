@@ -70,6 +70,68 @@ def test_no_camera_status_and_capture(client):
         assert b"/assets/" in response.data
 
 
+@pytest.mark.parametrize(
+    "flags,current,since_boot",
+    [
+        ("0", [], []),
+        ("50000", [], ["Undervoltage", "Throttled"]),
+        ("2", ["Frequency capped"], []),
+        ("80009", ["Undervoltage", "Temperature limit"], ["Temperature limit"]),
+    ],
+)
+def test_pi_health_status_without_camera(
+    client, tmp_path, monkeypatch, flags, current, since_boot
+):
+    zone = tmp_path / "thermal"
+    zone.mkdir()
+    (zone / "type").write_text("cpu-thermal\n")
+    (zone / "temp").write_text("53556\n")
+    monkeypatch.setattr("health.Path", lambda _: zone)
+    monkeypatch.setattr(
+        "health.subprocess.run",
+        lambda *a, **kw: SimpleNamespace(stdout=f"throttled=0x{flags}\n"),
+    )
+    data = client.get("/api/status").json
+    assert data["ready"] is False
+    assert data["health"] == dict(
+        temperature_c=53.556, current=current, since_boot=since_boot
+    )
+
+
+@pytest.mark.parametrize("failure", ["missing", "timeout", "malformed"])
+def test_pi_health_unavailable_and_recovery(client, tmp_path, monkeypatch, failure):
+    zone = tmp_path / "thermal"
+    zone.mkdir()
+    monkeypatch.setattr("health.Path", lambda _: zone)
+    clock = [100.0]
+    monkeypatch.setattr("health.time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def command(*args, **kwargs):
+        if failure == "missing":
+            raise FileNotFoundError("vcgencmd")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("vcgencmd", 0.5)
+        return SimpleNamespace(stdout="not a firmware reading")
+
+    monkeypatch.setattr("health.subprocess.run", command)
+    assert client.get("/api/status").json["health"] == dict(
+        temperature_c=None, current=None, since_boot=None
+    )
+    (zone / "type").write_text("cpu-thermal")
+    (zone / "temp").write_text("61000")
+    monkeypatch.setattr(
+        "health.subprocess.run",
+        lambda *a, **kw: SimpleNamespace(stdout="throttled=0x4"),
+    )
+    # Cached unavailable values expire; a missing sensor must never claim healthy.
+    clock[0] = 104.9
+    assert client.get("/api/status").json["health"]["current"] is None
+    clock[0] = 105.0
+    assert client.get("/api/status").json["health"] == dict(
+        temperature_c=61.0, current=["Throttled"], since_boot=[]
+    )
+
+
 def test_network_startup_preserves_existing_password(tmp_path, monkeypatch):
     from app import main
 

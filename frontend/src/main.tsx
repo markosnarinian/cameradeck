@@ -27,27 +27,79 @@ function StatusBar({
   revision,
   status,
   connected,
+  lastUpdated = null,
+  live = true,
 }: {
   revision: string;
   status: Status | null;
   connected: boolean;
+  lastUpdated?: number | null;
+  live?: boolean;
 }) {
+  const [now, setNow] = useState(() => performance.now());
+  useEffect(() => {
+    if (!live || lastUpdated == null) return;
+    const timer = setInterval(() => setNow(performance.now()), 1000);
+    return () => clearInterval(timer);
+  }, [live, lastUpdated]);
+  const age =
+    lastUpdated == null
+      ? null
+      : Math.max(0, Math.floor((now - lastUpdated) / 1000));
+  const fresh = connected && age != null && age < 5;
+  const health = status?.health;
   return (
     <footer className="status-bar" aria-label="System status">
-      <div className="status-commit">
-        <span>
-          Commit <code>{revision.slice(0, 7)}</code>
-        </span>
-        <span className="status-hash">
-          Full <code>{revision}</code>
-        </span>
-      </div>
+      <span>
+        Commit <code>{revision.slice(0, 7)}</code>
+      </span>
+      {live && (
+        <>
+          <span className={`status-connection ${fresh ? "fresh" : "stale"}`}>
+            {age == null
+              ? "Connecting…"
+              : `${fresh ? "Connected" : connected ? "Stale" : "Disconnected"} · ${fresh ? "updated" : "last update"} ${age}s ago`}
+          </span>
+          <span
+            className={
+              (health?.temperature_c ?? 0) >= 80 ? "status-warning" : undefined
+            }
+          >
+            Pi{" "}
+            {health?.temperature_c != null
+              ? `${health.temperature_c.toFixed(1)} °C`
+              : "temperature unavailable"}
+            {health && !fresh ? " · stale" : ""}
+          </span>
+          <span
+            className={
+              health?.current?.length
+                ? "status-danger"
+                : health?.since_boot?.length
+                  ? "status-warning"
+                  : undefined
+            }
+          >
+            {health?.current == null
+              ? "Throttling unavailable"
+              : health.current.length
+                ? `Now: ${health.current.join(", ")}`
+                : "No throttling now"}
+            {!!health?.since_boot?.length && (
+              <span className="status-warning">
+                {` · Since boot: ${health.since_boot.join(", ")}`}
+              </span>
+            )}
+            {health && !fresh ? " · stale" : ""}
+          </span>
+        </>
+      )}
       <span
         className={status?.low_space ? "status-disk low-space" : "status-disk"}
       >
         Media disk ·{" "}
         {status?.free_bytes != null && status.total_bytes != null
-          ? `${(status.free_bytes / 1024 ** 3).toFixed(1)} GiB available / ${(status.total_bytes / 1024 ** 3).toFixed(1)} GiB total${!connected ? " · stale" : ""}`
+          ? `${(status.free_bytes / 1024 ** 3).toFixed(1)} GiB available / ${(status.total_bytes / 1024 ** 3).toFixed(1)} GiB total${!fresh ? " · stale" : ""}`
           : "unavailable"}
       </span>
     </footer>
@@ -65,6 +117,7 @@ function App() {
     [notice, setNotice] = useState(""),
     [status, setStatus] = useState<Status | null>(null),
     [connected, setConnected] = useState(false),
+    [lastUpdated, setLastUpdated] = useState<number | null>(null),
     [busy, setBusy] = useState(false),
     [password, setPassword] = useState(""),
     [epoch, setEpoch] = useState(0);
@@ -92,6 +145,7 @@ function App() {
       setAuth("locked");
       setStatus(null);
       setConnected(false);
+      setLastUpdated(null);
     });
     void session();
     return () => onUnauthorized(() => {});
@@ -109,6 +163,7 @@ function App() {
         if (!stopped) {
           setStatus(data);
           setConnected(true);
+          setLastUpdated(performance.now());
           setError("");
         }
       } catch (e) {
@@ -205,7 +260,12 @@ function App() {
             </>
           )}
         </main>
-        <StatusBar revision={revision} status={null} connected={false} />
+        <StatusBar
+          revision={revision}
+          status={null}
+          connected={false}
+          live={false}
+        />
       </div>
     );
   const seq = status?.sequence;
@@ -243,6 +303,7 @@ function App() {
                   setAuth("locked");
                   setStatus(null);
                   setConnected(false);
+                  setLastUpdated(null);
                 })
               }
             >
@@ -430,7 +491,12 @@ function App() {
           />
         </Routes>
       </main>
-      <StatusBar revision={revision} status={status} connected={connected} />
+      <StatusBar
+        revision={revision}
+        status={status}
+        connected={connected}
+        lastUpdated={lastUpdated}
+      />
     </div>
   );
 }

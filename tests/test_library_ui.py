@@ -69,12 +69,14 @@ def library_page(tmp_path):
                 cwd=Path(__file__).resolve().parents[1],
                 text=True,
             ).strip()
-            expect(page.locator("footer code")).to_have_text([revision[:7], revision])
+            expect(page.locator("footer code")).to_have_text([revision[:7]])
+            expect(page.locator("body")).not_to_contain_text(revision)
             page.get_by_label("Password").fill("synthetic-password")
             page.get_by_role("button", name="Sign in").click()
             expect(page.locator(".media-card")).to_have_count(40)
             expect(page.locator("header")).not_to_contain_text(revision[:7])
-            expect(page.locator("footer code")).to_have_text([revision[:7], revision])
+            expect(page.locator("footer code")).to_have_text([revision[:7]])
+            expect(page.locator("body")).not_to_contain_text(revision)
             yield page
             assert not errors, errors
             browser.close()
@@ -90,9 +92,18 @@ def test_bottom_status_bar(library_page):
     base = page.url.split("/library")[0]
     status = page.request.get(base + "/api/status").json()
     status.update(free_bytes=17.25 * 1024**3, total_bytes=64 * 1024**3, low_space=False)
+    status["health"] = dict(temperature_c=54.2, current=[], since_boot=[])
     page.route("**/api/status", lambda route: route.fulfill(json=status))
     footer = page.get_by_role("contentinfo", name="System status")
     expect(footer).to_contain_text("17.3 GiB available / 64.0 GiB total")
+    expect(footer).to_contain_text("Pi 54.2 °C")
+    expect(footer).to_contain_text("No throttling now")
+    expect(footer).to_contain_text("Connected · updated")
+    screenshot(page, "status-healthy", full_page=False)
+    status["health"]["since_boot"] = ["Undervoltage", "Throttled"]
+    expect(footer).to_contain_text(
+        "No throttling now · Since boot: Undervoltage, Throttled"
+    )
     for path in ("/library", "/transfer", "/"):
         page.goto(base + path)
         expect(footer).to_contain_text("17.3 GiB available / 64.0 GiB total")
@@ -119,12 +130,44 @@ def test_bottom_status_bar(library_page):
     status.update(free_bytes=2.5 * 1024**3, low_space=True)
     expect(footer).to_contain_text("2.5 GiB available / 64.0 GiB total")
     screenshot(page, "status-low-space", full_page=False)
+    status["health"].update(
+        temperature_c=82.3, current=["Throttled", "Temperature limit"]
+    )
+    expect(footer).to_contain_text("Pi 82.3 °C")
+    expect(footer).to_contain_text("Now: Throttled, Temperature limit")
+    screenshot(page, "status-throttled", full_page=False)
+    status["health"] = dict(temperature_c=None, current=None, since_boot=None)
+    expect(footer).to_contain_text("Pi temperature unavailable")
+    expect(footer).to_contain_text("Throttling unavailable")
+    expect(footer).not_to_contain_text("No throttling now")
+    screenshot(page, "status-unavailable", full_page=False)
+    status["health"] = dict(temperature_c=54.2, current=[], since_boot=[])
+    expect(footer).to_contain_text("No throttling now")
+    # A hung request must become stale before the 15-second request timeout.
+    page.clock.install()
+    page.reload()
+    expect(footer).to_contain_text("Connected · updated")
+    page.clock.pause_at(page.evaluate("new Date().toISOString()"))
+    pending = []
     page.unroute("**/api/status")
-    page.route("**/api/status", lambda route: route.abort())
+    page.route("**/api/status", lambda route: pending.append(route))
+    page.clock.run_for(7000)
+    expect(footer).to_contain_text(re.compile(r"Stale · last update [5-9]s ago"))
+    screenshot(page, "status-stale", full_page=False)
+    assert len(pending) == 1
+    pending.pop().abort()
+    expect(footer).to_contain_text("Disconnected · last update")
     expect(footer).to_contain_text("2.5 GiB available / 64.0 GiB total · stale")
     screenshot(page, "status-disconnected", full_page=False)
+    page.unroute("**/api/status")
+    page.route("**/api/status", lambda route: route.fulfill(json=status))
+    page.clock.resume()
+    expect(footer).to_contain_text("Connected · updated")
+    expect(footer).not_to_contain_text(" · stale")
     page.get_by_role("button", name="Lock", exact=True).click()
     expect(footer).to_contain_text("Media disk · unavailable")
+    expect(footer).not_to_contain_text("Pi 54.2 °C")
+    expect(footer).not_to_contain_text("Connected")
     screenshot(page, "status-locked", full_page=False)
 
 

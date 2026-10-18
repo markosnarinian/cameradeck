@@ -81,23 +81,29 @@ select:disabled {
   line-height: 1.4;
   font-variant-numeric: tabular-nums;
 }
-.status-commit {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 16px;
-  min-width: 0;
-}
 .status-bar code {
   color: var(--foreground);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   user-select: all;
 }
-.status-hash {
-  overflow-wrap: anywhere;
-  min-width: 0;
-}
-.status-disk.low-space {
+.status-disk.low-space,
+.status-warning {
   color: #f5ce88;
+}
+.status-danger {
+  color: #ff9e9e;
+}
+.status-connection::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #f5ce88;
+  margin-right: 6px;
+}
+.status-connection.fresh::before {
+  background: #8bd5b0;
 }
 header {
   height: 76px;

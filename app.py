@@ -32,6 +32,7 @@ from flask import (
 )
 from camera import CameraDeck
 from catalog import ID, MediaCatalog
+from health import PiHealth
 from power import PowerManager
 from scripts.frontend import check as check_frontend
 from transfer import Busy, RsyncTransfer
@@ -136,6 +137,7 @@ def create_app(
     power_manager = power_manager or PowerManager()
     rsync = rsync or RsyncTransfer(deck.root)
     app.extensions["rsync"] = rsync
+    health = PiHealth()
     activity = Activity()
     deletion_lock = threading.Lock()
     deletion_progress = dict(active=False, completed=0, total=None, started=None)
@@ -262,7 +264,13 @@ def create_app(
 
     @app.get("/api/status")
     def status():
-        return jsonify({**deck.status(), "transfer_active": rsync.active})
+        return jsonify(
+            {
+                **deck.status(),
+                "transfer_active": rsync.active,
+                "health": health.status(),
+            }
+        )
 
     @app.get("/api/activity")
     def activity_status():

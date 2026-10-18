@@ -130,7 +130,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   `xz-utils` are newly required; no Python dependency or environment-variable
   migration is needed. The existing venv and media remain in place.
 - The bottom status bar (including on the locked screen) identifies Git HEAD
-  at backend startup with its full hash and 7-character GitHub-style abbreviation,
+  at backend startup with only its 7-character GitHub-style abbreviation,
   not dirty working-tree contents or a later checkout change. The navbar no
   longer shows a commit. Deploy committed source, build it, restart, and reload
   tabs together. An unavailable Git checkout displays `unknown`. The bar also
@@ -138,6 +138,20 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
   disconnected readings are marked stale. Deploy the matching backend/frontend
   for the new `/api/session` `full_revision` and `/api/status` `total_bytes` fields.
   No dependencies, service settings, or migrations change.
+- The authenticated status bar also shows Pi CPU temperature, current firmware
+  throttling/undervoltage flags, and separate flags recorded since boot. Backend
+  `/api/status` now includes `health`; readings are cached for five seconds.
+  Temperature uses the readable `cpu-thermal` sysfs sensor; firmware flags use
+  `/usr/bin/vcgencmd get_throttled` with a 0.5-second timeout. Missing sensors,
+  command failures, or insufficient permissions show unavailable, never healthy.
+  On Raspberry Pi OS, `vcgencmd` is supplied by `raspi-utils-core` (already
+  installed on pi4). Check it as the service user without sudo; do not grant
+  broad privileges or replace device-specific service settings. No new Python
+  dependency or migration is required. Connection freshness shows time since the
+  last successful status response; readings become stale after five seconds
+  without an update, including while a request is still pending. These health
+  and connection readings are hidden when locked. Capture rates/skipped frames
+  and rsync progress remain on their existing pages, not in this bar.
 
 ## Update steps
 
@@ -284,8 +298,8 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    Take a test photo, then perform a short 5/s run while browsing the Library;
    stop it and inspect completed count, achieved rate and skipped frames. A
    configured target is not a hardware throughput guarantee. Confirm the bottom
-   status bar's full commit and `/api/session` `full_revision` equal
-   `git rev-parse HEAD`, the short label matches its first seven characters,
+   status bar shows only the first seven characters of `git rev-parse HEAD`,
+   `/api/session` `full_revision` equals the full hash,
    available/total disk space matches the media filesystem, and
    `git status --short` shows no source edits
    (the local bundle is ignored). Check authenticated `/api/status`, preview,

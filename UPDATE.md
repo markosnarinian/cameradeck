@@ -3,6 +3,77 @@
 These are the steps to update an already-deployed CameraDeck checkout on a
 Raspberry Pi to the latest code. See `README.md` for first-time installation.
 
+## PyPI installations
+
+The PyPI wheel includes a verified compiled UI. It needs neither Git nor Node
+on the Pi. Do not migrate an existing checkout-based service just to update it:
+the checkout instructions below still apply, including its original `media/`
+location, `.env`, service settings, and frontend build step.
+
+For an installation already using PyPI, first check activity with the existing
+`scripts/check-idle.py` helper and stop the service in the same command, as in
+step 1 below. Keep that helper from the repository for operator use; pip does
+not install the systemd unit or the idle-check script. Then, as the service user:
+
+```bash
+~/.venvs/cameradeck/bin/python -m pip install --upgrade cameradeck
+~/.venvs/cameradeck/bin/python -c 'from cameradeck.scripts.frontend import check; check()'
+```
+
+Only restart after both commands succeed, then verify the authenticated UI,
+API, and preview as in step 7. Keep the previous version number for rollback
+with `pip install cameradeck==<previous-version>` while stopped. Never remove
+the media directory, settings, session key, or ledgers.
+
+Packaged runs default to `$XDG_DATA_HOME/cameradeck/media`, or
+`~/.local/share/cameradeck/media` if unset. An existing service must keep its
+explicit `--media` path when migrating. For a package-based unit, replace the
+checkout-based `ExecStart` with the venv's `cameradeck` command and its existing
+host/port/media arguments, and replace `ExecCondition` with the venv Python
+command above. Preserve the installed user, environment, password, capabilities,
+and other device-specific settings. Do not run both installations at once.
+
+## Frontend toolchain
+
+Only source checkouts and release builders need Node **22.23.3** and npm
+**10.9.9**. Both are checked by `scripts/frontend.py`. Install the official
+binary as the normal user without replacing system Node:
+
+```bash
+sudo apt install curl xz-utils
+(
+  set -eu
+  version=$(cat .node-version)
+  case "$(uname -m)" in
+    aarch64) arch=arm64 ;;
+    x86_64) arch=x64 ;;
+    *) echo 'Unsupported architecture' >&2; exit 1 ;;
+  esac
+  archive="node-v$version-linux-$arch.tar.xz"
+  download=$(mktemp -d)
+  trap 'rm -rf "$download"' EXIT
+  curl -fsSL "https://nodejs.org/dist/v$version/$archive" -o "$download/$archive"
+  curl -fsSL "https://nodejs.org/dist/v$version/SHASUMS256.txt" -o "$download/SHASUMS256.txt"
+  (cd "$download" && grep "  $archive$" SHASUMS256.txt | sha256sum -c -)
+  mkdir -p "$HOME/.local/share/cameradeck/node-$version"
+  tar -xJf "$download/$archive" --strip-components=1 -C "$HOME/.local/share/cameradeck/node-$version"
+)
+export PATH="$HOME/.local/share/cameradeck/node-$(cat .node-version)/bin:$PATH"
+node --version
+npm --version
+```
+
+Repeat the `export` in each build/update shell. Keep the committed npm lockfile;
+the build helper runs `npm ci --include=dev`, even under `NODE_ENV=production`.
+Build only while stopped and without concurrent source edits or builds. Internet
+access (or a populated npm cache) and room for dependencies, staged output, and
+the existing bundle are needed during builds, not during normal operation.
+
+Release builds also collect frontend dependency licenses into
+`static/dist/THIRD_PARTY_LICENSES.txt`. Keep the tracked `frontend/licenses/`
+fallback notice with the source; startup receipts now hash it too. Existing
+checkouts must rebuild the frontend before restarting after this update.
+
 ## Before you start
 
 - Only update while CameraDeck is idle or stopped: nothing in progress that
@@ -217,7 +288,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    pulling and `git stash pop` after.
 
 4. **Re-sync dependencies and build the frontend on the Pi.** Install the
-   pinned Node/npm toolchain from README's "Pinned frontend toolchain" if not
+   pinned Node/npm toolchain from "Frontend toolchain" above if not
    present (`sudo apt install curl xz-utils` supplies the download tools).
    Run as the service user, never with sudo npm:
 
@@ -289,7 +360,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    ```
 
    For a manual run, export `CAMERADECK_PASSWORD` in the current shell
-   first (see README's "Access from your phone"; `.env` is only read by the
+   first (see README's "Connect from another device"; `.env` is only read by the
    service), then run `python3 scripts/frontend.py check && uv run --no-dev python app.py --host 0.0.0.0`
    (without `--no-dev`, `uv run` installs the dev tools again).
 
@@ -307,7 +378,7 @@ Raspberry Pi to the latest code. See `README.md` for first-time installation.
    rsync command. Test destructive actions only with disposable captures after
    verifying backups. Keep the rollback backup until these checks pass.
    Interrupted legacy clip errors preserve the
-   original files; see README's "Library and storage".
+   original files; see README's "Storage and options".
 
 ## Rolling back
 

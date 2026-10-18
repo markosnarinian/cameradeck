@@ -30,12 +30,21 @@ from flask import (
     send_from_directory,
     session,
 )
-from camera import CameraDeck
-from catalog import ID, MediaCatalog
-from health import PiHealth
-from power import PowerManager
-from scripts.frontend import check as check_frontend
-from transfer import Busy, RsyncTransfer
+
+if __package__:
+    from .camera import CameraDeck
+    from .catalog import ID, MediaCatalog
+    from .health import PiHealth
+    from .power import PowerManager
+    from .scripts.frontend import check as check_frontend
+    from .transfer import Busy, RsyncTransfer
+else:
+    from camera import CameraDeck
+    from catalog import ID, MediaCatalog
+    from health import PiHealth
+    from power import PowerManager
+    from scripts.frontend import check as check_frontend
+    from transfer import Busy, RsyncTransfer
 
 
 class Activity:
@@ -737,7 +746,17 @@ def main():
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--media", default=str(Path(__file__).parent / "media"))
+    default_media = (
+        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        / "cameradeck/media"
+        if __package__
+        else Path(__file__).parent / "media"
+    )
+    parser.add_argument(
+        "--media",
+        default=str(default_media),
+        help="Media directory (default: %(default)s)",
+    )
     args = parser.parse_args()
     password = os.environ.get("CAMERADECK_PASSWORD", "")
     if args.host not in {"127.0.0.1", "::1", "localhost"} and not password:

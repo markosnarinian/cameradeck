@@ -19,6 +19,7 @@ def source_hash(root):
         if p.is_file() and not p.name.endswith(".tsbuildinfo")
     ]
     files += [p for p in (frontend / "src").rglob("*") if p.is_file()]
+    files += [p for p in (frontend / "licenses").rglob("*") if p.is_file()]
     files += [root / ".node-version"]
     digest = hashlib.sha256()
     for path in sorted(files):
@@ -82,6 +83,27 @@ def build(root=ROOT):
             raise RuntimeError(
                 "Missing build output or source changed during build; retry while stopped."
             )
+        notices = ["Third-party frontend licenses\n"]
+        packages = json.loads((frontend / "package-lock.json").read_text())["packages"]
+        for name, package in sorted(packages.items()):
+            if not name or package.get("dev"):
+                continue
+            directory = frontend / name
+            licenses = [
+                path
+                for path in sorted(directory.iterdir())
+                if path.is_file()
+                and path.name.lower().startswith(
+                    ("license", "licence", "notice", "copying")
+                )
+            ]
+            if not licenses:
+                licenses = [frontend / "licenses" / (directory.name + ".txt")]
+            notices.append(
+                f"\n{name} {package['version']} ({package.get('license', '')})\n"
+            )
+            notices.extend(path.read_text() for path in licenses)
+        (stage / "THIRD_PARTY_LICENSES.txt").write_text("\n".join(notices))
         (stage / ".build.json").write_text(
             json.dumps(
                 {

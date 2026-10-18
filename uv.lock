@@ -104,7 +104,7 @@ dev = [
 requires-dist = [
     { name = "av", specifier = ">=18.1.0" },
     { name = "flask", specifier = ">=3.1,<4" },
-    { name = "numpy", specifier = ">=1.24" },
+    { name = "numpy", specifier = ">=2,<3" },
     { name = "pillow", specifier = ">=9" },
     { name = "waitress", specifier = ">=3,<4" },
 ]

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
 [project]
 name = "cameradeck"
 version = "0.1.0"
@@ -8,9 +12,58 @@ dependencies = [
     "Flask>=3.1,<4",
     "waitress>=3,<4",
     "Pillow>=9",
-    "numpy>=1.24",
+    "numpy>=2,<3",
     "av>=18.1.0",
 ]
+
+[project.scripts]
+cameradeck = "cameradeck.app:main"
+
+[project.urls]
+Homepage = "https://github.com/markosnarinian/cameradeck"
+Issues = "https://github.com/markosnarinian/cameradeck/issues"
+
+[tool.uv]
+# Keep the existing source-checkout deployment independent of wheel builds.
+package = false
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/package_build.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/*.py", "/scripts/*.py", "/frontend/src", "/frontend/licenses", "/frontend/*.json",
+    "/frontend/index.html", "/frontend/vite.config.ts", "/.node-version",
+    "/static/dist", "/README.md", "/UPDATE.md", "/deploy",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+"static/dist" = "static/dist"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py" = "cameradeck/__init__.py"
+"app.py" = "cameradeck/app.py"
+"camera.py" = "cameradeck/camera.py"
+"catalog.py" = "cameradeck/catalog.py"
+"health.py" = "cameradeck/health.py"
+"power.py" = "cameradeck/power.py"
+"quality.py" = "cameradeck/quality.py"
+"transfer.py" = "cameradeck/transfer.py"
+"scripts/frontend.py" = "cameradeck/scripts/frontend.py"
+"static/dist" = "cameradeck/static/dist"
+# Source hashes remain verifiable at startup, without Node or a Git checkout.
+"frontend/src" = "cameradeck/frontend/src"
+"frontend/licenses" = "cameradeck/frontend/licenses"
+"frontend/package.json" = "cameradeck/frontend/package.json"
+"frontend/package-lock.json" = "cameradeck/frontend/package-lock.json"
+"frontend/tsconfig.json" = "cameradeck/frontend/tsconfig.json"
+"frontend/components.json" = "cameradeck/frontend/components.json"
+"frontend/index.html" = "cameradeck/frontend/index.html"
+"frontend/vite.config.ts" = "cameradeck/frontend/vite.config.ts"
+".node-version" = "cameradeck/.node-version"
 
 # picamera2 and libcamera are apt-installed system packages (not on PyPI):
 #   sudo apt install python3-picamera2 python3-libcamera

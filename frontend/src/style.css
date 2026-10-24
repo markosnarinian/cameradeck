@@ -856,9 +856,7 @@ select {
   flex-wrap: nowrap;
 }
 .camera-page .button,
-.camera-page .input,
-.camera-shell header .button,
-.camera-shell nav a {
+.camera-page .input {
   min-height: 44px;
 }
 .camera-retry {

@@ -104,6 +104,7 @@ def test_bottom_status_bar(library_page):
     expect(footer).to_contain_text(
         "No throttling now · Since boot: Undervoltage, Throttled"
     )
+    header_layouts = {}
     for path in ("/library", "/transfer", "/"):
         page.goto(base + path)
         expect(footer).to_contain_text("17.3 GiB available / 64.0 GiB total")
@@ -119,6 +120,13 @@ def test_bottom_status_bar(library_page):
             screenshot(
                 page, f"status-{path.strip('/') or 'camera'}-{width}", full_page=False
             )
+            header_layout = page.locator("header").evaluate("""el =>
+                [el, ...el.querySelectorAll('a, button')].map(node => {
+                    const {x, y, width, height} = node.getBoundingClientRect();
+                    return {x, y, width, height};
+                })
+            """)
+            assert header_layout == header_layouts.setdefault(width, header_layout)
             if path == "/transfer":
                 button = page.get_by_role("button", name="Delete all media", exact=True)
                 button.scroll_into_view_if_needed()
